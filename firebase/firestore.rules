@@ -1,0 +1,150 @@
+rules_version = '2';
+
+// ECOReward Bin - Firestore Security Rules  (audit C-01, Phase 1)
+//
+// STATUS: drafted from what the Flutter app, the Next.js admin console and the kiosk actually do, and
+// exercised by firebase/tests/rules.test.mjs in the local Firestore emulator.
+// NOT DEPLOYED. Compare with the rules currently live in the Firebase console, try the apps against the
+// emulator or a test project, and only then deploy (see firebase/README.md).
+//
+// WHAT THIS CLOSES
+//   - A customer promoting themselves to admin (`role` can only be set to 'customer' at sign-up and is
+//     immutable for customers afterwards; only an existing admin can change it).
+//   - Non-admin writes to rewards (except the "stock - 1" done by a redemption), settings, other users'
+//     documents, and redemption status.
+//   - Listing / enumerating QR tokens, and forging "scanned by" / "user" ids on logs, history, redemptions.
+//   - Setting points to an arbitrary number in one write (max +100 per write, never negative).
+//
+// WHAT THIS CANNOT CLOSE  (needs a trusted code path: audit C-01 step 3)
+//   - The phone credits points itself, so a customer can still raise their OWN `points` in small steps.
+//     Rules can bound a write, they cannot verify that a QR was genuine.
+//
+// KNOWN LEAK KEPT FOR NOW  (audit H-13)
+//   - The leaderboard needs customers to read other customers' documents, which exposes their e-mail
+//     addresses. Fix = split a public `profiles` collection from private `users` (Phase 3/7).
+//
+// NOTE: the kiosk (Python, Admin SDK) bypasses these rules entirely - see audit C-02.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+    function signedIn()     { return request.auth != null; }
+    function isOwner(uid)   { return signedIn() && request.auth.uid == uid; }
+    function changedKeys()  { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // Admin = a user document whose role is 'admin'. Customers cannot change `role` (see /users),
+    // so this cannot be self-granted. Evaluated last in `||` chains so customers don't pay the extra read.
+    function isAdmin() {
+      return signedIn()
+          && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // A customer's own balance: an integer, never negative, at most +100 per write.
+    function pointsOk() {
+      return request.resource.data.points is int
+          && request.resource.data.points >= 0
+          && request.resource.data.points <= resource.data.points + 100;
+    }
+
+    // ── users ────────────────────────────────────────────────────────────────
+    match /users/{uid} {
+      // Customers are read by the leaderboard / rank queries, which always filter role == 'customer'.
+      // (signedIn() first: the `role == 'customer'` test alone would let an anonymous visitor read them.)
+      allow get:  if signedIn() && (isOwner(uid) || resource.data.role == 'customer' || isAdmin());
+      allow list: if signedIn() && (resource.data.role == 'customer' || isAdmin());
+
+      // Sign-up: own document, role 'customer', zeroed stats (the app writes exactly these).
+      allow create: if isOwner(uid)
+                    && request.resource.data.role == 'customer'
+                    && request.resource.data.points == 0
+                    && request.resource.data.scanCount == 0
+                    && request.resource.data.streak == 0
+                    && request.resource.data.badges.size() == 0;
+
+      // The app updates these on a customer's own document: username (profile), and
+      // points / scanCount / streak / lastScanDate / badges (scan + redeem transactions).
+      // `createdAt` is tolerated only for app versions that still send the whole document (audit H-01).
+      // `role` and `email` are NOT in the list, so they can never change.
+      allow update: if (isOwner(uid)
+                        && changedKeys().hasOnly(['username', 'points', 'scanCount', 'streak',
+                                                  'lastScanDate', 'badges', 'createdAt'])
+                        && pointsOk())
+                    || isAdmin();
+
+      allow delete: if false;
+    }
+
+    // ── rewards ──────────────────────────────────────────────────────────────
+    match /rewards/{id} {
+      allow read: if signedIn();
+      allow create, delete: if isAdmin();
+
+      // A redemption lowers a limited stock by exactly 1 (never unlimited = -1, never below 0).
+      allow update: if (signedIn()
+                        && changedKeys().hasOnly(['stock'])
+                        && resource.data.get('stock', -1) is int
+                        && resource.data.get('stock', -1) > 0
+                        && request.resource.data.stock == resource.data.stock - 1)
+                    || isAdmin();
+    }
+
+    // ── redemptions ──────────────────────────────────────────────────────────
+    match /redemptions/{id} {
+      allow read:   if (signedIn() && resource.data.userId == request.auth.uid) || isAdmin();
+      allow create: if signedIn()
+                    && request.resource.data.userId == request.auth.uid
+                    && request.resource.data.status == 'pending';
+      // Only an admin, and only pending -> claimed.
+      allow update: if isAdmin()
+                    && changedKeys().hasOnly(['status'])
+                    && request.resource.data.status == 'claimed';
+      allow delete: if false;
+    }
+
+    // ── waste_logs (point-earning ledger) ────────────────────────────────────
+    match /waste_logs/{id} {
+      allow read:   if (signedIn() && resource.data.userId == request.auth.uid) || isAdmin();
+      allow create: if (signedIn() && request.resource.data.userId == request.auth.uid) || isAdmin();
+      allow update, delete: if false;
+    }
+
+    // ── qr_tokens ────────────────────────────────────────────────────────────
+    // Customers can fetch ONE token by id (they hold the QR) but can never list or query tokens.
+    match /qr_tokens/{token} {
+      allow get:    if signedIn();
+      allow list:   if isAdmin();
+      allow create: if isAdmin();      // Flutter admin QR screen. The kiosk uses the Admin SDK.
+
+      // A customer may only append their own uid to `usedBy`.
+      allow update: if (signedIn()
+                        && changedKeys().hasOnly(['usedBy'])
+                        && request.resource.data.usedBy.size() == resource.data.usedBy.size() + 1
+                        && request.resource.data.usedBy.hasAll(resource.data.usedBy)
+                        && request.auth.uid in request.resource.data.usedBy
+                        && !(request.auth.uid in resource.data.usedBy))
+                    || isAdmin();
+      allow delete: if false;
+    }
+
+    // ── qr_scan_history (audit trail written by the phone, read by the web admin) ──
+    match /qr_scan_history/{id} {
+      allow create: if signedIn() && request.resource.data.scannedByUid == request.auth.uid;
+      allow read:   if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // ── settings / bins ──────────────────────────────────────────────────────
+    match /settings/{doc} {
+      allow read:  if signedIn();
+      allow write: if isAdmin();
+    }
+    match /bins/{id} {
+      allow read:  if isAdmin();
+      allow write: if false;           // nothing in the project writes bins (audit H-09)
+    }
+
+    // Everything else is denied by default.
+  }
+}

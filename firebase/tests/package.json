@@ -1,0 +1,17 @@
+{
+  "name": "ecoreward-firestore-rules-tests",
+  "private": true,
+  "type": "module",
+  "description": "Tests for ../firestore.rules, run against the local Firestore emulator (never your real project).",
+  "scripts": {
+    "test": "firebase emulators:exec --config ../firebase.json --only firestore --project demo-ecoreward \"node --test\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "firebase": "^13.0.0",
+    "firebase-tools": "^15.33.0"
+  },
+  "engines": {
+    "node": ">=24.12.0"
+  }
+}
