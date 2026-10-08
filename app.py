@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
+import os
 import sys
 import platform
+from pathlib import Path
 import cv2
 import uuid
 import random
@@ -23,15 +25,52 @@ else:
         pass
 
 # ── Firebase ───────────────────────────────────────────────────────────────────
+_APP_DIR     = Path(__file__).resolve().parent
+_DEFAULT_KEY = Path.home() / ".ecoreward" / "kiosk-sa.json"
+# Legacy names inside the project folder. Still accepted so existing set-ups keep working,
+# but a service-account key must live OUTSIDE the project folder (it is a full-access secret).
+_LEGACY_KEYS = ("serviceAccountKey.json", "serviceAccountKey.json.json")
+
+
+def find_service_account():
+    """Locate the Firebase Admin credential file. Returns (path or None, every place checked).
+
+    Order:
+      1. GOOGLE_APPLICATION_CREDENTIALS - explicit; if it is set but the file is missing we
+         stop there instead of silently using some other key.
+      2. ~/.ecoreward/kiosk-sa.json     - recommended location, outside the project / Git / any ZIP.
+      3. <this folder>/serviceAccountKey.json[.json] - legacy, deprecated.
+    """
+    tried = []
+    explicit = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        tried.append(f"{path}  (GOOGLE_APPLICATION_CREDENTIALS)")
+        return (path if path.is_file() else None), tried
+    for path in [_DEFAULT_KEY] + [_APP_DIR / name for name in _LEGACY_KEYS]:
+        tried.append(str(path))
+        if path.is_file():
+            return path, tried
+    return None, tried
+
+
 db = None
 try:
-    cred = credentials.Certificate("serviceAccountKey.json")
+    _key, _tried = find_service_account()
+    if _key is None:
+        raise FileNotFoundError("Firebase credential not found. Looked in:\n    " + "\n    ".join(_tried))
+    if _APP_DIR in _key.resolve().parents:
+        print("[SECURITY WARNING] The Firebase key is stored inside the project folder.")
+        print(f"                   Move it to {_DEFAULT_KEY} (or set GOOGLE_APPLICATION_CREDENTIALS),")
+        print("                   and rotate it if this folder was ever zipped, shared or pushed.")
+    cred = credentials.Certificate(str(_key))
     if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
     db = firestore.client()
     print("[FIREBASE] Connected!")
 except Exception as e:
-    print(f"[FIREBASE WARNING] {e}")
+    print(f"[FIREBASE ERROR] {e}")
+    print("[FIREBASE ERROR] Running OFFLINE: QR codes will NOT be issued until this is fixed (see README).")
 
 # ── YOLO ───────────────────────────────────────────────────────────────────────
 print("[AI] Loading YOLO model...")
@@ -224,6 +263,12 @@ def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count):
 
     # thin accent line under top bar
     cv2.line(out, (0, 52), (w, 52), BORDER, 1)
+
+    # Firebase offline: say so loudly. A QR could never be redeemed, so SPACE is disabled.
+    if not fb_ok:
+        blend(out, 0, 53, w, 85, RED_SOFT, 0.88)
+        putc(out, "FIREBASE OFFLINE  -  QR codes disabled  (check the credential, see README)",
+             w // 2, 75, F, 0.46, WHITE, 1)
 
     # ── scan frame ──
     cx, cy = w // 2, h // 2
@@ -633,9 +678,13 @@ def draw_success(cam_frame, waste_type, points):
     return base
 
 # ── Firebase watcher ───────────────────────────────────────────────────────────
-qr_scanned  = False
-_scan_lock  = threading.Lock()
-_watcher    = None   # holds active Firestore listener so we can unsubscribe
+# The Firestore listener runs on its own thread and the UI loop in main() runs on this one.
+# A threading.Event is the hand-off: the listener sets it, main() reads and clears it. (It used to
+# be a module-global bool that main() re-assigned without `global`, which made it a separate local
+# variable, so a scan was never noticed - audit C-04.)
+_scan_event   = threading.Event()
+_active_token = None   # token whose document is being watched; callbacks for other tokens are ignored
+_watcher      = None   # holds active Firestore listener so we can unsubscribe
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -664,7 +713,7 @@ def _cleanup_stale_tokens():
 threading.Thread(target=_cleanup_stale_tokens, daemon=True).start()
 
 def watch_token(token):
-    global _watcher
+    global _watcher, _active_token
     if not db:  # Firebase offline — nothing to watch
         return None
     # unsubscribe previous listener if any
@@ -673,12 +722,13 @@ def watch_token(token):
             _watcher.unsubscribe()
         except Exception:
             pass
+    _active_token = token
+    _scan_event.clear()   # forget any scan of the previous QR before the new listener starts
     def on_snap(doc_snapshot, changes, read_time):
-        global qr_scanned
         for doc in doc_snapshot:
-            if doc.exists and len(doc.to_dict().get('usedBy', [])) > 0:
-                with _scan_lock:
-                    qr_scanned = True
+            # ignore late callbacks that belong to a QR we are no longer showing
+            if doc.exists and doc.id == _active_token and len(doc.to_dict().get('usedBy', [])) > 0:
+                _scan_event.set()
     _watcher = db.collection('qr_tokens').document(token).on_snapshot(on_snap)
     return _watcher
 
@@ -930,9 +980,8 @@ def main():
         elif qr_active and qr_expires_at:
             secs_left = max(0, int((qr_expires_at - _now()).total_seconds()))
 
-            with _scan_lock:
-                _scanned = qr_scanned
-            if _scanned:
+            if _scan_event.is_set():
+                _scan_event.clear()
                 scan_count    += 1
                 print(f"[SCANNED] +{qr_points} pts | Total scans: {scan_count}")
                 show_success   = True
@@ -947,8 +996,6 @@ def main():
                     'ts':          datetime.now().strftime("%b %d  %I:%M %p"),
                 })
                 qr_active  = False
-                with _scan_lock:
-                    qr_scanned = False
                 display = draw_success(cam_r, success_waste, success_points)
 
             elif secs_left == 0:
@@ -974,15 +1021,18 @@ def main():
             show_receipt = False
 
         if key == 32 and not qr_active and not show_success:
-            token      = str(uuid.uuid4())
-            waste_type = latest_waste_type
-            points     = POINTS_MAP[waste_type]
-            expires_at = _now() + timedelta(minutes=QR_EXPIRY_MINUTES)
-            qr_data    = f"ECOBIN:{waste_type}:{token}"
+            if db is None:
+                # A QR for a token that was never stored could never be redeemed (audit C-03): refuse.
+                print("[BLOCKED] Firebase is offline - not issuing a QR code (it could never be redeemed).")
+            else:
+                token      = str(uuid.uuid4())
+                waste_type = latest_waste_type
+                points     = POINTS_MAP[waste_type]
+                expires_at = _now() + timedelta(minutes=QR_EXPIRY_MINUTES)
+                qr_data    = f"ECOBIN:{waste_type}:{token}"
 
-            print(f"\n[QR GENERATED] {waste_type} +{points}pts token={token[:8]}...")
+                print(f"\n[QR GENERATED] {waste_type} +{points}pts token={token[:8]}...")
 
-            if db:
                 try:
                     claim_code = str(random.randint(1000, 9999))
                     db.collection("qr_tokens").document(token).set({
@@ -995,23 +1045,18 @@ def main():
                     })
                     qr_claim_code = claim_code
                     print("[FIREBASE] Token saved — waiting for scan...\n")
-                    watch_token(token)
+                    watch_token(token)   # also clears any scan flag left over from the previous QR
                 except Exception as err:
                     print(f"[FIREBASE ERROR] {err}\n")
-            else:
-                print("[SKIP] Firebase not connected.\n")
 
-            qr_image      = generate_qr(qr_data, size=220)
-            qr_active     = True
-            qr_scanned    = False
-            qr_token      = token
-            qr_waste_type = waste_type
-            qr_points     = points
-            qr_expires_at = expires_at
-            qr_total_secs = QR_EXPIRY_MINUTES * 60
-            show_receipt  = False
-            if not db:
-                qr_claim_code = str(random.randint(1000, 9999))
+                qr_image      = generate_qr(qr_data, size=220)
+                qr_active     = True
+                qr_token      = token
+                qr_waste_type = waste_type
+                qr_points     = points
+                qr_expires_at = expires_at
+                qr_total_secs = QR_EXPIRY_MINUTES * 60
+                show_receipt  = False
 
         if key == ord('q'):
             break

@@ -88,11 +88,26 @@ py -3.11 -m pip install torch torchvision --index-url https://download.pytorch.o
 ```
 
 ### 5. Add Firebase credentials
-- Go to Firebase Console → Project Settings → Service Accounts → Generate new private key
-- Save the file as `serviceAccountKey.json.json` (double extension — this is intentional)
-- Place it in the same folder as `app.py`
+The scanner needs a Firebase **service-account key**. It is a full-access secret (it bypasses all
+Firestore security rules), so keep it **outside this project folder**.
 
-> ⚠️ This file is in `.gitignore` and will NOT be in the repo. You must get it from Firebase manually.
+1. Firebase Console → Project Settings → Service Accounts → **Generate new private key**.
+2. Save it **outside** the project, at `C:\Users\<you>\.ecoreward\kiosk-sa.json` (create the folder),
+   or anywhere you like and point to it once with an environment variable, then open a new terminal:
+   ```bash
+   setx GOOGLE_APPLICATION_CREDENTIALS "C:\path\to\kiosk-sa.json"
+   ```
+3. Start the scanner. The first lines must say `[FIREBASE] Connected!` and the top bar must show **LIVE**.
+
+Lookup order: `GOOGLE_APPLICATION_CREDENTIALS` → `~/.ecoreward/kiosk-sa.json` → *(legacy, deprecated)*
+`serviceAccountKey.json` / `serviceAccountKey.json.json` next to `app.py` (the scanner warns if it finds the key there).
+
+If no credential is found the scanner runs **OFFLINE**: a red banner is shown and SPACE will **not** issue
+QR codes, because a QR for a token that was never stored can never be redeemed.
+
+> ⚠️ Never commit, zip, e-mail or chat the key. If it was ever in a shared folder, create a new key and
+> **delete the old key ID** (Google Cloud Console → IAM & Admin → Service Accounts → Keys). Deleting the
+> file alone does not revoke copies.
 
 ### 6. Get the trained model
 **Option A — Get `best.pt` from teammate (recommended)**
@@ -112,6 +127,12 @@ copy runs\detect\ecoreward_cafe-2\weights\best.pt best.pt
 ```bash
 py -3.11 app.py
 ```
+
+### 8. Run the tests (no camera, no Firebase, no model needed)
+```bash
+py -3.11 -I -m unittest discover -s tests -v
+```
+They replace Firebase, the YOLO model and the camera window with fakes and exercise the real main loop.
 
 ---
 
@@ -182,7 +203,7 @@ App.py---CASPTONE-master/
 ├── train.py                      # YOLOv8 training script (optional)
 ├── dataset/
 │   └── data.yaml                 # Dataset config (6 classes)
-├── serviceAccountKey.json.json   # ⚠️ NOT in repo — get from Firebase
+├── (kiosk-sa.json)               # ⚠️ NOT in repo — lives OUTSIDE the project: ~/.ecoreward/kiosk-sa.json
 ├── best.pt                       # ⚠️ NOT in repo — train locally or get from teammate
 └── yolov8n.pt                    # ⚠️ NOT in repo — auto-downloaded by ultralytics
 ```

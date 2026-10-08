@@ -24,6 +24,18 @@ __pycache__/
 *.pyo
 .env
 
+# Credentials placed in the project by mistake (the key belongs OUTSIDE it: ~/.ecoreward/kiosk-sa.json)
+kiosk-sa.json
+*serviceAccount*.json*
+*-adminsdk-*.json
+
+# Virtual environments
+.venv/
+venv/
+
+# Node dependencies of the Firestore rules tests
+firebase/tests/node_modules/
+
 # OS
 .DS_Store
 Thumbs.db
