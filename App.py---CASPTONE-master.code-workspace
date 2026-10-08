@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../CAPSTONE-1-main"
+		},
+		{
+			"path": "../../CAPSTONE-1-WEB-main"
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "CAPSTONE-1-main"
+	}
+}

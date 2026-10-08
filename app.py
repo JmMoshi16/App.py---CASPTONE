@@ -1,21 +1,31 @@
 # -*- coding: utf-8 -*-
+import sys
+import platform
 import cv2
 import uuid
 import random
 import qrcode
 import numpy as np
 import threading
-import winsound
 from collections import deque, Counter
 from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore
 from ultralytics import YOLO
 
+# ── Platform-safe beep ────────────────────────────────────────────────────────
+if platform.system() == 'Windows':
+    import winsound
+    def _beep(freq=880, dur=120):
+        winsound.Beep(freq, dur)
+else:
+    def _beep(freq=880, dur=120):  # no-op on Linux/macOS
+        pass
+
 # ── Firebase ───────────────────────────────────────────────────────────────────
 db = None
 try:
-    cred = credentials.Certificate("serviceAccountKey.json.json")
+    cred = credentials.Certificate("serviceAccountKey.json")
     if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
     db = firestore.client()
@@ -28,7 +38,8 @@ print("[AI] Loading YOLO model...")
 try:
     model = YOLO("best.pt")
     print("[AI] Loaded: best.pt")
-except Exception:
+except Exception as e:
+    print(f"[AI WARNING] best.pt failed to load ({e}), falling back to yolov8n.pt")
     model = YOLO("yolov8n.pt")
     print("[AI] Loaded: yolov8n.pt")
 
@@ -89,7 +100,7 @@ WASTE_MAP  = {
     'fork':           'Residual',
     'spoon':          'Residual',
     'plastic-spoon':  'Residual',
-    'tissue':         'Residual',
+    'tissue':         'Biodegradable',
     'foam box':       'Residual',
     'styro':          'Residual',
     '1':              'Residual',   # class 0 anomaly — treat as residual
@@ -201,6 +212,16 @@ def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count):
     rrect(out, sx - 10, 10, sx + stw + 10, 30, 6, CARD2)
     putl(out, sc_text, sx, 26, F, 0.30, AMBER, 1)
 
+    # history icon pill — clock symbol + label
+    hx = sx - 64
+    rrect(out, hx - 10, 10, hx + 54, 30, 6, CARD2)
+    # draw mini clock face
+    hcx, hcy = hx + 8, 20
+    cv2.circle(out, (hcx, hcy), 7, ACCENT, 1, cv2.LINE_AA)
+    cv2.line(out, (hcx, hcy), (hcx, hcy - 4), ACCENT, 1, cv2.LINE_AA)
+    cv2.line(out, (hcx, hcy), (hcx + 3, hcy), ACCENT, 1, cv2.LINE_AA)
+    putl(out, "HIST", hx + 19, 26, F, 0.27, ACCENT, 1)
+
     # thin accent line under top bar
     cv2.line(out, (0, 52), (w, 52), BORDER, 1)
 
@@ -261,13 +282,13 @@ def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count):
         putr(out, "pts", w - 16, h - 8, F, 0.36, GRAY, 1)
 
         # hint
-        putc(out, "SPACE  to generate QR", cx, h - 10, F, 0.32, GRAY, 1)
+        putc(out, "SPACE  to generate QR      H  history", cx, h - 10, F, 0.32, GRAY, 1)
 
     else:
         # idle state — centered instruction
         putc(out, "Place item in front of camera", cx, h - 46, FB, 0.55, OFF_WHITE, 1)
         putc(out, "AI will detect and classify automatically", cx, h - 22, F, 0.34, GRAY, 1)
-        putc(out, "SPACE  generate QR     Q  quit", cx, h - 6, F, 0.28, GRAY_DIM, 1)
+        putc(out, "SPACE  generate QR     H  history     Q  quit", cx, h - 6, F, 0.28, GRAY_DIM, 1)
 
     return out
 
@@ -397,7 +418,7 @@ def draw_qr_panel(cam_frame, qr_img, waste_type, points, secs_left, claim_code, 
     return np.hstack([cam_r, panel])
 
 # ── Receipt / Manual Claim Screen ─────────────────────────────────────────────
-def draw_receipt(cam_frame, waste_type, points, claim_code):
+def draw_receipt(cam_frame, waste_type, points, claim_code, token=""):
     base = cv2.resize(cam_frame, (WIN_W, WIN_H))
     acc  = WASTE_COLOR.get(waste_type, ACCENT)
     blend(base, 0, 0, WIN_W, WIN_H, BLACK, 0.86)
@@ -492,6 +513,88 @@ def draw_receipt(cam_frame, waste_type, points, claim_code):
     return base
 
 
+# ── History Overlay ─────────────────────────────────────────────────────────
+def draw_history(cam_frame, history):
+    base = cv2.resize(cam_frame, (WIN_W, WIN_H))
+    blend(base, 0, 0, WIN_W, WIN_H, BLACK, 0.88)
+
+    pw, ph = 700, 560
+    px = WIN_W // 2 - pw // 2
+    py = WIN_H // 2 - ph // 2
+    cx = WIN_W // 2
+
+    # card bg
+    rrect(base, px + 4, py + 4, px + pw + 4, py + ph + 4, 16, (4, 5, 7))
+    rrect(base, px, py, px + pw, py + ph, 16, CARD)
+
+    # header
+    blend(base, px, py, px + pw, py + 62, CARD2, 1.0)
+    cv2.line(base, (px, py + 62), (px + pw, py + 62), ACCENT, 2)
+    # clock icon
+    ic = (px + 36, py + 32)
+    cv2.circle(base, ic, 16, ACCENT, 2, cv2.LINE_AA)
+    cv2.line(base, ic, (ic[0], ic[1] - 10), ACCENT, 2, cv2.LINE_AA)
+    cv2.line(base, ic, (ic[0] + 8, ic[1]), ACCENT, 2, cv2.LINE_AA)
+    cv2.circle(base, ic, 2, ACCENT, -1, cv2.LINE_AA)
+
+    putl(base, "SCAN HISTORY", px + 62, py + 28, FB, 0.62, WHITE, 2)
+    putl(base, f"{len(history)} total redeemed", px + 64, py + 50, F, 0.28, GRAY, 1)
+    putc(base, "H  close", px + pw - 50, py + 38, F, 0.28, GRAY_DIM, 1)
+
+    # column headers
+    hy = py + 66
+    blend(base, px, hy, px + pw, hy + 22, GRAY_DIM, 0.5)
+    putl(base, "#",          px + 14,  hy + 15, F, 0.27, GRAY, 1)
+    putl(base, "WASTE TYPE", px + 40,  hy + 15, F, 0.27, GRAY, 1)
+    putl(base, "POINTS",     px + 238, hy + 15, F, 0.27, GRAY, 1)
+    putl(base, "CLAIM CODE", px + 338, hy + 15, F, 0.27, GRAY, 1)
+    putl(base, "TIME",       px + 508, hy + 15, F, 0.27, GRAY, 1)
+
+    row_h  = 44
+    max_rows = 9
+    entries = list(reversed(history))
+    visible = entries[:max_rows]
+    ry = hy + 26
+
+    if not visible:
+        putc(base, "No scans yet",              cx, WIN_H // 2 - 10, FB, 0.58, GRAY, 1)
+        putc(base, "Generate a QR and scan it", cx, WIN_H // 2 + 20, F,  0.34, GRAY_DIM, 1)
+    else:
+        for i, entry in enumerate(visible):
+            row_y = ry + i * row_h
+            acc   = WASTE_COLOR.get(entry['waste_type'], ACCENT)
+            if i % 2 == 0:
+                blend(base, px, row_y, px + pw, row_y + row_h, CARD2, 0.6)
+            cv2.rectangle(base, (px, row_y + 4), (px + 3, row_y + row_h - 4), acc, -1)
+
+            num  = len(history) - i
+            ty   = row_y + row_h - 14
+            putl(base, str(num),               px + 14,  ty, F,  0.30, GRAY,   1)
+            putl(base, entry['waste_type'],    px + 40,  ty, FB, 0.36, WHITE,  1)
+
+            tag = WASTE_TAG.get(entry['waste_type'], '?')
+            (tw2, _), _ = cv2.getTextSize(tag, F, 0.24, 1)
+            rrect(base, px + 168, row_y + 10, px + 168 + tw2 + 10, row_y + row_h - 10, 4, acc)
+            putl(base, tag, px + 173, row_y + row_h - 12, F, 0.24, BG, 1)
+
+            putl(base, f"+{entry['points']} pts", px + 238, ty, FB, 0.38, AMBER,  1)
+            putl(base, f"ECO-{entry['claim_code']}", px + 338, ty, FB, 0.36, ACCENT, 1)
+            putl(base, entry['ts'],             px + 508, ty, F,  0.30, GRAY,   1)
+
+            cv2.line(base, (px + 8, row_y + row_h), (px + pw - 8, row_y + row_h), BORDER, 1)
+
+        if len(history) > max_rows:
+            putc(base, f"+ {len(history) - max_rows} more (showing latest {max_rows})",
+                 cx, py + ph - 14, F, 0.27, GRAY_DIM, 1)
+
+    # footer
+    blend(base, px, py + ph - 36, px + pw, py + ph, CARD2, 1.0)
+    cv2.line(base, (px, py + ph - 36), (px + pw, py + ph - 36), BORDER, 1)
+    putc(base, "Session history only  •  Press H to close",
+         cx, py + ph - 12, F, 0.28, GRAY_DIM, 1)
+    return base
+
+
 # ── Success Overlay ────────────────────────────────────────────────────────────
 def draw_success(cam_frame, waste_type, points):
     base = cv2.resize(cam_frame, (WIN_W, WIN_H))
@@ -538,24 +641,32 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 def _cleanup_stale_tokens():
-    """On startup, expire any tokens that passed their expiry time."""
+    """On startup, expire any tokens that passed their expiry time.
+
+    NOTE: Queries 'isUsed == False' (a scalar boolean) instead of
+    'usedBy == []' — Firestore does not support equality on array fields.
+    New tokens written by app.py include the isUsed flag.
+    """
     if not db:
         return
     try:
-        docs = db.collection('qr_tokens').where('usedBy', '==', []).stream()
+        docs = db.collection('qr_tokens').where('isUsed', '==', False).stream()
         now_iso = _now().isoformat()
         for doc in docs:
             data = doc.to_dict()
             if data.get('expiresAt', '') < now_iso:
-                doc.reference.update({'expired': True})
+                doc.reference.update({'expired': True, 'isUsed': True})
                 print(f"[CLEANUP] Expired stale token {doc.id[:8]}...")
     except Exception as e:
         print(f"[CLEANUP WARNING] {e}")
 
-_cleanup_stale_tokens()
+# Run cleanup in a background thread so startup is not blocked
+threading.Thread(target=_cleanup_stale_tokens, daemon=True).start()
 
 def watch_token(token):
     global _watcher
+    if not db:  # Firebase offline — nothing to watch
+        return None
     # unsubscribe previous listener if any
     if _watcher:
         try:
@@ -571,195 +682,344 @@ def watch_token(token):
     _watcher = db.collection('qr_tokens').document(token).on_snapshot(on_snap)
     return _watcher
 
+# ── Splash / Startup Animation ────────────────────────────────────────────────
+def draw_splash_animation(window_name):
+    """Plays a branded startup splash animation (≈2.5s) using OpenCV."""
+    import math
+    total_frames = 120   # ~2.5s at 48fps equivalent
+    cx, cy = WIN_W // 2, WIN_H // 2
+
+    # Easing helpers
+    def ease_out_cubic(t): return 1 - (1 - t) ** 3
+    def ease_in_out(t):    return t * t * (3 - 2 * t)
+    def ease_out_back(t):
+        c1, c3 = 1.70158, 1.70158 + 1
+        return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+    for frame_i in range(total_frames):
+        t = frame_i / (total_frames - 1)   # 0.0 → 1.0
+        canvas = np.zeros((WIN_H, WIN_W, 3), np.uint8)
+
+        # ── Phase 1 (0.0–0.15): bg fade in ──────────────────────────────────
+        bg_alpha = min(1.0, t / 0.15)
+        bg_val   = int(ease_out_cubic(bg_alpha) * 14)
+        canvas[:] = (bg_val, bg_val + 2, bg_val + 4)
+
+        # subtle radial vignette — darker edges
+        for radius, alpha_v in [(460, 0.25), (340, 0.18), (200, 0.08)]:
+            mask = np.zeros((WIN_H, WIN_W), np.float32)
+            cv2.circle(mask, (cx, cy), radius, 1.0, -1)
+            mask = cv2.GaussianBlur(mask, (0, 0), radius // 3)
+            for c in range(3):
+                canvas[:, :, c] = np.clip(
+                    canvas[:, :, c].astype(np.float32) + mask * (CARD[c] - canvas[:, :, c].astype(np.float32)) * alpha_v,
+                    0, 255).astype(np.uint8)
+
+        # ── Phase 2 (0.10–0.50): logo circle scale-in ───────────────────────
+        if t >= 0.10:
+            logo_t  = min(1.0, (t - 0.10) / 0.30)
+            scale   = ease_out_back(logo_t)
+            r_outer = int(80 * scale)
+            r_inner = int(72 * scale)
+            if r_outer > 2:
+                # glow ring
+                for dr in range(8, 0, -1):
+                    alpha_g = 0.04 * (9 - dr) * logo_t
+                    glow_col = tuple(int(ACCENT[i] * alpha_g) for i in range(3))
+                    cv2.circle(canvas, (cx, cy), r_outer + dr, glow_col, 2, cv2.LINE_AA)
+                # filled circle
+                cv2.circle(canvas, (cx, cy), r_outer, CARD2, -1, cv2.LINE_AA)
+                cv2.circle(canvas, (cx, cy), r_outer, ACCENT, 2, cv2.LINE_AA)
+
+                # leaf / eco icon inside — simple overlapping circles
+                if scale > 0.5:
+                    icon_r = int(28 * scale)
+                    leaf_x, leaf_y = cx, cy - 8
+                    cv2.circle(canvas, (leaf_x,          leaf_y), icon_r, ACCENT, -1, cv2.LINE_AA)
+                    cv2.circle(canvas, (leaf_x + icon_r, leaf_y), icon_r, CARD2,  -1, cv2.LINE_AA)
+                    # stem
+                    cv2.line(canvas, (cx, cy - 8 + icon_r - 4),
+                             (cx, cy + icon_r + 4), ACCENT, 2, cv2.LINE_AA)
+
+        # ── Phase 3 (0.40–0.75): brand text slide up ────────────────────────
+        if t >= 0.40:
+            txt_t  = min(1.0, (t - 0.40) / 0.28)
+            txt_a  = ease_out_cubic(txt_t)
+            slide  = int((1 - txt_a) * 30)
+            ty_eco = cy + 104 + slide
+
+            # ECO  REWARD  text
+            (ew, eh), _ = cv2.getTextSize("ECO", FB, 1.10, 3)
+            (rw, _),  _ = cv2.getTextSize("REWARD", FB, 1.10, 2)
+            total_w = ew + rw + 12
+            lx = cx - total_w // 2
+
+            # draw with alpha-sim — just draw dimmed first then bright
+            eco_col    = tuple(int(c * txt_a) for c in ACCENT)
+            reward_col = tuple(int(c * txt_a) for c in WHITE)
+            cv2.putText(canvas, "ECO",    (lx, ty_eco),          FB, 1.10, eco_col,    3, cv2.LINE_AA)
+            cv2.putText(canvas, "REWARD", (lx + ew + 12, ty_eco), FB, 1.10, reward_col, 2, cv2.LINE_AA)
+
+            # tagline
+            tag_col = tuple(int(c * txt_a) for c in GRAY)
+            putc(canvas, "Smart Waste Kiosk System", cx, ty_eco + 28, F, 0.38, tag_col, 1)
+
+        # ── Phase 4 (0.62–0.88): loading bar ────────────────────────────────
+        if t >= 0.62:
+            bar_t   = min(1.0, (t - 0.62) / 0.26)
+            bar_a   = ease_in_out(bar_t)
+            bar_w   = 280
+            bar_h_v = 4
+            bx1     = cx - bar_w // 2
+            by1     = cy + 148
+            # track
+            rrect(canvas, bx1, by1, bx1 + bar_w, by1 + bar_h_v, 2, CARD2)
+            # fill
+            fill_w  = int(bar_w * bar_a)
+            if fill_w > 2:
+                rrect(canvas, bx1, by1, bx1 + fill_w, by1 + bar_h_v, 2, ACCENT)
+                # leading glow dot
+                cv2.circle(canvas, (bx1 + fill_w, by1 + bar_h_v // 2),
+                           4, ACCENT, -1, cv2.LINE_AA)
+
+            # loading label
+            pct       = int(bar_a * 100)
+            pct_col   = tuple(int(c * min(1.0, bar_t * 2)) for c in GRAY)
+            putc(canvas, f"Initializing  {pct}%", cx, by1 + 22, F, 0.30, pct_col, 1)
+
+        # ── Phase 5 (0.88–1.0): fade to black before handoff ────────────────
+        if t >= 0.88:
+            fade_t = (t - 0.88) / 0.12
+            fade_a = ease_in_out(fade_t)
+            overlay = canvas.copy()
+            overlay[:] = (8, 10, 14)
+            cv2.addWeighted(overlay, fade_a, canvas, 1 - fade_a, 0, canvas)
+
+        cv2.imshow(window_name, canvas)
+        if cv2.waitKey(20) & 0xFF == ord('q'):
+            cv2.destroyAllWindows()
+            sys.exit(0)
+
+
 # ── Webcam ─────────────────────────────────────────────────────────────────────
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("[CAMERA ERROR] Could not access webcam!")
-    exit()
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[CAMERA ERROR] Could not access webcam!")
+        sys.exit(1)
 
-print("\n------------------------------------------")
-print("  ECOReward Bin  |  1280x720  |  Kiosk Mode")
-print("  SPACEBAR = Generate QR     Q = Quit")
-print("------------------------------------------\n")
+    print("\n------------------------------------------")
+    print("  ECOReward Bin  |  1280x720  |  Kiosk Mode")
+    print("  SPACEBAR = Generate QR    H = History    Q = Quit")
+    print("------------------------------------------\n")
 
-latest_label      = "Unknown"
-latest_waste_type = "Residual"
-latest_conf       = 0.0
-fb_ok             = db is not None
-scan_count        = 0
+    cv2.namedWindow("ECOReward Bin", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("ECOReward Bin", WIN_W, WIN_H)
 
-# ── Detection smoothing (majority vote over last 7 frames) ────────────────────
-DETECT_WINDOW   = 7
-detect_history  = deque(maxlen=DETECT_WINDOW)
-HOLD_FRAMES     = 0   # counts frames since last real detection
-HOLD_MAX        = 15  # keep last result for 15 frames before resetting
-_last_beep_type = None  # track last beeped class to avoid repeat beeps
+    # ── Play startup splash ──
+    draw_splash_animation("ECOReward Bin")
 
-qr_active      = False
-qr_image       = None
-qr_token       = None
-qr_waste_type  = None
-qr_points      = 0
-qr_expires_at  = None
-qr_total_secs  = QR_EXPIRY_MINUTES * 60
-qr_claim_code  = "----"
 
-show_success   = False
-success_until  = None
-success_waste  = ""
-success_points = 0
+    latest_label      = "Unknown"
+    latest_waste_type = "Residual"
+    latest_conf       = 0.0
+    fb_ok             = db is not None
+    scan_count        = 0
 
-show_receipt = False
+    # ── Detection smoothing (majority vote over last 7 frames) ──────────────
+    DETECT_WINDOW   = 7
+    detect_history  = deque(maxlen=DETECT_WINDOW)
+    HOLD_FRAMES     = 0   # counts frames since last real detection
+    HOLD_MAX        = 15  # keep last result for 15 frames before resetting
+    _last_beep_type = None  # track last beeped class to avoid repeat beeps
 
-cv2.namedWindow("ECOReward Bin", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("ECOReward Bin", WIN_W, WIN_H)
+    qr_active      = False
+    qr_image       = None
+    qr_token       = None
+    qr_waste_type  = None
+    qr_points      = 0
+    qr_expires_at  = None
+    qr_total_secs  = QR_EXPIRY_MINUTES * 60
+    qr_claim_code  = "----"
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    show_success   = False
+    success_until  = None
+    success_waste  = ""
+    success_points = 0
 
-    # ── AI detection ──
-    cam_r = cv2.resize(frame, (CAM_W, WIN_H))
-    if not qr_active and not show_success:
-        # Run YOLO on native resolution for better accuracy
-        results  = model(frame, conf=0.15, verbose=False)
-        fh, fw   = frame.shape[:2]
-        sx, sy   = CAM_W / fw, WIN_H / fh   # scale factors to cam_r coords
-        detected = False
-        for r in results:
-            for box in r.boxes:
-                cid  = int(box.cls[0])
-                lbl  = model.names[cid].lower()
-                conf = float(box.conf[0])
-                if conf < 0.30:
-                    continue
-                detected = True
-                detect_history.append((lbl, conf))
-                # majority vote from history
-                vote_lbl = Counter(h[0] for h in detect_history).most_common(1)[0][0]
-                vote_conf = max(h[1] for h in detect_history if h[0] == vote_lbl)
-                latest_label      = vote_lbl
-                latest_waste_type = WASTE_MAP.get(vote_lbl, 'Residual')
-                latest_conf       = vote_conf
-                HOLD_FRAMES       = 0
-                # beep once when a new class is first confirmed
-                if vote_lbl != _last_beep_type:
-                    _last_beep_type = vote_lbl
-                    threading.Thread(target=winsound.Beep, args=(880, 120), daemon=True).start()
-                # scale bbox from native frame → cam_r
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                x1, y1 = int(x1 * sx), int(y1 * sy)
-                x2, y2 = int(x2 * sx), int(y2 * sy)
-                ac  = WASTE_COLOR[latest_waste_type]
-                cv2.rectangle(cam_r, (x1, y1), (x2, y2), ac, 2, cv2.LINE_AA)
-                # label tag above box
-                tag = f"{vote_lbl}  {vote_conf * 100:.0f}%"
-                (tw, th), _ = cv2.getTextSize(tag, F, 0.44, 1)
-                rrect(cam_r, x1, y1 - th - 10, x1 + tw + 10, y1, 4, ac)
-                cv2.putText(cam_r, tag, (x1 + 5, y1 - 3), F, 0.44, BG, 1, cv2.LINE_AA)
-                # confidence bar directly on bbox bottom edge
-                bar_w = x2 - x1
-                bar_y = y2 - 6
-                rrect(cam_r, x1, bar_y, x2, y2, 0, GRAY_DIM)
-                rrect(cam_r, x1, bar_y, x1 + int(bar_w * vote_conf), y2, 0, ac)
-        if not detected:
-            HOLD_FRAMES += 1
-            if HOLD_FRAMES > HOLD_MAX:
-                detect_history.clear()
-                latest_label      = "Unknown"
-                latest_waste_type = "Residual"
-                latest_conf       = 0.0
-                _last_beep_type   = None  # reset so next detection beeps again
+    show_receipt  = False
+    show_history  = False
+    scan_history  = []   # list of dicts: {waste_type, points, claim_code, ts}
 
-    # ── build display ──
-    if show_receipt and qr_token:
-        display = draw_receipt(cam_r, qr_waste_type, qr_points, qr_claim_code)
+    cv2.namedWindow("ECOReward Bin", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("ECOReward Bin", WIN_W, WIN_H)
 
-    elif show_success and success_until:
-        if _now() < success_until:
-            display = draw_success(cam_r, success_waste, success_points)
-        else:
-            show_success = False
-            display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                      latest_conf, fb_ok, scan_count)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    elif qr_active and qr_expires_at:
-        secs_left = max(0, int((qr_expires_at - _now()).total_seconds()))
+        # ── AI detection ──
+        cam_r = cv2.resize(frame, (CAM_W, WIN_H))
+        if not qr_active and not show_success:
+            # Run YOLO on native resolution for better accuracy
+            results  = model(frame, conf=0.15, verbose=False)
+            fh, fw   = frame.shape[:2]
+            sx, sy   = CAM_W / fw, WIN_H / fh   # scale factors to cam_r coords
+            detected = False
+            for r in results:
+                for box in r.boxes:
+                    cid  = int(box.cls[0])
+                    lbl  = model.names[cid].lower()
+                    conf = float(box.conf[0])
+                    if conf < 0.30:
+                        continue
+                    detected = True
+                    detect_history.append((lbl, conf))
+                    # majority vote from history
+                    vote_lbl = Counter(h[0] for h in detect_history).most_common(1)[0][0]
+                    vote_conf = max(h[1] for h in detect_history if h[0] == vote_lbl)
+                    latest_label      = vote_lbl
+                    latest_waste_type = WASTE_MAP.get(vote_lbl, 'Residual')
+                    latest_conf       = vote_conf
+                    HOLD_FRAMES       = 0
+                    # beep once when a new class is first confirmed
+                    if vote_lbl != _last_beep_type:
+                        _last_beep_type = vote_lbl
+                        threading.Thread(target=_beep, args=(880, 120), daemon=True).start()
+                    # scale bbox from native frame → cam_r
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    x1, y1 = int(x1 * sx), int(y1 * sy)
+                    x2, y2 = int(x2 * sx), int(y2 * sy)
+                    ac  = WASTE_COLOR[latest_waste_type]
+                    cv2.rectangle(cam_r, (x1, y1), (x2, y2), ac, 2, cv2.LINE_AA)
+                    # label tag above box
+                    tag = f"{latest_waste_type}  {vote_conf * 100:.0f}%"
+                    (tw, th), _ = cv2.getTextSize(tag, F, 0.44, 1)
+                    rrect(cam_r, x1, y1 - th - 10, x1 + tw + 10, y1, 4, ac)
+                    cv2.putText(cam_r, tag, (x1 + 5, y1 - 3), F, 0.44, BG, 1, cv2.LINE_AA)
+                    # confidence bar directly on bbox bottom edge
+                    bar_w = x2 - x1
+                    bar_y = y2 - 6
+                    rrect(cam_r, x1, bar_y, x2, y2, 0, GRAY_DIM)
+                    rrect(cam_r, x1, bar_y, x1 + int(bar_w * vote_conf), y2, 0, ac)
+            if not detected:
+                HOLD_FRAMES += 1
+                if HOLD_FRAMES > HOLD_MAX:
+                    detect_history.clear()
+                    latest_label      = "Unknown"
+                    latest_waste_type = "Residual"
+                    latest_conf       = 0.0
+                    _last_beep_type   = None  # reset so next detection beeps again
 
-        with _scan_lock:
-            _scanned = qr_scanned
-        if _scanned:
-            scan_count    += 1
-            print(f"[SCANNED] +{qr_points} pts | Total scans: {scan_count}")
-            show_success   = True
-            success_until  = _now() + timedelta(seconds=4)
-            success_waste  = qr_waste_type
-            success_points = qr_points
-            qr_active  = False
+        # ── build display ──
+        if show_history:
+            display = draw_history(cam_r, scan_history)
+
+        elif show_receipt and qr_token:
+            display = draw_receipt(cam_r, qr_waste_type, qr_points, qr_claim_code, qr_token or "")
+
+        elif show_success and success_until:
+            if _now() < success_until:
+                display = draw_success(cam_r, success_waste, success_points)
+            else:
+                show_success = False
+                display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
+                                          latest_conf, fb_ok, scan_count)
+
+        elif qr_active and qr_expires_at:
+            secs_left = max(0, int((qr_expires_at - _now()).total_seconds()))
+
             with _scan_lock:
-                qr_scanned = False
-            display = draw_success(cam_r, success_waste, success_points)
+                _scanned = qr_scanned
+            if _scanned:
+                scan_count    += 1
+                print(f"[SCANNED] +{qr_points} pts | Total scans: {scan_count}")
+                show_success   = True
+                success_until  = _now() + timedelta(seconds=4)
+                success_waste  = qr_waste_type
+                success_points = qr_points
+                # record to session history
+                scan_history.append({
+                    'waste_type':  qr_waste_type,
+                    'points':      qr_points,
+                    'claim_code':  qr_claim_code,
+                    'ts':          datetime.now().strftime("%b %d  %I:%M %p"),
+                })
+                qr_active  = False
+                with _scan_lock:
+                    qr_scanned = False
+                display = draw_success(cam_r, success_waste, success_points)
 
-        elif secs_left == 0:
-            print("[EXPIRED] QR expired.")
-            qr_active = False
+            elif secs_left == 0:
+                print("[EXPIRED] QR expired.")
+                qr_active = False
+                display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
+                                          latest_conf, fb_ok, scan_count)
+            else:
+                display = draw_qr_panel(cam_r, qr_image, qr_waste_type, qr_points,
+                                        secs_left, qr_claim_code, qr_total_secs)
+        else:
             display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
                                       latest_conf, fb_ok, scan_count)
-        else:
-            display = draw_qr_panel(cam_r, qr_image, qr_waste_type, qr_points,
-                                    secs_left, qr_claim_code, qr_total_secs)
-    else:
-        display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                  latest_conf, fb_ok, scan_count)
 
-    cv2.imshow("ECOReward Bin", display)
-    key = cv2.waitKey(1) & 0xFF
+        cv2.imshow("ECOReward Bin", display)
+        key = cv2.waitKey(1) & 0xFF
 
-    if key == ord('r') and qr_active:
-        show_receipt = not show_receipt
+        if key == ord('r') and qr_active:
+            show_receipt = not show_receipt
 
-    if key == 32 and not qr_active and not show_success:
-        token      = str(uuid.uuid4())
-        waste_type = latest_waste_type
-        points     = POINTS_MAP[waste_type]
-        expires_at = _now() + timedelta(minutes=QR_EXPIRY_MINUTES)
-        qr_data    = f"ECOBIN:{waste_type}:{token}"
+        if key == ord('h'):
+            show_history = not show_history
+            show_receipt = False
 
-        print(f"\n[QR GENERATED] {waste_type} +{points}pts token={token[:8]}...")
+        if key == 32 and not qr_active and not show_success:
+            token      = str(uuid.uuid4())
+            waste_type = latest_waste_type
+            points     = POINTS_MAP[waste_type]
+            expires_at = _now() + timedelta(minutes=QR_EXPIRY_MINUTES)
+            qr_data    = f"ECOBIN:{waste_type}:{token}"
 
-        if db:
-            try:
-                claim_code = str(random.randint(1000, 9999))
-                db.collection("qr_tokens").document(token).set({
-                    "wasteType": waste_type,
-                    "expiresAt": expires_at.isoformat(),
-                    "usedBy":    [],
-                    "createdAt": _now().isoformat(),
-                    "claimCode": claim_code,
-                })
-                qr_claim_code = claim_code
-                print("[FIREBASE] Token saved — waiting for scan...\n")
-                watch_token(token)
-            except Exception as err:
-                print(f"[FIREBASE ERROR] {err}\n")
-        else:
-            print("[SKIP] Firebase not connected.\n")
+            print(f"\n[QR GENERATED] {waste_type} +{points}pts token={token[:8]}...")
 
-        qr_image      = generate_qr(qr_data, size=220)
-        qr_active     = True
-        qr_scanned    = False
-        qr_token      = token
-        qr_waste_type = waste_type
-        qr_points     = points
-        qr_expires_at = expires_at
-        qr_total_secs = QR_EXPIRY_MINUTES * 60
-        show_receipt  = False
-        if not db: qr_claim_code = str(random.randint(1000, 9999))
+            if db:
+                try:
+                    claim_code = str(random.randint(1000, 9999))
+                    db.collection("qr_tokens").document(token).set({
+                        "wasteType": waste_type,
+                        "expiresAt": expires_at.isoformat(),
+                        "usedBy":    [],
+                        "isUsed":    False,
+                        "createdAt": _now().isoformat(),
+                        "claimCode": claim_code,
+                    })
+                    qr_claim_code = claim_code
+                    print("[FIREBASE] Token saved — waiting for scan...\n")
+                    watch_token(token)
+                except Exception as err:
+                    print(f"[FIREBASE ERROR] {err}\n")
+            else:
+                print("[SKIP] Firebase not connected.\n")
 
-    if key == ord('q'):
-        break
+            qr_image      = generate_qr(qr_data, size=220)
+            qr_active     = True
+            qr_scanned    = False
+            qr_token      = token
+            qr_waste_type = waste_type
+            qr_points     = points
+            qr_expires_at = expires_at
+            qr_total_secs = QR_EXPIRY_MINUTES * 60
+            show_receipt  = False
+            if not db:
+                qr_claim_code = str(random.randint(1000, 9999))
 
-cap.release()
-cv2.destroyAllWindows()
-print("\n[SYSTEM] Shut down.")
+        if key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("\n[SYSTEM] Shut down.")
+
+
+if __name__ == '__main__':
+    main()

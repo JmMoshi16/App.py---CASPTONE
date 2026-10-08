@@ -1,0 +1,29 @@
+# Credentials — never commit these
+serviceAccountKey.json.json
+serviceAccountKey.json
+*.json.json
+
+# Trained models — too large for GitHub (get via Colab)
+best.pt
+last.pt
+yolov8n.pt
+*.pt
+
+# Dataset — too large for GitHub (re-download via download_dataset.py)
+dataset/train/
+dataset/valid/
+dataset/test/
+dataset/*.cache
+
+# Training output
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
