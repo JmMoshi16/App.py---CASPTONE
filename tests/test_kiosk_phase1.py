@@ -212,6 +212,23 @@ class ScanDetectionTests(unittest.TestCase):
         self.assertEqual(success.call_count, 0)
         self.assertNotIn("[SCANNED]", out)
 
+    def test_leftover_scan_signal_does_not_dismiss_a_new_qr_even_if_its_write_fails(self):
+        class FailingWrites(FakeFirestore):
+            def collection(self, name):
+                coll = super().collection(name)
+                coll.document = lambda doc_id: types.SimpleNamespace(
+                    set=lambda data: (_ for _ in ()).throw(RuntimeError("network down")),
+                    on_snapshot=lambda cb: None)
+                return coll
+
+        _set_scan_flag()  # e.g. a late callback for the previous QR
+        with mock.patch.object(app, "db", FailingWrites()), \
+                mock.patch.object(app, "draw_success", wraps=app.draw_success) as success:
+            out, _ = run_main({3: SPACE, 6: QUIT})
+        self.assertIn("[FIREBASE ERROR] network down", out)
+        self.assertEqual(success.call_count, 0, "a stale signal dismissed a QR that nobody scanned")
+        _clear_scan_flag()
+
     def test_callback_for_a_different_token_is_ignored(self):
         """A late callback from a previously watched token must not dismiss the new QR."""
         db = FakeFirestore()
@@ -228,6 +245,13 @@ class ScanDetectionTests(unittest.TestCase):
 
 def _scan_flag_is_set():
     return app._scan_event.is_set() if hasattr(app, "_scan_event") else bool(app.qr_scanned)
+
+
+def _set_scan_flag():
+    if hasattr(app, "_scan_event"):
+        app._scan_event.set()
+    else:
+        app.qr_scanned = True
 
 
 def _clear_scan_flag():

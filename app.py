@@ -1033,6 +1033,8 @@ def main():
 
                 print(f"\n[QR GENERATED] {waste_type} +{points}pts token={token[:8]}...")
 
+                _scan_event.clear()   # new QR: drop any scan signal left over from the previous one,
+                                      # even if the Firestore write below fails and no listener is started
                 try:
                     claim_code = str(random.randint(1000, 9999))
                     db.collection("qr_tokens").document(token).set({
