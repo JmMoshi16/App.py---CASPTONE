@@ -7,7 +7,7 @@ import platform
 from pathlib import Path
 import cv2
 import uuid
-import random
+import secrets
 import qrcode
 import numpy as np
 import threading
@@ -16,6 +16,11 @@ from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore
 from ultralytics import YOLO
+
+# kiosk_firestore.py sits next to this file; isolated mode (python -I) does not add this folder itself.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kiosk_firestore import KioskFirestore, SERVER_TIMESTAMP as KIOSK_SERVER_TIMESTAMP  # noqa: E402
 
 # ── Platform-safe beep ────────────────────────────────────────────────────────
 if platform.system() == 'Windows':
@@ -56,23 +61,45 @@ def find_service_account():
     return None, tried
 
 
+# Preferred (audit C-02 / Phase 7): the least-privilege kiosk identity written by tools/set_claims.py.
+_KIOSK_CONFIG = Path(os.environ.get("ECOREWARD_KIOSK_CONFIG", "").strip()
+                     or Path.home() / ".ecoreward" / "kiosk.json").expanduser()
+
 db = None
-try:
-    _key, _tried = find_service_account()
-    if _key is None:
-        raise FileNotFoundError("Firebase credential not found. Looked in:\n    " + "\n    ".join(_tried))
-    if _APP_DIR in _key.resolve().parents:
-        print("[SECURITY WARNING] The Firebase key is stored inside the project folder.")
-        print(f"                   Move it to {_DEFAULT_KEY} (or set GOOGLE_APPLICATION_CREDENTIALS),")
-        print("                   and rotate it if this folder was ever zipped, shared or pushed.")
-    cred = credentials.Certificate(str(_key))
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("[FIREBASE] Connected!")
-except Exception as e:
-    print(f"[FIREBASE ERROR] {e}")
-    print("[FIREBASE ERROR] Running OFFLINE: QR codes will NOT be issued until this is fixed (see README).")
+DB_MODE = None                          # 'kiosk' (rules apply) or 'admin' (legacy, bypasses rules)
+SERVER_TS = firestore.SERVER_TIMESTAMP
+if _KIOSK_CONFIG.is_file():
+    # An explicit kiosk identity wins; if it fails we stay offline rather than silently
+    # falling back to the full-access key.
+    try:
+        db = KioskFirestore.from_config(_KIOSK_CONFIG)
+        db.check()
+        DB_MODE, SERVER_TS = "kiosk", KIOSK_SERVER_TIMESTAMP
+        print("[FIREBASE] Connected as the kiosk identity (least privilege).")
+    except Exception as e:
+        db = None
+        print(f"[FIREBASE ERROR] Kiosk identity in {_KIOSK_CONFIG} could not sign in: {e}")
+        print("[FIREBASE ERROR] Running OFFLINE: QR codes will NOT be issued until this is fixed (see README).")
+else:
+    try:
+        _key, _tried = find_service_account()
+        if _key is None:
+            raise FileNotFoundError("Firebase credential not found. Looked in:\n    " + "\n    ".join(_tried))
+        if _APP_DIR in _key.resolve().parents:
+            print("[SECURITY WARNING] The Firebase key is stored inside the project folder.")
+            print(f"                   Move it to {_DEFAULT_KEY} (or set GOOGLE_APPLICATION_CREDENTIALS),")
+            print("                   and rotate it if this folder was ever zipped, shared or pushed.")
+        cred = credentials.Certificate(str(_key))
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        DB_MODE = "admin"
+        print("[FIREBASE] Connected!")
+        print("[SECURITY] This kiosk uses a FULL-ACCESS service-account key (it can read every user).")
+        print("           Switch to the kiosk identity: see README, 'Kiosk identity'.")
+    except Exception as e:
+        print(f"[FIREBASE ERROR] {e}")
+        print("[FIREBASE ERROR] Running OFFLINE: QR codes will NOT be issued until this is fixed (see README).")
 
 # ── YOLO ───────────────────────────────────────────────────────────────────────
 print("[AI] Loading YOLO model...")
@@ -108,7 +135,9 @@ _RULES = json.loads(_RULES_FILE.read_text(encoding="utf-8")) if _RULES_FILE.exis
 QR_EXPIRY_MINUTES = _RULES.get("qrExpiryMinutes", 20)
 
 # Kiosk identity: hostname-based so the web admin can tell which machine sent each heartbeat
-KIOSK_ID = platform.node() or "kiosk-default"
+KIOSK_NAME = platform.node() or "kiosk-default"
+# With the kiosk identity the rules only let it write kiosks/{its own uid}; the PC name is stored as `name`.
+KIOSK_ID = db.uid if DB_MODE == "kiosk" else KIOSK_NAME
 
 # ── Palette BGR ────────────────────────────────────────────────────────────────
 BG        = (  8,  10,  14)   # near-black
@@ -728,7 +757,10 @@ def _cleanup_stale_tokens():
         print(f"[CLEANUP WARNING] {e}")
 
 # Run cleanup in a background thread so startup is not blocked
-threading.Thread(target=_cleanup_stale_tokens, daemon=True).start()
+# Only the legacy admin key may list tokens; the kiosk identity cannot (and expiry is enforced by the
+# rules with server time anyway).
+if DB_MODE == "admin":
+    threading.Thread(target=_cleanup_stale_tokens, daemon=True).start()
 
 
 def _start_heartbeat():
@@ -741,8 +773,9 @@ def _start_heartbeat():
         while not _stop.wait(30):
             try:
                 db.collection("kiosks").document(KIOSK_ID).set({
-                    "lastSeen": firestore.SERVER_TIMESTAMP,
+                    "lastSeen": SERVER_TS,
                     "status":   "online",
+                    "name":     KIOSK_NAME,
                 }, merge=True)
             except Exception:
                 pass
@@ -1115,13 +1148,13 @@ def main():
                 _scan_event.clear()   # new QR: drop any scan signal left over from the previous one,
                                       # even if the Firestore write below fails and no listener is started
                 try:
-                    claim_code = str(random.randint(1000, 9999))
+                    claim_code = str(1000 + secrets.randbelow(9000))   # unpredictable manual-claim code
                     db.collection("qr_tokens").document(token).set({
                         "wasteType": waste_type,
                         "expiresAt": expires_at,              # H-07: Admin SDK stores UTC datetime as Timestamp
                         "usedBy":    [],
                         "isUsed":    False,
-                        "createdAt": firestore.SERVER_TIMESTAMP,  # H-07
+                        "createdAt": SERVER_TS,  # H-07
                         "claimCode": claim_code,
                     })
                     qr_claim_code = claim_code
@@ -1135,7 +1168,7 @@ def main():
                             "confidence": float(latest_conf),
                             "modelFile":  MODEL_FILE,
                             "modelSha256": MODEL_SHA256,
-                            "timestamp":  firestore.SERVER_TIMESTAMP,
+                            "timestamp":  SERVER_TS,
                             "token":      token,
                             "kioskId":    KIOSK_ID,
                         })

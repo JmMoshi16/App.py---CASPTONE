@@ -11,7 +11,7 @@ import { after, before, beforeEach, describe, it } from 'node:test';
 import { assertFails, assertSucceeds, initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import {
   addDoc, arrayUnion, collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, increment, limit,
-  orderBy, query, runTransaction, setDoc, Timestamp, updateDoc, where, writeBatch,
+  orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, updateDoc, where, writeBatch,
 } from 'firebase/firestore';
 
 let env;
@@ -72,6 +72,9 @@ const alice = () => env.authenticatedContext('alice', { email: 'alice@example.co
 const bob   = () => env.authenticatedContext('bob',   { email: 'bob@example.com' }).firestore();
 const carol = () => env.authenticatedContext('carol', { email: 'carol@example.com' }).firestore(); // signed up, no profile yet
 const admin = () => env.authenticatedContext('adm',   { email: 'admin@example.com' }).firestore();
+// Phase 7 identities: custom claims are set only by tools/set_claims.py (Admin SDK).
+const kiosk = () => env.authenticatedContext('kiosk1', { kiosk: true }).firestore();
+const claimAdmin = () => env.authenticatedContext('staff2', { admin: true }).firestore(); // no users doc
 
 const ok = (p) => assertSucceeds(p);
 const denied = (p) => assertFails(p);
@@ -370,6 +373,86 @@ describe('qr_scan_history, settings, bins and everything else', () => {
   it('unknown collections are denied even for an admin (default deny)', async () => {
     await denied(getDoc(doc(admin(), 'secrets', 'x')));
     await denied(setDoc(doc(admin(), 'secrets', 'x'), { a: 1 }));
+  });
+});
+
+describe('kiosk identity (Phase 7, audit C-02): least privilege', () => {
+  const minutes = (m) => Timestamp.fromMillis(Date.now() + m * 60_000);
+  const token = (o = {}) => ({ wasteType: 'Recyclable', expiresAt: minutes(20), usedBy: [], isUsed: false,
+    createdAt: serverTimestamp(), claimCode: '4821', ...o });
+
+  it('creates a well-formed QR token and reads it back by id (scan polling)', async () => {
+    await ok(setDoc(doc(kiosk(), 'qr_tokens', 'k1'), token()));
+    await ok(getDoc(doc(kiosk(), 'qr_tokens', 'k1')));
+  });
+  it('cannot mint a token that is already used, too long-lived, back-dated or oddly shaped', async () => {
+    const db = kiosk();
+    await denied(setDoc(doc(db, 'qr_tokens', 'k2'), token({ isUsed: true })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'k3'), token({ usedBy: ['alice'] })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'k4'), token({ expiresAt: minutes(24 * 60) })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'k5'), token({ expiresAt: minutes(-1) })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'k6'), token({ createdAt: Timestamp.fromMillis(0) })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'k7'), token({ wasteType: 'Gold' })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'k8'), token({ claimCode: 'ABCD' })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'k9'), token({ points: 5000 })));
+  });
+  it('cannot change, claim, list or delete tokens', async () => {
+    const db = kiosk();
+    await denied(updateDoc(doc(db, 'qr_tokens', 'tok1'), { isUsed: true, usedBy: arrayUnion('kiosk1') }));
+    await denied(updateDoc(doc(db, 'qr_tokens', 'tok1'), { expiresAt: minutes(60) }));
+    await denied(getDocs(collection(db, 'qr_tokens')));
+    await denied(deleteDoc(doc(db, 'qr_tokens', 'tok1')));
+  });
+  it('a stolen kiosk credential cannot read any customer data', async () => {
+    const db = kiosk();
+    await denied(getDoc(doc(db, 'users', 'alice')));
+    await denied(getDocs(collection(db, 'users')));
+    await denied(getDoc(doc(db, 'profiles', 'alice')));
+    await denied(getDocs(query(collection(db, 'waste_logs'), where('userId', '==', 'alice'))));
+    await denied(getDocs(collection(db, 'redemptions')));
+    await denied(getDocs(collection(db, 'qr_scan_history')));
+    await denied(getDoc(doc(db, 'settings', 'app')));
+  });
+  it('cannot act as a customer or an admin', async () => {
+    const db = kiosk();
+    await denied(setDoc(doc(db, 'users', 'kiosk1'), { username: 'k', email: 'k@x', role: 'customer', points: 0,
+      lifetimePoints: 0, scanCount: 0, streak: 0, badges: [], createdAt: '2026-10-09' }));
+    await denied(addDoc(collection(db, 'waste_logs'), { userId: 'kiosk1', wasteType: 'Recyclable', pointsEarned: 10, timestamp: 'x', binId: 'b' }));
+    await denied(addDoc(collection(db, 'rewards'), { title: 'Free', pointsCost: 0 }));
+    await denied(updateDoc(doc(db, 'redemptions', 'rd_alice'), { status: 'claimed' }));
+  });
+  it('writes only its own heartbeat, with server time', async () => {
+    const db = kiosk();
+    await ok(setDoc(doc(db, 'kiosks', 'kiosk1'), { lastSeen: serverTimestamp(), status: 'online', name: 'CAFE-PC' }));
+    await denied(setDoc(doc(db, 'kiosks', 'other-kiosk'), { lastSeen: serverTimestamp(), status: 'online' }));
+    await denied(setDoc(doc(db, 'kiosks', 'kiosk1'), { lastSeen: Timestamp.fromMillis(0), status: 'online' }));
+    await denied(getDoc(doc(db, 'kiosks', 'kiosk1')));
+  });
+  it('logs detections only in its own name', async () => {
+    const det = (o = {}) => ({ wasteType: 'Recyclable', label: 'can', confidence: 0.92, modelFile: 'best.pt',
+      modelSha256: 'abc', timestamp: serverTimestamp(), token: 'k1', kioskId: 'kiosk1', ...o });
+    await ok(addDoc(collection(kiosk(), 'detections'), det()));
+    await denied(addDoc(collection(kiosk(), 'detections'), det({ kioskId: 'other-kiosk' })));
+    await denied(addDoc(collection(kiosk(), 'detections'), det({ confidence: 7 })));
+    await denied(addDoc(collection(alice(), 'detections'), det()));
+  });
+  it('customers cannot create tokens, write heartbeats or read detections', async () => {
+    await denied(setDoc(doc(alice(), 'qr_tokens', 'forged2'), token()));
+    await denied(setDoc(doc(alice(), 'kiosks', 'alice'), { lastSeen: serverTimestamp(), status: 'online' }));
+    await denied(getDocs(collection(alice(), 'detections')));
+  });
+});
+
+describe('admin custom claim (Phase 7)', () => {
+  it('an admin identified by claim (no users doc) can do admin work', async () => {
+    const db = claimAdmin();
+    await ok(getDocs(collection(db, 'users')));
+    await ok(updateDoc(doc(db, 'redemptions', 'rd_bob'), { status: 'claimed' }));
+    await ok(getDocs(collection(db, 'detections')));
+  });
+  it('a customer cannot fake the claim by writing it into a document', async () => {
+    await denied(updateDoc(doc(alice(), 'users', 'alice'), { admin: true }));
+    await denied(getDocs(collection(alice(), 'detections')));
   });
 });
 

@@ -87,20 +87,47 @@ py -3.11 -m pip install ultralytics opencv-python qrcode firebase-admin numpy ro
 py -3.11 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
-### 5. Add Firebase credentials
-The scanner needs a Firebase **service-account key**. It is a full-access secret (it bypasses all
-Firestore security rules), so keep it **outside this project folder**.
+### 5. Connect the kiosk to Firebase — kiosk identity (recommended)
+The kiosk signs in as its **own** Firebase user with the claim `kiosk: true`. The Firestore rules let that
+identity do only four things: create a well-formed QR token, read a token by id, write its own heartbeat and
+add a detection. A stolen kiosk PC therefore **cannot read customer e-mails, points or redemptions**, and you
+cut it off by revoking one user. Its config file holds a public Web API key and a revocable sign-in token —
+no password and no private key.
+
+**Before the first time:** deploy the Phase 7 rules (`firebase/README.md`). The kiosk identity depends on them.
+
+On an **admin's computer** (the one that has the service-account key — see "Admin key" below):
+```bash
+py -3.11 tools\set_claims.py create-kiosk --name cafe-kiosk-1 --api-key <Web API key>
+```
+The Web API key is in Firebase Console → Project settings → General (it is public; it also ships in the app).
+This writes `%USERPROFILE%\.ecoreward\kiosk.json` (readable only by you). Then:
+
+1. Copy `kiosk.json` to the **kiosk PC** at `C:\Users\<kiosk user>\.ecoreward\kiosk.json`
+   (or anywhere, and point to it with `setx ECOREWARD_KIOSK_CONFIG "C:\path\kiosk.json"`).
+2. **Remove the service-account key from the kiosk PC.**
+3. Start the scanner. The first lines must say `[FIREBASE] Connected as the kiosk identity (least privilege).`
+4. Kiosk lost, stolen or retired: `py -3.11 tools\set_claims.py revoke-kiosk cafe-kiosk-1` (takes effect within an hour).
+
+While a QR is on screen, the kiosk checks every 2 s (every 5 s after 2 minutes) whether it was scanned — the
+REST API it uses has no live listener. That is at most a few hundred reads per unscanned QR.
+
+#### Admin key (admin computers and the maintenance tools only)
+`tools\set_claims.py`, `tools\backfill_profiles.py`, `tools\delete_user_data.py` and `tools\migrate_timestamps.py`
+use a **service-account key**. It is a full-access secret (it bypasses all Firestore rules): keep it on an
+admin's computer, **outside this project folder**.
 
 1. Firebase Console → Project Settings → Service Accounts → **Generate new private key**.
-2. Save it **outside** the project, at `C:\Users\<you>\.ecoreward\kiosk-sa.json` (create the folder),
-   or anywhere you like and point to it once with an environment variable, then open a new terminal:
+2. Save it at `C:\Users\<you>\.ecoreward\kiosk-sa.json` (create the folder), or anywhere you like and point to it
+   once with an environment variable, then open a new terminal:
    ```bash
    setx GOOGLE_APPLICATION_CREDENTIALS "C:\path\to\kiosk-sa.json"
    ```
-3. Start the scanner. The first lines must say `[FIREBASE] Connected!` and the top bar must show **LIVE**.
 
-Lookup order: `GOOGLE_APPLICATION_CREDENTIALS` → `~/.ecoreward/kiosk-sa.json` → *(legacy, deprecated)*
-`serviceAccountKey.json` / `serviceAccountKey.json.json` next to `app.py` (the scanner warns if it finds the key there).
+If there is **no** `kiosk.json`, the scanner still falls back to this key (legacy mode) and prints a
+`[SECURITY]` warning — that mode can read every user, so switch to the kiosk identity.
+Lookup order: `ECOREWARD_KIOSK_CONFIG` / `~/.ecoreward/kiosk.json` (kiosk identity) → `GOOGLE_APPLICATION_CREDENTIALS`
+→ `~/.ecoreward/kiosk-sa.json` → *(legacy, deprecated)* `serviceAccountKey.json[.json]` next to `app.py`.
 
 If no credential is found the scanner runs **OFFLINE**: a red banner is shown and SPACE will **not** issue
 QR codes, because a QR for a token that was never stored can never be redeemed.
@@ -203,7 +230,9 @@ App.py---CASPTONE-master/
 ├── train.py                      # YOLOv8 training script (optional)
 ├── dataset/
 │   └── data.yaml                 # Dataset config (6 classes)
-├── (kiosk-sa.json)               # ⚠️ NOT in repo — lives OUTSIDE the project: ~/.ecoreward/kiosk-sa.json
+├── kiosk_firestore.py            # least-privilege Firestore client used with the kiosk identity
+├── (kiosk.json)                  # ⚠️ NOT in repo — kiosk PC only: ~/.ecoreward/kiosk.json (tools/set_claims.py)
+├── (kiosk-sa.json)               # ⚠️ NOT in repo — ADMIN PC only, OUTSIDE the project: ~/.ecoreward/kiosk-sa.json
 ├── best.pt                       # ⚠️ NOT in repo — train locally or get from teammate
 └── yolov8n.pt                    # ⚠️ NOT in repo — auto-downloaded by ultralytics
 ```

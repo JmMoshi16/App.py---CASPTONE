@@ -26,22 +26,49 @@ rules_version = '2';
 //
 // Phase 5: `lifetimePoints` (never decreases, +100 max per write); one token = one claim (`isUsed`).
 //
-// NOTE: the kiosk (Python, Admin SDK) bypasses these rules entirely - see audit C-02.
+// Phase 7 (audit C-02): the kiosk signs in as its own Firebase Auth user with the custom claim
+// `kiosk: true` (tools/set_claims.py) instead of using a full-access service-account key. That identity
+// can ONLY create well-formed QR tokens, read a token by id, write its own heartbeat and detection log.
+// It cannot read users, profiles, logs or redemptions and cannot act as a customer. Admins may also be
+// identified by the custom claim `admin: true`; the `users.role == 'admin'` check still works.
+// The legacy Admin-SDK kiosk mode bypasses these rules - retire it once the kiosk identity is in use.
 
 service cloud.firestore {
   match /databases/{database}/documents {
 
     // ── helpers ──────────────────────────────────────────────────────────────
-    function signedIn()     { return request.auth != null; }
+    // The kiosk device identity (custom claim set only by tools/set_claims.py with the Admin SDK).
+    function isKiosk()      { return request.auth != null && request.auth.token.get('kiosk', false) == true; }
+    // A signed-in PERSON (customer or admin). The kiosk is excluded on purpose, so a stolen kiosk
+    // credential cannot sign up as a customer, claim tokens or earn points.
+    function signedIn()     { return request.auth != null && !isKiosk(); }
     function isOwner(uid)   { return signedIn() && request.auth.uid == uid; }
     function changedKeys()  { return request.resource.data.diff(resource.data).affectedKeys(); }
 
-    // Admin = a user document whose role is 'admin'. Customers cannot change `role` (see /users),
-    // so this cannot be self-granted. Evaluated last in `||` chains so customers don't pay the extra read.
+    // Admin = custom claim `admin: true` (no extra read), or a user document whose role is 'admin'.
+    // Neither can be self-granted: claims are set only with the Admin SDK and customers cannot change
+    // `role` (see /users). Evaluated last in `||` chains so customers don't pay the extra read.
     function isAdmin() {
       return signedIn()
-          && exists(/databases/$(database)/documents/users/$(request.auth.uid))
-          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+          && (request.auth.token.get('admin', false) == true
+              || (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+                  && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'));
+    }
+
+    // A QR token exactly as the kiosk creates it: unused, a known category, a 4-digit claim code,
+    // created now (server time) and expiring within 30 minutes.
+    function isNewKioskToken() {
+      let t = request.resource.data;
+      return t.keys().hasOnly(['wasteType', 'expiresAt', 'usedBy', 'isUsed', 'createdAt', 'claimCode'])
+          && t.wasteType in ['Biodegradable', 'Recyclable', 'Residual']
+          && t.usedBy == []
+          && t.isUsed == false
+          && t.createdAt == request.time
+          && t.expiresAt is timestamp
+          && t.expiresAt > request.time
+          && t.expiresAt <= request.time + duration.value(30, 'm')
+          && t.claimCode is string
+          && t.claimCode.matches('^[0-9]{4}$');
     }
 
     // A customer's own balance: an integer, never negative, at most +100 per write.
@@ -150,9 +177,10 @@ service cloud.firestore {
     // ── qr_tokens ────────────────────────────────────────────────────────────
     // Customers can fetch ONE token by id (they hold the QR) but can never list or query tokens.
     match /qr_tokens/{token} {
-      allow get:    if signedIn();
+      allow get:    if signedIn() || isKiosk();      // the kiosk polls its own QR to see it was scanned
       allow list:   if isAdmin();
-      allow create: if isAdmin();      // Flutter admin QR screen. The kiosk uses the Admin SDK.
+      allow create: if isAdmin()                     // Flutter admin QR screen
+                    || (isKiosk() && isNewKioskToken());
 
       // One token = one claim (audit H-02): the first customer sets usedBy = [own uid] and isUsed = true.
       // Expiry is checked with server time when expiresAt is a Timestamp (audit H-07).
@@ -184,18 +212,29 @@ service cloud.firestore {
       allow write: if false;           // nothing in the project writes bins (audit H-09)
     }
 
-    // ── kiosks (3.4: heartbeat written by kiosk via Admin SDK) ───────────────
-    // The kiosk writes via Admin SDK (bypasses rules). The web admin reads; clients never write.
+    // ── kiosks (heartbeat) ───────────────────────────────────────────────────
+    // A kiosk writes only its OWN document (id = its Auth uid), with a server-time lastSeen.
     match /kiosks/{kioskId} {
       allow read:  if isAdmin();
-      allow write: if false;           // Admin SDK only
+      allow create, update: if isKiosk()
+                    && request.auth.uid == kioskId
+                    && request.resource.data.keys().hasOnly(['lastSeen', 'status', 'name'])
+                    && request.resource.data.lastSeen == request.time;
+      allow delete: if false;
     }
 
-    // ── detections (3.4: detection log written by kiosk via Admin SDK) ────────
-    // Written by the kiosk's Admin SDK. The web admin reads; clients never write.
+    // ── detections (one row per issued QR, audit M-21) ───────────────────────
     match /detections/{id} {
       allow read:  if isAdmin();
-      allow write: if false;           // Admin SDK only
+      allow create: if isKiosk()
+                    && request.resource.data.keys().hasOnly(['wasteType', 'label', 'confidence', 'modelFile',
+                                                             'modelSha256', 'timestamp', 'token', 'kioskId'])
+                    && request.resource.data.kioskId == request.auth.uid
+                    && request.resource.data.timestamp == request.time
+                    && request.resource.data.wasteType in ['Biodegradable', 'Recyclable', 'Residual']
+                    && request.resource.data.confidence is number
+                    && request.resource.data.confidence >= 0 && request.resource.data.confidence <= 1;
+      allow update, delete: if false;
     }
 
     // Everything else is denied by default.

@@ -28,6 +28,8 @@ __pycache__/
 kiosk-sa.json
 *serviceAccount*.json*
 *-adminsdk-*.json
+# Kiosk identity config (belongs in ~/.ecoreward/kiosk.json, never in the project)
+kiosk.json
 
 # Virtual environments
 .venv/
@@ -35,6 +37,7 @@ venv/
 
 # Node dependencies of the Firestore rules tests
 firebase/tests/node_modules/
+firebase/tests/*.log
 
 # OS
 .DS_Store

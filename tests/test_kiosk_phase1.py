@@ -113,6 +113,8 @@ class FakeCap:
 
 def _install_fakes():
     """Replace heavy / external modules BEFORE app.py is imported."""
+    # Never pick up a real kiosk identity from this PC's ~/.ecoreward/kiosk.json during tests.
+    os.environ["ECOREWARD_KIOSK_CONFIG"] = str(Path(tempfile.gettempdir()) / "ecoreward-tests-no-kiosk.json")
     class _NoCredential:
         def __init__(self, *a, **k):
             raise FileNotFoundError("fake: no credential at import time (tests inject app.db themselves)")
