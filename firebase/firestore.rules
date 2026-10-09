@@ -19,9 +19,9 @@ rules_version = '2';
 //   - The phone credits points itself, so a customer can still raise their OWN `points` in small steps.
 //     Rules can bound a write, they cannot verify that a QR was genuine.
 //
-// KNOWN LEAK KEPT FOR NOW  (audit H-13)
-//   - The leaderboard needs customers to read other customers' documents, which exposes their e-mail
-//     addresses. Fix = split a public `profiles` collection from private `users` (Phase 3/7).
+// FIXED (audit H-13, Phase 3)
+//   - `profiles` collection added below: public stats only (username, points, badges).
+//     Leaderboard now queries `profiles` — e-mail and role never leave the `users` collection.
 //
 // NOTE: the kiosk (Python, Admin SDK) bypasses these rules entirely - see audit C-02.
 
@@ -70,6 +70,25 @@ service cloud.firestore {
       allow update: if (isOwner(uid)
                         && changedKeys().hasOnly(['username', 'points', 'scanCount', 'streak',
                                                   'lastScanDate', 'badges', 'createdAt'])
+                        && pointsOk())
+                    || isAdmin();
+
+      allow delete: if false;
+    }
+
+    // ── profiles (H-13: public leaderboard stats; no email / role) ──────────
+    // Any signed-in user can read; only the owner (or admin) can write,
+    // and only the three public fields are permitted.
+    match /profiles/{uid} {
+      allow read: if signedIn();
+
+      allow create: if isOwner(uid)
+                    && request.resource.data.keys().hasOnly(['username', 'points', 'badges'])
+                    && request.resource.data.points == 0
+                    && request.resource.data.badges.size() == 0;
+
+      allow update: if (isOwner(uid)
+                        && changedKeys().hasOnly(['username', 'points', 'badges'])
                         && pointsOk())
                     || isAdmin();
 
