@@ -10,8 +10,8 @@ import { readFileSync } from 'node:fs';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { assertFails, assertSucceeds, initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import {
-  addDoc, arrayUnion, collection, deleteDoc, doc, getDoc, getDocs, increment, orderBy, query,
-  runTransaction, setDoc, updateDoc, where,
+  addDoc, arrayUnion, collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, increment, limit,
+  orderBy, query, runTransaction, setDoc, Timestamp, updateDoc, where, writeBatch,
 } from 'firebase/firestore';
 
 let env;
@@ -41,6 +41,8 @@ beforeEach(async () => {
     await setDoc(doc(db, 'users', 'alice'), customer({ username: 'alice', email: 'alice@example.com' }));
     await setDoc(doc(db, 'users', 'bob'), customer({ username: 'bob', email: 'bob@example.com', points: 120 }));
     await setDoc(doc(db, 'users', 'adm'), customer({ username: 'admin', email: 'admin@example.com', role: 'admin', points: 0 }));
+    // alice has a profile; bob is an account from before profiles existed (no profile, no lifetimePoints)
+    await setDoc(doc(db, 'profiles', 'alice'), { username: 'alice', points: 50, lifetimePoints: 50, badges: ['first_scan'] });
     const reward = (o) => ({ title: 'Free Coffee', description: 'x', pointsCost: 50, category: 'Coffee', isActive: true, ...o });
     await setDoc(doc(db, 'rewards', 'limited'), reward({ stock: 3 }));
     await setDoc(doc(db, 'rewards', 'unlimited'), reward({ stock: -1 }));
@@ -56,7 +58,9 @@ beforeEach(async () => {
     const token = (usedBy) => ({ wasteType: 'Recyclable', expiresAt: '2099-01-01T00:00:00.000', usedBy, isUsed: false,
       createdAt: '2026-10-08T10:00:00.000', claimCode: '1234' });
     await setDoc(doc(db, 'qr_tokens', 'tok1'), token([]));
-    await setDoc(doc(db, 'qr_tokens', 'tok2'), token(['bob']));
+    await setDoc(doc(db, 'qr_tokens', 'tok2'), { ...token(['bob']), isUsed: true });
+    await setDoc(doc(db, 'qr_tokens', 'tokTs'), { ...token([]), expiresAt: Timestamp.fromDate(new Date('2099-01-01')) });
+    await setDoc(doc(db, 'qr_tokens', 'tokOld'), { ...token([]), expiresAt: Timestamp.fromDate(new Date('2020-01-01')) });
     await setDoc(doc(db, 'qr_scan_history', 'h1'), { token: 'tok2', scannedByUid: 'bob', wasteType: 'Recyclable', pointsAwarded: 10 });
     await setDoc(doc(db, 'settings', 'app'), { pointsRecyclable: 10, qrExpiryMinutes: 20 });
     await setDoc(doc(db, 'bins', 'bin1'), { location: 'Cafe', fillLevel: 40 });
@@ -84,8 +88,19 @@ describe('anonymous visitor', () => {
 
 describe('sign-up (Flutter FirebaseService.register)', () => {
   const fresh = (o = {}) => ({ username: 'carol', email: 'carol@example.com', role: 'customer', points: 0,
-    createdAt: '2026-10-09T09:00:00.000', scanCount: 0, streak: 0, badges: [], ...o });
+    lifetimePoints: 0, createdAt: '2026-10-09T09:00:00.000', scanCount: 0, streak: 0, badges: [], ...o });
+  const freshProfile = (o = {}) => ({ username: 'carol', points: 0, lifetimePoints: 0, badges: [], ...o });
   it('allows a customer profile with zeroed stats', async () => { await ok(setDoc(doc(carol(), 'users', 'carol'), fresh())); });
+  it('Phase 5 batch: users doc + matching public profile', async () => {
+    const db = carol();
+    await ok(writeBatch(db).set(doc(db, 'users', 'carol'), fresh()).set(doc(db, 'profiles', 'carol'), freshProfile()).commit());
+  });
+  it('denies a profile that does not match the user document, or starting lifetime points', async () => {
+    const db = carol();
+    await denied(writeBatch(db).set(doc(db, 'users', 'carol'), fresh()).set(doc(db, 'profiles', 'carol'), freshProfile({ points: 500 })).commit());
+    await denied(writeBatch(db).set(doc(db, 'users', 'carol'), fresh()).set(doc(db, 'profiles', 'carol'), freshProfile({ email: 'x@y' })).commit());
+    await denied(setDoc(doc(db, 'users', 'carol'), fresh({ lifetimePoints: 500 })));
+  });
   it('denies signing up as admin', async () => { await denied(setDoc(doc(carol(), 'users', 'carol'), fresh({ role: 'admin' }))); });
   it('denies signing up with starting points', async () => { await denied(setDoc(doc(carol(), 'users', 'carol'), fresh({ points: 500 }))); });
   it('denies signing up with fake stats or badges', async () => {
@@ -95,21 +110,39 @@ describe('sign-up (Flutter FirebaseService.register)', () => {
   it('denies creating a profile for somebody else', async () => { await denied(setDoc(doc(carol(), 'users', 'dave'), fresh({ username: 'dave' }))); });
 });
 
-describe('users - reading', () => {
+describe('users - reading (private since Phase 5: H-13 closed)', () => {
   it('a customer reads their own document', async () => { await ok(getDoc(doc(alice(), 'users', 'alice'))); });
-  it('a customer reads another customer (leaderboard needs this - known leak H-13)', async () => { await ok(getDoc(doc(alice(), 'users', 'bob'))); });
+  it("a customer can no longer read another customer's document (e-mail)", async () => { await denied(getDoc(doc(alice(), 'users', 'bob'))); });
   it('a customer cannot read an admin document', async () => { await denied(getDoc(doc(alice(), 'users', 'adm'))); });
-  it('leaderboard query: customers ordered by points', async () => {
-    await ok(getDocs(query(collection(alice(), 'users'), where('role', '==', 'customer'), orderBy('points', 'desc'))));
-  });
-  it('rank query: customers with more points', async () => {
-    await ok(getDocs(query(collection(alice(), 'users'), where('role', '==', 'customer'), where('points', '>', 10))));
-  });
-  it('a customer cannot list all users, or admins', async () => {
+  it('a customer cannot query users at all', async () => {
     await denied(getDocs(collection(alice(), 'users')));
-    await denied(getDocs(query(collection(alice(), 'users'), where('role', '==', 'admin'))));
+    await denied(getDocs(query(collection(alice(), 'users'), where('role', '==', 'customer'), orderBy('points', 'desc'))));
   });
-  it('an admin lists everything', async () => { await ok(getDocs(collection(admin(), 'users'))); });
+  it('an admin lists everything (web leaderboard, admin screens)', async () => {
+    await ok(getDocs(collection(admin(), 'users')));
+    await ok(getDocs(query(collection(admin(), 'users'), where('role', '==', 'customer'), orderBy('points', 'desc'))));
+  });
+});
+
+describe('profiles - the public leaderboard', () => {
+  it('any signed-in customer runs the leaderboard and rank queries', async () => {
+    await ok(getDocs(query(collection(bob(), 'profiles'), orderBy('lifetimePoints', 'desc'), limit(20))));
+    await ok(getCountFromServer(query(collection(bob(), 'profiles'), where('lifetimePoints', '>', 10))));
+  });
+  it('an anonymous visitor cannot read profiles', async () => { await denied(getDoc(doc(anon(), 'profiles', 'alice'))); });
+  it("a customer cannot inflate their profile, or write someone else's", async () => {
+    await denied(setDoc(doc(alice(), 'profiles', 'alice'), { username: 'alice', points: 9999, lifetimePoints: 9999, badges: ['first_scan'] }));
+    await denied(setDoc(doc(alice(), 'profiles', 'bob'), { username: 'bob', points: 120, lifetimePoints: 120, badges: ['first_scan'] }));
+    await denied(deleteDoc(doc(alice(), 'profiles', 'alice')));
+  });
+  it('username change (updateUsername): users + profile in one transaction', async () => {
+    const db = alice();
+    await ok(runTransaction(db, async (tx) => {
+      await tx.get(doc(db, 'users', 'alice'));
+      tx.update(doc(db, 'users', 'alice'), { username: 'alice2' });
+      tx.set(doc(db, 'profiles', 'alice'), { username: 'alice2', points: 50, lifetimePoints: 50, badges: ['first_scan'] });
+    }));
+  });
 });
 
 describe('users - updating (the privilege-escalation and cheating paths)', () => {
@@ -123,6 +156,30 @@ describe('users - updating (the privilege-escalation and cheating paths)', () =>
       const snap = await tx.get(ref);
       tx.update(ref, { points: increment(15), scanCount: increment(1), streak: 2, lastScanDate: '2026-10-09', badges: [...snap.data().badges, 'scan_5'] });
     }));
+  });
+  it('Phase 5 scan transaction: log with pointsAwarded + absolute user stats + profile copy', async () => {
+    const db = alice();
+    await ok(runTransaction(db, async (tx) => {
+      await tx.get(doc(db, 'users', 'alice'));
+      tx.set(doc(collection(db, 'waste_logs')), { userId: 'alice', wasteType: 'Biodegradable', pointsEarned: 15, pointsAwarded: 23,
+        timestamp: Timestamp.now(), binId: 'abcd1234' });
+      tx.update(doc(db, 'users', 'alice'), { points: 73, lifetimePoints: 73, scanCount: 4, streak: 3, lastScanDate: '2026-10-09',
+        badges: ['first_scan', 'pts_50', 'streak_3'] });
+      tx.set(doc(db, 'profiles', 'alice'), { username: 'alice', points: 73, lifetimePoints: 73, badges: ['first_scan', 'pts_50', 'streak_3'] });
+    }));
+  });
+  it('an account from before profiles (bob) gets its profile created by its next scan', async () => {
+    const db = bob();
+    await ok(runTransaction(db, async (tx) => {
+      await tx.get(doc(db, 'users', 'bob'));
+      tx.update(doc(db, 'users', 'bob'), { points: 130, lifetimePoints: 130, scanCount: 4 });
+      tx.set(doc(db, 'profiles', 'bob'), { username: 'bob', points: 130, lifetimePoints: 130, badges: ['first_scan'] });
+    }));
+  });
+  it('lifetimePoints never decreases and grows at most +100 per write', async () => {
+    await denied(updateDoc(a(), { lifetimePoints: 10 }));
+    await denied(updateDoc(a(), { lifetimePoints: 5000 }));
+    await denied(updateDoc(a(), { lifetimePoints: 60.5 }));
   });
   it('largest legitimate credit (+30: biodegradable 15 x 2.0 streak) is allowed', async () => { await ok(updateDoc(a(), { points: increment(30) })); });
   it('redeem: points - 50', async () => { await ok(updateDoc(a(), { points: increment(-50) })); });
@@ -182,6 +239,27 @@ describe('redemptions', () => {
       tx.update(doc(db, 'rewards', 'limited'), { stock: increment(-1) });
     }));
   });
+  it('Phase 5 redeem: balance down, lifetime unchanged, profile copied', async () => {
+    const db = alice(); const rdRef = doc(collection(db, 'redemptions'));
+    await ok(runTransaction(db, async (tx) => {
+      await tx.get(doc(db, 'users', 'alice')); await tx.get(doc(db, 'rewards', 'limited'));
+      tx.set(rdRef, mine());
+      tx.update(doc(db, 'users', 'alice'), { points: 0, lifetimePoints: 50 });
+      tx.set(doc(db, 'profiles', 'alice'), { username: 'alice', points: 0, lifetimePoints: 50, badges: ['first_scan'] });
+      tx.update(doc(db, 'rewards', 'limited'), { stock: increment(-1) });
+    }));
+  });
+  it('a redemption cannot lower lifetimePoints', async () => {
+    await denied(updateDoc(doc(alice(), 'users', 'alice'), { points: 0, lifetimePoints: 0 }));
+  });
+  it('a profile that keeps the old lifetime while users silently falls back to the new balance is denied', async () => {
+    const db = alice();
+    await denied(runTransaction(db, async (tx) => {
+      await tx.get(doc(db, 'users', 'alice'));
+      tx.update(doc(db, 'users', 'alice'), { points: 0 });
+      tx.set(doc(db, 'profiles', 'alice'), { username: 'alice', points: 0, lifetimePoints: 50, badges: ['first_scan'] });
+    }));
+  });
   it('a customer cannot create a redemption for someone else, or one that is already claimed', async () => {
     await denied(addDoc(collection(alice(), 'redemptions'), mine({ userId: 'bob' })));
     await denied(addDoc(collection(alice(), 'redemptions'), mine({ status: 'claimed' })));
@@ -210,6 +288,10 @@ describe('waste_logs', () => {
     await ok(addDoc(collection(alice(), 'waste_logs'), log('alice')));
     await denied(addDoc(collection(alice(), 'waste_logs'), log('bob')));
   });
+  it('pointsAwarded must be a sane integer', async () => {
+    await ok(addDoc(collection(alice(), 'waste_logs'), { ...log('alice'), pointsAwarded: 30 }));
+    await denied(addDoc(collection(alice(), 'waste_logs'), { ...log('alice'), pointsAwarded: 9999 }));
+  });
   it('a customer reads their own logs (query) but not all, nor others', async () => {
     await ok(getDocs(query(collection(alice(), 'waste_logs'), where('userId', '==', 'alice'))));
     await denied(getDocs(collection(alice(), 'waste_logs')));
@@ -232,22 +314,29 @@ describe('qr_tokens', () => {
     await denied(getDocs(collection(alice(), 'qr_tokens')));
     await denied(getDocs(query(collection(alice(), 'qr_tokens'), where('claimCode', '==', '1234'))));
   });
-  it('scan transaction: appending own uid to usedBy', async () => {
+  it('scan transaction as the app does it (H-02): usedBy += own uid, isUsed = true', async () => {
     const db = alice(); const ref = doc(db, 'qr_tokens', 'tok1');
-    await ok(runTransaction(db, async (tx) => { await tx.get(ref); tx.update(ref, { usedBy: arrayUnion('alice') }); }));
+    await ok(runTransaction(db, async (tx) => { await tx.get(ref); tx.update(ref, { isUsed: true, usedBy: arrayUnion('alice') }); }));
   });
-  it('a second customer can append to a token that already has one user', async () => {
-    await ok(updateDoc(doc(alice(), 'qr_tokens', 'tok2'), { usedBy: arrayUnion('alice') }));
+  it('...also for a kiosk token whose expiresAt is a Timestamp (H-07)', async () => {
+    await ok(updateDoc(doc(alice(), 'qr_tokens', 'tokTs'), { isUsed: true, usedBy: arrayUnion('alice') }));
   });
-  it('a customer cannot add someone else, remove others, or change anything else', async () => {
-    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok1'), { usedBy: arrayUnion('bob') }));
-    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok2'), { usedBy: ['alice'] }));                 // erases bob
-    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok1'), { usedBy: arrayUnion('alice'), expiresAt: '2099-12-31' }));
+  it('an expired Timestamp token cannot be claimed (server time)', async () => {
+    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tokOld'), { isUsed: true, usedBy: arrayUnion('alice') }));
+  });
+  it('one token = one claim: a second customer cannot claim a used token', async () => {
+    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok2'), { usedBy: arrayUnion('alice') }));
+    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok2'), { isUsed: true, usedBy: ['alice'] }));
+  });
+  it('a customer cannot claim for someone else, leave isUsed false, or change anything else', async () => {
+    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok1'), { isUsed: true, usedBy: arrayUnion('bob') }));
+    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok1'), { usedBy: arrayUnion('alice') }));
+    await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok1'), { isUsed: true, usedBy: arrayUnion('alice'), expiresAt: '2099-12-31' }));
     await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok1'), { wasteType: 'Biodegradable' }));
     await denied(updateDoc(doc(alice(), 'qr_tokens', 'tok1'), { isUsed: true }));
   });
   it('a customer cannot add the same uid twice, create or delete tokens', async () => {
-    await denied(updateDoc(doc(bob(), 'qr_tokens', 'tok2'), { usedBy: ['bob', 'bob'] }));
+    await denied(updateDoc(doc(bob(), 'qr_tokens', 'tok1'), { isUsed: true, usedBy: ['bob', 'bob'] }));
     await denied(setDoc(doc(alice(), 'qr_tokens', 'forged'), { wasteType: 'Biodegradable', usedBy: [], isUsed: false }));
     await denied(deleteDoc(doc(alice(), 'qr_tokens', 'tok1')));
   });
