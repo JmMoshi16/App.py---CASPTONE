@@ -442,6 +442,67 @@ class DetectionLogTest(unittest.TestCase):
         self.assertEqual(d["token"], db.sets[0][1])
 
 
+# ── Phase 8.5: golden path through the emulator (kiosk -> token -> phone claim -> kiosk -> admin) ──
+def _emulator_client(uid, claims):
+    import base64, json as _json, time as _time
+    enc = lambda d: base64.urlsafe_b64encode(_json.dumps(d).encode()).decode().rstrip("=")
+    now, project = int(_time.time()), "demo-ecoreward"
+    token = (enc({"alg": "none", "typ": "JWT"}) + "." + enc({
+        "iss": f"https://securetoken.google.com/{project}", "aud": project, "sub": uid, "user_id": uid,
+        "iat": now, "exp": now + 3600, "auth_time": now,
+        "firebase": {"sign_in_provider": "custom", "identities": {}}, **claims}) + ".")
+    return app.KioskFirestore(project, lambda: token,
+                              base_url=f"http://{os.environ['FIRESTORE_EMULATOR_HOST']}/v1")
+
+
+@unittest.skipUnless(os.environ.get("FIRESTORE_EMULATOR_HOST"), "Firestore emulator not running")
+class GoldenPathEmulatorTest(unittest.TestCase):
+    """The real main() loop and the real kiosk client against the real rules (run via firebase emulators:exec)."""
+
+    def test_kiosk_issues_a_qr_a_phone_claims_it_and_the_kiosk_reacts(self):
+        import time as _time
+        kiosk_db = _emulator_client("kiosk-golden", {"kiosk": True})
+        phone = _emulator_client("alice-golden", {})
+        other_phone = _emulator_client("bob-golden", {})
+        admin = _emulator_client("staff-golden", {"admin": True})
+        state = {}
+
+        def phone_scans_the_qr():
+            state["token"] = app._active_token
+            # Exactly what the Flutter app writes when it claims a token (validateAndUseQRToken).
+            phone.collection("qr_tokens").document(state["token"]).set(
+                {"usedBy": ["alice-golden"], "isUsed": True}, merge=True)
+
+        def wait_for_the_kiosk_to_notice():
+            deadline = _time.monotonic() + 15
+            while not _scan_flag_is_set() and _time.monotonic() < deadline:
+                _time.sleep(0.2)
+            state["noticed"] = _scan_flag_is_set()
+
+        with mock.patch.object(app, "db", kiosk_db), \
+                mock.patch.object(app, "SERVER_TS", app.KIOSK_SERVER_TIMESTAMP), \
+                mock.patch.object(app, "KIOSK_ID", "kiosk-golden"), \
+                mock.patch.object(app, "draw_success", wraps=app.draw_success) as success:
+            out, _ = run_main({3: SPACE, 8: QUIT}, hooks={4: phone_scans_the_qr, 5: wait_for_the_kiosk_to_notice})
+
+        self.assertIn("[FIREBASE] Token saved", out)
+        self.assertTrue(state.get("noticed"), "the kiosk never noticed the phone's claim (C-04 via REST polling)")
+        self.assertGreaterEqual(success.call_count, 1)
+        self.assertIn("[SCANNED]", out)
+
+        from kiosk_firestore import KioskFirestoreError
+        with self.assertRaises(KioskFirestoreError):     # one token = one claim (H-02)
+            other_phone.collection("qr_tokens").document(state["token"]).set(
+                {"usedBy": ["bob-golden"], "isUsed": True}, merge=True)
+        claimed = admin.collection("qr_tokens").document(state["token"]).get().to_dict()
+        self.assertEqual(claimed["usedBy"], ["alice-golden"])
+        self.assertIs(claimed["isUsed"], True)
+        with self.assertRaises(KioskFirestoreError):     # and the kiosk still cannot read customers (C-02)
+            kiosk_db.collection("users").document("alice-golden").get()
+        if app._watcher:
+            app._watcher.unsubscribe()
+
+
 # ── static guard: the C-04 bug class can't come back ──────────────────────────
 class NoShadowedGlobalsTest(unittest.TestCase):
     def test_no_function_assigns_a_name_that_another_function_declares_global(self):

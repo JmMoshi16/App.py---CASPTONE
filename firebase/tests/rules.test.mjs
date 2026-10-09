@@ -7,6 +7,7 @@
 //
 //   cd firebase/tests && npm install && npm test        (needs Java 21+; see ../README.md)
 import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { assertFails, assertSucceeds, initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import {
@@ -21,7 +22,8 @@ before(async () => {
   env = await initializeTestEnvironment({
     projectId: 'demo-ecoreward',
     firestore: {
-      rules: readFileSync(new URL('../firestore.rules', import.meta.url), 'utf8'),
+      // RULES_FILE lets tools/break_restore.py run these tests against a deliberately broken copy.
+      rules: readFileSync(process.env.RULES_FILE || new URL('../firestore.rules', import.meta.url), 'utf8'),
       host,
       port: Number(port),
     },
@@ -453,6 +455,98 @@ describe('admin custom claim (Phase 7)', () => {
   it('a customer cannot fake the claim by writing it into a document', async () => {
     await denied(updateDoc(doc(alice(), 'users', 'alice'), { admin: true }));
     await denied(getDocs(collection(alice(), 'detections')));
+  });
+});
+
+// ── Phase 8: races. Each transaction mirrors the app code it names; both sides start at once. ──
+const settle = (ps) => Promise.allSettled(ps).then((rs) => rs.map((r) => r.status));
+
+describe('concurrency (Phase 8, audit H-02 / H-06 / stock race)', () => {
+  // Flutter FirebaseService.validateAndUseQRToken
+  const claimToken = (db, uid, tokenId) => runTransaction(db, async (tx) => {
+    const ref = doc(db, 'qr_tokens', tokenId);
+    const t = (await tx.get(ref)).data();
+    if (!t || t.isUsed === true || (t.usedBy ?? []).length > 0) throw new Error('alreadyUsed');
+    tx.update(ref, { isUsed: true, usedBy: arrayUnion(uid) });
+  });
+
+  it('two phones scan the same QR at the same moment: exactly one wins', async () => {
+    const results = await settle([claimToken(alice(), 'alice', 'tok1'), claimToken(bob(), 'bob', 'tok1')]);
+    assert.deepEqual(results.sort(), ['fulfilled', 'rejected']);
+    let token;
+    await env.withSecurityRulesDisabled(async (ctx) => { token = (await getDoc(doc(ctx.firestore(), 'qr_tokens', 'tok1'))).data(); });
+    assert.equal(token.usedBy.length, 1);
+    assert.equal(token.isUsed, true);
+  });
+
+  // Flutter FirebaseService.redeemReward (balance down, lifetime kept, profile copy, stock - 1)
+  const redeemLast = (db, uid) => runTransaction(db, async (tx) => {
+    const userRef = doc(db, 'users', uid), rewardRef = doc(db, 'rewards', 'last1');
+    const u = (await tx.get(userRef)).data(), r = (await tx.get(rewardRef)).data();
+    if (u.points < r.pointsCost || r.stock <= 0) throw new Error('cannotRedeem');
+    const lifetime = u.lifetimePoints ?? u.points, balance = u.points - r.pointsCost;
+    tx.set(doc(collection(db, 'redemptions')), { userId: uid, userEmail: `${uid}@example.com`, rewardId: 'last1',
+      rewardTitle: 'Last one', pointsUsed: r.pointsCost, redeemedAt: Timestamp.now(), status: 'pending', redemptionCode: uid.toUpperCase() });
+    tx.update(userRef, { points: balance, lifetimePoints: lifetime });
+    tx.set(doc(db, 'profiles', uid), { username: u.username, points: balance, lifetimePoints: lifetime, badges: u.badges });
+    tx.update(rewardRef, { stock: increment(-1) });
+  });
+
+  it('two customers redeem the last item in stock at once: one redemption, stock 0, no negative', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(doc(ctx.firestore(), 'rewards', 'last1'), { title: 'Last one', description: 'x', pointsCost: 50, category: 'Other', isActive: true, stock: 1 });
+    });
+    const results = await settle([redeemLast(alice(), 'alice'), redeemLast(bob(), 'bob')]);
+    assert.deepEqual(results.sort(), ['fulfilled', 'rejected']);
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      assert.equal((await getDoc(doc(db, 'rewards', 'last1'))).data().stock, 0);
+      assert.equal((await getDocs(query(collection(db, 'redemptions'), where('rewardId', '==', 'last1')))).size, 1);
+    });
+  });
+
+  // Web lib/firebaseService.ts manualClaimPoints (re-reads the token inside the transaction)
+  const manualClaim = (db) => runTransaction(db, async (tx) => {
+    const tokenRef = doc(db, 'qr_tokens', 'tok1'), userRef = doc(db, 'users', 'bob');
+    const t = (await tx.get(tokenRef)).data();
+    if (!t || t.isUsed === true || (t.usedBy ?? []).length > 0) throw new Error('alreadyUsed');
+    const u = (await tx.get(userRef)).data();
+    const points = u.points + 10, lifetimePoints = (u.lifetimePoints ?? u.points) + 10;
+    tx.update(tokenRef, { usedBy: ['bob'], isUsed: true });
+    tx.update(userRef, { points, lifetimePoints });
+    tx.set(doc(db, 'profiles', 'bob'), { username: u.username, points, lifetimePoints, badges: u.badges ?? [] });
+    tx.set(doc(collection(db, 'waste_logs')), { userId: 'bob', wasteType: 'Recyclable', pointsEarned: 10, pointsAwarded: 10,
+      timestamp: serverTimestamp(), binId: 'tok1' });
+  });
+
+  it('two staff enter the same claim code at once: points credited exactly once (H-06)', async () => {
+    const results = await settle([manualClaim(admin()), manualClaim(claimAdmin())]);
+    assert.deepEqual(results.sort(), ['fulfilled', 'rejected']);
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      assert.equal((await getDoc(doc(db, 'users', 'bob'))).data().points, 130);
+      assert.equal((await getDocs(query(collection(db, 'waste_logs'), where('binId', '==', 'tok1')))).size, 1);
+    });
+  });
+});
+
+describe('registration self-heal (Phase 8, audit H-10)', () => {
+  // Flutter FirebaseService.login: Auth account exists but users/{uid} was never written ->
+  // create a default customer + profile in one batch at the next login.
+  it('a customer with no users document gets a fresh profile on login', async () => {
+    const db = carol();
+    await ok(writeBatch(db)
+      .set(doc(db, 'users', 'carol'), { username: 'carol', email: 'carol@example.com', role: 'customer', points: 0,
+        lifetimePoints: 0, createdAt: Timestamp.now(), scanCount: 0, streak: 0, badges: [] })
+      .set(doc(db, 'profiles', 'carol'), { username: 'carol', points: 0, lifetimePoints: 0, badges: [] })
+      .commit());
+  });
+  it('the self-heal path cannot be used to create an admin or a rich account', async () => {
+    const db = carol();
+    await denied(setDoc(doc(db, 'users', 'carol'), { username: 'carol', email: 'carol@example.com', role: 'admin', points: 0,
+      lifetimePoints: 0, createdAt: Timestamp.now(), scanCount: 0, streak: 0, badges: [] }));
+    await denied(setDoc(doc(db, 'users', 'carol'), { username: 'carol', email: 'carol@example.com', role: 'customer', points: 100,
+      lifetimePoints: 100, createdAt: Timestamp.now(), scanCount: 0, streak: 0, badges: [] }));
   });
 });
 

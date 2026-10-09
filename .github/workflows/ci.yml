@@ -1,0 +1,50 @@
+# Kiosk + Firestore rules CI (audit roadmap 8.4). Nothing here touches the real Firebase project.
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  kiosk-unit:
+    name: Kiosk tests (fakes, no Firebase)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        # firebase_admin and ultralytics are replaced by fakes inside the tests; best.pt is not in git,
+        # so the real-model label test skips itself.
+        run: pip install numpy opencv-python-headless "qrcode[pil]" requests
+      - name: Unit tests
+        run: python -I -m unittest discover -s tests -v
+
+  firestore-emulator:
+    name: Rules, races and golden path (Firestore emulator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: firebase/tests/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy opencv-python-headless "qrcode[pil]" requests
+      - run: npm ci
+        working-directory: firebase/tests
+      - name: Security-rules tests (customer, admin, kiosk, anonymous, races)
+        run: npm test
+        working-directory: firebase/tests
+      - name: Kiosk client + golden path against the rules
+        working-directory: firebase/tests
+        run: >
+          npx firebase emulators:exec --config ../firebase.json --only firestore --project demo-ecoreward
+          "python -I -m unittest discover -s ../../tests -v"
