@@ -736,7 +736,7 @@ def watch_token(token):
 def draw_splash_animation(window_name):
     """Plays a branded startup splash animation (≈2.5s) using OpenCV."""
     import math
-    total_frames = 120   # ~2.5s at 48fps equivalent
+    total_frames = 60    # ~1s at 60fps; was 120 (audit H-18)
     cx, cy = WIN_W // 2, WIN_H // 2
 
     # Easing helpers
@@ -745,6 +745,17 @@ def draw_splash_animation(window_name):
     def ease_out_back(t):
         c1, c3 = 1.70158, 1.70158 + 1
         return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+    # ── Precompute vignette weights once — they depend only on constants. (audit H-18)
+    # Previously, three GaussianBlur calls ran on *every* frame (3 × 120 = 360 blurs, median 674 ms/frame ≈ 81 s).
+    # Building the weights once + vectorising across channels cuts per-frame work to one float32 round-trip.
+    _card_f = np.array(CARD, np.float32)   # shape (3,) – broadcast target
+    _vig_weights = []
+    for _r, _a in ((460, 0.25), (340, 0.18), (200, 0.08)):
+        _m = np.zeros((WIN_H, WIN_W), np.float32)
+        cv2.circle(_m, (cx, cy), _r, 1.0, -1)
+        cv2.GaussianBlur(_m, (0, 0), _r // 3, dst=_m)
+        _vig_weights.append((_m * _a).astype(np.float32)[:, :, np.newaxis])   # (H, W, 1)
 
     for frame_i in range(total_frames):
         t = frame_i / (total_frames - 1)   # 0.0 → 1.0
@@ -755,15 +766,11 @@ def draw_splash_animation(window_name):
         bg_val   = int(ease_out_cubic(bg_alpha) * 14)
         canvas[:] = (bg_val, bg_val + 2, bg_val + 4)
 
-        # subtle radial vignette — darker edges
-        for radius, alpha_v in [(460, 0.25), (340, 0.18), (200, 0.08)]:
-            mask = np.zeros((WIN_H, WIN_W), np.float32)
-            cv2.circle(mask, (cx, cy), radius, 1.0, -1)
-            mask = cv2.GaussianBlur(mask, (0, 0), radius // 3)
-            for c in range(3):
-                canvas[:, :, c] = np.clip(
-                    canvas[:, :, c].astype(np.float32) + mask * (CARD[c] - canvas[:, :, c].astype(np.float32)) * alpha_v,
-                    0, 255).astype(np.uint8)
+        # subtle radial vignette — vectorised: one float32 round-trip per frame (audit H-18)
+        _cf = canvas.astype(np.float32)
+        for _wt in _vig_weights:
+            _cf += _wt * (_card_f - _cf)
+        canvas = np.clip(_cf, 0, 255).astype(np.uint8)
 
         # ── Phase 2 (0.10–0.50): logo circle scale-in ───────────────────────
         if t >= 0.10:
@@ -904,10 +911,24 @@ def main():
     cv2.namedWindow("ECOReward Bin", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("ECOReward Bin", WIN_W, WIN_H)
 
+    _cap_fail_count = 0          # (audit H-14) consecutive failed reads
+    _CAP_FAIL_MAX   = 30         # ~1 s at 30 fps before attempting re-open
+
     while True:
         ret, frame = cap.read()
         if not ret:
-            break
+            _cap_fail_count += 1
+            if _cap_fail_count >= _CAP_FAIL_MAX:
+                print("[CAMERA] Lost feed — attempting re-open...")
+                cap.release()
+                cap = cv2.VideoCapture(0)
+                _cap_fail_count = 0
+                if not cap.isOpened():
+                    print("[CAMERA ERROR] Could not re-open webcam — exiting.")
+                    break
+                print("[CAMERA] Re-opened successfully.")
+            continue
+        _cap_fail_count = 0
 
         # ── AI detection ──
         cam_r = cv2.resize(frame, (CAM_W, WIN_H))
@@ -1024,6 +1045,11 @@ def main():
             if db is None:
                 # A QR for a token that was never stored could never be redeemed (audit C-03): refuse.
                 print("[BLOCKED] Firebase is offline - not issuing a QR code (it could never be redeemed).")
+            elif latest_label == "Unknown":
+                # (audit H-03) No waste detected yet — refuse so pressing SPACE on an empty scene
+                # does not issue a +5 Residual QR.
+                print("[BLOCKED] No waste detected — hold an item in front of the camera for "
+                      "a moment until the label appears, then press SPACE.")
             else:
                 token      = str(uuid.uuid4())
                 waste_type = latest_waste_type
@@ -1048,17 +1074,20 @@ def main():
                     qr_claim_code = claim_code
                     print("[FIREBASE] Token saved — waiting for scan...\n")
                     watch_token(token)   # also clears any scan flag left over from the previous QR
-                except Exception as err:
-                    print(f"[FIREBASE ERROR] {err}\n")
 
-                qr_image      = generate_qr(qr_data, size=220)
-                qr_active     = True
-                qr_token      = token
-                qr_waste_type = waste_type
-                qr_points     = points
-                qr_expires_at = expires_at
-                qr_total_secs = QR_EXPIRY_MINUTES * 60
-                show_receipt  = False
+                    # (audit H-14) Only activate the QR display after the token was successfully
+                    # stored.  Previously these ran even on a write failure, issuing a QR for a
+                    # token that Firestore never recorded (could never be redeemed).
+                    qr_image      = generate_qr(qr_data, size=220)
+                    qr_active     = True
+                    qr_token      = token
+                    qr_waste_type = waste_type
+                    qr_points     = points
+                    qr_expires_at = expires_at
+                    qr_total_secs = QR_EXPIRY_MINUTES * 60
+                    show_receipt  = False
+                except Exception as err:
+                    print(f"[FIREBASE ERROR] Could not store token — QR not shown: {err}\n")
 
         if key == ord('q'):
             break

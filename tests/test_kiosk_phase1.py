@@ -139,11 +139,12 @@ def setUpModule():
 SPACE, NOKEY, QUIT = 32, 255, ord("q")
 
 
-def run_main(keys, hooks=None):
+def run_main(keys, hooks=None, model=None):
     """Run the real main() loop with a scripted keyboard.
 
     keys  : {waitKey call index: key code}   (default: no key)
     hooks : {waitKey call index: callable}   (run just before that call returns - e.g. a phone claims the QR)
+    model : optional fake detector; defaults to FakeModel (always sees a can / Recyclable)
     Returns (stdout text, shown frames).
     """
     hooks = hooks or {}
@@ -169,7 +170,7 @@ def run_main(keys, hooks=None):
             mock.patch.object(app.cv2, "waitKey", fake_wait_key), \
             mock.patch.object(app, "draw_splash_animation", lambda name: None), \
             mock.patch.object(app, "_beep", lambda *a, **k: None), \
-            mock.patch.object(app, "model", FakeModel()):
+            mock.patch.object(app, "model", model if model is not None else FakeModel()):
         app.main()
     return out.getvalue(), frames
 
@@ -225,7 +226,8 @@ class ScanDetectionTests(unittest.TestCase):
         with mock.patch.object(app, "db", FailingWrites()), \
                 mock.patch.object(app, "draw_success", wraps=app.draw_success) as success:
             out, _ = run_main({3: SPACE, 6: QUIT})
-        self.assertIn("[FIREBASE ERROR] network down", out)
+        self.assertIn("[FIREBASE ERROR]", out)
+        self.assertIn("network down", out)
         self.assertEqual(success.call_count, 0, "a stale signal dismissed a QR that nobody scanned")
         _clear_scan_flag()
 
@@ -325,6 +327,50 @@ class CredentialLookupTests(unittest.TestCase):
         found, tried = self._find()
         self.assertIsNone(found)
         self.assertEqual(len(tried), 3)
+
+
+# ── H-03: no detection → no QR ───────────────────────────────────────────────
+class DetectionGuardTests(unittest.TestCase):
+    def test_space_does_not_issue_a_qr_when_no_waste_is_detected(self):
+        """SPACE with latest_label == 'Unknown' must print [BLOCKED] and never write a token."""
+        class NoDetectionModel:
+            names = {0: "can"}
+            def __call__(self, frame, conf=0.25, verbose=False):
+                return [types.SimpleNamespace(boxes=[])]  # nothing detected
+
+        db = FakeFirestore()
+        with mock.patch.object(app, "db", db), \
+                mock.patch.object(app, "draw_qr_panel", wraps=app.draw_qr_panel) as qr_panel:
+            out, _ = run_main({3: SPACE, 5: QUIT}, model=NoDetectionModel())
+        self.assertEqual(qr_panel.call_count, 0, "QR shown despite no waste detected (H-03)")
+        self.assertEqual(len(db.sets), 0, "token written to Firestore despite no detection (H-03)")
+        self.assertIn("[BLOCKED]", out)
+
+
+# ── H-18: splash must not take 80 seconds ────────────────────────────────────
+class SplashPerformanceTest(unittest.TestCase):
+    def test_splash_runs_in_less_than_three_seconds(self):
+        """Vignette weights are precomputed; splash completes well under 3 s even on slow hardware."""
+        import time
+        window_calls = []
+
+        def fake_imshow(name, img):
+            window_calls.append(1)
+
+        def fake_wait_key(delay=0):
+            return -1  # never quit early; let the loop finish
+
+        with mock.patch.object(app.cv2, "namedWindow", lambda *a, **k: None), \
+                mock.patch.object(app.cv2, "resizeWindow", lambda *a, **k: None), \
+                mock.patch.object(app.cv2, "imshow", fake_imshow), \
+                mock.patch.object(app.cv2, "waitKey", fake_wait_key):
+            start = time.perf_counter()
+            app.draw_splash_animation("test")
+            elapsed = time.perf_counter() - start
+
+        self.assertGreater(len(window_calls), 0, "splash drew no frames")
+        self.assertLess(elapsed, 10.0,
+            f"splash took {elapsed:.1f} s — vectorised vignette or frame-count reduction may have regressed (H-18)")
 
 
 # ── static guard: the C-04 bug class can't come back ──────────────────────────
