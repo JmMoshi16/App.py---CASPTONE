@@ -9,6 +9,14 @@
       ]
     },
     {
+      "collectionGroup": "users",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "role",           "order": "ASCENDING"  },
+        { "fieldPath": "lifetimePoints", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "waste_logs",
       "queryScope": "COLLECTION",
       "fields": [
