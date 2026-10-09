@@ -93,6 +93,9 @@ _RULES_FILE = _APP_DIR / "config" / "rules.json"
 _RULES = json.loads(_RULES_FILE.read_text(encoding="utf-8")) if _RULES_FILE.exists() else {}
 QR_EXPIRY_MINUTES = _RULES.get("qrExpiryMinutes", 20)
 
+# Kiosk identity: hostname-based so the web admin can tell which machine sent each heartbeat
+KIOSK_ID = platform.node() or "kiosk-default"
+
 # ── Palette BGR ────────────────────────────────────────────────────────────────
 BG        = (  8,  10,  14)   # near-black
 CARD      = ( 18,  22,  28)   # dark card
@@ -730,6 +733,27 @@ def _cleanup_stale_tokens():
 # Run cleanup in a background thread so startup is not blocked
 threading.Thread(target=_cleanup_stale_tokens, daemon=True).start()
 
+
+def _start_heartbeat():
+    """3.4: write kiosks/{KIOSK_ID}.lastSeen every 30 s so the web admin can see liveness."""
+    if db is None:
+        return
+    _stop = threading.Event()
+
+    def _beat():
+        while not _stop.wait(30):
+            try:
+                db.collection("kiosks").document(KIOSK_ID).set({
+                    "lastSeen": firestore.SERVER_TIMESTAMP,
+                    "status":   "online",
+                }, merge=True)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_beat, daemon=True, name="kiosk-heartbeat")
+    t.start()
+
+
 def watch_token(token):
     global _watcher, _active_token
     if not db:  # Firebase offline — nothing to watch
@@ -893,6 +917,8 @@ def main():
 
     # ── Play startup splash ──
     draw_splash_animation("ECOReward Bin")
+
+    _start_heartbeat()   # 3.4: keep kiosks/{KIOSK_ID} updated while running
 
 
     latest_label      = "Unknown"
@@ -1092,6 +1118,17 @@ def main():
                     qr_claim_code = claim_code
                     print("[FIREBASE] Token saved — waiting for scan...\n")
                     watch_token(token)   # also clears any scan flag left over from the previous QR
+                    # 3.4: log detection so admins can see kiosk activity history
+                    try:
+                        db.collection("detections").add({
+                            "wasteType":  waste_type,
+                            "confidence": float(latest_conf),
+                            "timestamp":  firestore.SERVER_TIMESTAMP,
+                            "token":      token,
+                            "kioskId":    KIOSK_ID,
+                        })
+                    except Exception:
+                        pass  # non-critical — never blocks QR flow
 
                     # (audit H-14) Only activate the QR display after the token was successfully
                     # stored.  Previously these ran even on a write failure, issuing a QR for a
