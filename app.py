@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 import os
 import sys
 import platform
@@ -87,7 +88,10 @@ WIN_W, WIN_H      = 1280, 720
 CAM_W             = 820
 PANEL_W           = WIN_W - CAM_W          # 460
 MARGIN            = 20
-QR_EXPIRY_MINUTES = 20
+# Load canonical business rules — single source of truth shared with Flutter and web (audit M-24)
+_RULES_FILE = _APP_DIR / "config" / "rules.json"
+_RULES = json.loads(_RULES_FILE.read_text(encoding="utf-8")) if _RULES_FILE.exists() else {}
+QR_EXPIRY_MINUTES = _RULES.get("qrExpiryMinutes", 20)
 
 # ── Palette BGR ────────────────────────────────────────────────────────────────
 BG        = (  8,  10,  14)   # near-black
@@ -118,7 +122,7 @@ WASTE_TAG = {
     'Recyclable':    'REC',
     'Residual':      'RES',
 }
-POINTS_MAP = {'Biodegradable': 15, 'Recyclable': 10, 'Residual': 5}
+POINTS_MAP = _RULES.get("points", {'Biodegradable': 15, 'Recyclable': 10, 'Residual': 5})
 WASTE_MAP  = {
     # legacy 3-class
     'biodegradable':  'Biodegradable',
@@ -689,6 +693,19 @@ _watcher      = None   # holds active Firestore listener so we can unsubscribe
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
+def _to_utc_dt(value):
+    """H-07: tolerant datetime parser — handles Admin SDK datetime objects and ISO string fallback."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            s = value.rstrip('Z').replace('+00:00', '').replace('+0000', '')
+            return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
 def _cleanup_stale_tokens():
     """On startup, expire any tokens that passed their expiry time.
 
@@ -700,10 +717,11 @@ def _cleanup_stale_tokens():
         return
     try:
         docs = db.collection('qr_tokens').where('isUsed', '==', False).stream()
-        now_iso = _now().isoformat()
+        now = _now()
         for doc in docs:
             data = doc.to_dict()
-            if data.get('expiresAt', '') < now_iso:
+            expires_dt = _to_utc_dt(data.get('expiresAt'))   # H-07: proper datetime comparison
+            if expires_dt and now > expires_dt:
                 doc.reference.update({'expired': True, 'isUsed': True})
                 print(f"[CLEANUP] Expired stale token {doc.id[:8]}...")
     except Exception as e:
@@ -736,7 +754,7 @@ def watch_token(token):
 def draw_splash_animation(window_name):
     """Plays a branded startup splash animation (≈2.5s) using OpenCV."""
     import math
-    total_frames = 60    # ~1s at 60fps; was 120 (audit H-18)
+    total_frames = 30    # ~0.5s at 60fps; was 60/120 (audit H-18)
     cx, cy = WIN_W // 2, WIN_H // 2
 
     # Easing helpers
@@ -1065,10 +1083,10 @@ def main():
                     claim_code = str(random.randint(1000, 9999))
                     db.collection("qr_tokens").document(token).set({
                         "wasteType": waste_type,
-                        "expiresAt": expires_at.isoformat(),
+                        "expiresAt": expires_at,              # H-07: Admin SDK stores UTC datetime as Timestamp
                         "usedBy":    [],
                         "isUsed":    False,
-                        "createdAt": _now().isoformat(),
+                        "createdAt": firestore.SERVER_TIMESTAMP,  # H-07
                         "claimCode": claim_code,
                     })
                     qr_claim_code = claim_code

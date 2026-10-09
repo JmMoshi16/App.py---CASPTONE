@@ -1,0 +1,40 @@
+{
+  "_comment": "Canonical business rules — single source of truth for kiosk, Flutter app and web admin. Parity verified by kiosk/tests/test_kiosk_phase1.py (ConfigParityTest). Do NOT duplicate these constants in app.py, firebase_service.dart or types.ts.",
+  "points": {
+    "Biodegradable": 15,
+    "Recyclable": 10,
+    "Residual": 5
+  },
+  "qrExpiryMinutes": 20,
+  "ranks": [
+    { "label": "Bronze",   "minPts": 0,   "nextPts": 50,  "icon": "🥉" },
+    { "label": "Silver",   "minPts": 50,  "nextPts": 200, "icon": "🥈" },
+    { "label": "Gold",     "minPts": 200, "nextPts": 500, "icon": "🥇" },
+    { "label": "Platinum", "minPts": 500, "nextPts": null, "icon": "💎" }
+  ],
+  "levels": [
+    { "level": 1, "title": "Eco Seedling", "emoji": "🌱", "minPts": 0,    "maxPts": 99   },
+    { "level": 2, "title": "Eco Sprout",   "emoji": "🌿", "minPts": 100,  "maxPts": 249  },
+    { "level": 3, "title": "Eco Grower",   "emoji": "🌳", "minPts": 250,  "maxPts": 499  },
+    { "level": 4, "title": "Eco Warrior",  "emoji": "⚔️", "minPts": 500,  "maxPts": 999  },
+    { "level": 5, "title": "Eco Champion", "emoji": "🏆", "minPts": 1000, "maxPts": 1999 },
+    { "level": 6, "title": "Eco Legend",   "emoji": "💎", "minPts": 2000, "maxPts": -1   }
+  ],
+  "streakMultipliers": [
+    { "minDays": 1, "maxDays": 2, "multiplier": 1.0 },
+    { "minDays": 3, "maxDays": 6, "multiplier": 1.5 },
+    { "minDays": 7, "maxDays": null, "multiplier": 2.0 }
+  ],
+  "badges": [
+    { "id": "first_scan", "label": "First Scan",   "desc": "Completed your first scan",  "icon": "🌱", "req": "scans",  "value": 1   },
+    { "id": "scan_5",     "label": "5 Scans",       "desc": "Scanned waste 5 times",      "icon": "♻️", "req": "scans",  "value": 5   },
+    { "id": "scan_10",    "label": "Eco Starter",   "desc": "Scanned waste 10 times",     "icon": "🌿", "req": "scans",  "value": 10  },
+    { "id": "scan_25",    "label": "Eco Warrior",   "desc": "Scanned waste 25 times",     "icon": "🏆", "req": "scans",  "value": 25  },
+    { "id": "scan_50",    "label": "Eco Champion",  "desc": "Scanned waste 50 times",     "icon": "🥇", "req": "scans",  "value": 50  },
+    { "id": "pts_50",     "label": "Point Earner",  "desc": "Earned 50 points total",     "icon": "⭐",      "req": "points", "value": 50  },
+    { "id": "pts_100",    "label": "Century Club",  "desc": "Earned 100 points total",    "icon": "💯", "req": "points", "value": 100 },
+    { "id": "pts_500",    "label": "Platinum Eco",  "desc": "Earned 500 points total",    "icon": "💎", "req": "points", "value": 500 },
+    { "id": "streak_3",   "label": "On a Roll",     "desc": "3-day scan streak",          "icon": "🔥", "req": "streak", "value": 3   },
+    { "id": "streak_7",   "label": "Week Warrior",  "desc": "7-day scan streak",          "icon": "🌟", "req": "streak", "value": 7   }
+  ]
+}

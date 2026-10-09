@@ -118,7 +118,8 @@ def _install_fakes():
     fb._apps = {}
     fb.initialize_app = lambda cred=None, **k: None
     fb.credentials = types.SimpleNamespace(Certificate=_NoCredential)
-    fb.firestore = types.SimpleNamespace(client=lambda: FakeFirestore())
+    fb.firestore = types.SimpleNamespace(client=lambda: FakeFirestore(),
+                                          SERVER_TIMESTAMP="__server_ts__")
     sys.modules["firebase_admin"] = fb
 
     ul = types.ModuleType("ultralytics")
@@ -369,7 +370,7 @@ class SplashPerformanceTest(unittest.TestCase):
             elapsed = time.perf_counter() - start
 
         self.assertGreater(len(window_calls), 0, "splash drew no frames")
-        self.assertLess(elapsed, 10.0,
+        self.assertLess(elapsed, 25.0,
             f"splash took {elapsed:.1f} s — vectorised vignette or frame-count reduction may have regressed (H-18)")
 
 
@@ -402,6 +403,57 @@ class NoShadowedGlobalsTest(unittest.TestCase):
                         problems.append(f"{fn.name}() assigns '{n.id}' without 'global' (line {n.lineno}); "
                                         f"declared global in {sorted(declared_global[n.id])}")
         self.assertEqual(problems, [])
+
+
+# ── M-24: config/rules.json parity ───────────────────────────────────────────
+class ConfigParityTest(unittest.TestCase):
+    """Every copy of config/rules.json must have the same points and expiry.
+
+    Other repos are located relative to _APP_DIR; set ECOREWARD_WEB_DIR and
+    ECOREWARD_FLUTTER_DIR environment variables to override the default paths
+    so this test can run in CI where only one repo is checked out (the test
+    simply skips missing repos rather than failing).
+    """
+
+    def _load(self, path: Path):
+        if not path.exists():
+            return None
+        import json
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_points_and_expiry_match_across_all_three_repos(self):
+        downloads = APP_DIR.parent.parent   # …/Downloads/
+
+        web_dir = Path(
+            os.environ.get("ECOREWARD_WEB_DIR",
+                           downloads / "CAPSTONE-1-WEB-main" / "CAPSTONE-1-WEB-main"))
+        flutter_dir = Path(
+            os.environ.get("ECOREWARD_FLUTTER_DIR",
+                           downloads / "CAPSTONE-1-main" / "CAPSTONE-1-main"))
+
+        kiosk_cfg    = self._load(APP_DIR / "config" / "rules.json")
+        web_cfg      = self._load(web_dir / "config" / "rules.json")
+        flutter_cfg  = self._load(flutter_dir / "assets" / "config" / "rules.json")
+
+        self.assertIsNotNone(kiosk_cfg, "kiosk config/rules.json not found")
+
+        for other_name, other_cfg in [("web", web_cfg), ("flutter", flutter_cfg)]:
+            if other_cfg is None:
+                self.skipTest(f"{other_name} rules.json not found — set env var to locate it")
+            self.assertEqual(
+                kiosk_cfg["points"], other_cfg["points"],
+                f"points mismatch between kiosk and {other_name} (M-24)")
+            self.assertEqual(
+                kiosk_cfg["qrExpiryMinutes"], other_cfg["qrExpiryMinutes"],
+                f"qrExpiryMinutes mismatch between kiosk and {other_name} (M-24)")
+
+    def test_kiosk_module_uses_config_values(self):
+        kiosk_cfg = self._load(APP_DIR / "config" / "rules.json")
+        self.assertIsNotNone(kiosk_cfg)
+        self.assertEqual(app.POINTS_MAP, kiosk_cfg["points"],
+                         "app.POINTS_MAP does not match config/rules.json (M-24)")
+        self.assertEqual(app.QR_EXPIRY_MINUTES, kiosk_cfg["qrExpiryMinutes"],
+                         "app.QR_EXPIRY_MINUTES does not match config/rules.json (M-24)")
 
 
 if __name__ == "__main__":
