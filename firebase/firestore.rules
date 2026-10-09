@@ -164,6 +164,20 @@ service cloud.firestore {
       allow write: if false;           // nothing in the project writes bins (audit H-09)
     }
 
+    // ── kiosks (3.4: heartbeat written by kiosk via Admin SDK) ───────────────
+    // The kiosk writes via Admin SDK (bypasses rules). The web admin reads; clients never write.
+    match /kiosks/{kioskId} {
+      allow read:  if isAdmin();
+      allow write: if false;           // Admin SDK only
+    }
+
+    // ── detections (3.4: detection log written by kiosk via Admin SDK) ────────
+    // Written by the kiosk's Admin SDK. The web admin reads; clients never write.
+    match /detections/{id} {
+      allow read:  if isAdmin();
+      allow write: if false;           // Admin SDK only
+    }
+
     // Everything else is denied by default.
   }
 }
