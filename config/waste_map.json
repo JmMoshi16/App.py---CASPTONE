@@ -1,0 +1,29 @@
+{
+  "_comment": "Model label (lower-cased) -> waste category. Every class of the loaded model MUST appear here or the kiosk refuses to issue QR codes (audit M-22). Categories must be keys of rules.json 'points'.",
+  "map": {
+    "biodegradable": "Biodegradable",
+    "recyclable":    "Recyclable",
+    "residual":      "Residual",
+
+    "fries":         "Biodegradable",
+    "plain rice":    "Biodegradable",
+    "bowl":          "Biodegradable",
+    "tissue":        "Biodegradable",
+
+    "bottle":        "Recyclable",
+    "can":           "Recyclable",
+    "metal":         "Recyclable",
+    "straw":         "Recyclable",
+    "paper-cup":     "Recyclable",
+    "paper cup":     "Recyclable",
+    "plastic-cup":   "Recyclable",
+
+    "cigarette":     "Residual",
+    "fork":          "Residual",
+    "spoon":         "Residual",
+    "plastic-spoon": "Residual",
+    "foam box":      "Residual",
+    "styro":         "Residual",
+    "1":             "Residual"
+  }
+}

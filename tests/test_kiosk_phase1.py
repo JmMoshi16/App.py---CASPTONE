@@ -62,6 +62,9 @@ class FakeCollection:
     def document(self, doc_id):
         return FakeDocRef(self.db, self.name, doc_id)
 
+    def add(self, data):
+        self.db.adds.append((self.name, dict(data)))
+
     def where(self, *args, **kwargs):
         return self
 
@@ -73,7 +76,7 @@ class FakeFirestore:
     """In-memory stand-in for firebase_admin.firestore.client()."""
 
     def __init__(self):
-        self.sets, self.listeners, self.unsubscribed = [], {}, []
+        self.sets, self.adds, self.listeners, self.unsubscribed = [], [], {}, []
 
     def collection(self, name):
         return FakeCollection(self, name)
@@ -372,6 +375,69 @@ class SplashPerformanceTest(unittest.TestCase):
         self.assertGreater(len(window_calls), 0, "splash drew no frames")
         self.assertLess(elapsed, 25.0,
             f"splash took {elapsed:.1f} s — vectorised vignette or frame-count reduction may have regressed (H-18)")
+
+
+# ── Phase 4: label map, one vote per frame, traceable detections ──────────────
+class _ScriptedModel:
+    """Returns the same boxes every frame. boxes: [(class_id, conf), ...]"""
+    def __init__(self, names, boxes):
+        self.names, self._boxes = names, boxes
+
+    def __call__(self, frame, conf=0.25, verbose=False):
+        return [types.SimpleNamespace(boxes=[FakeBox(c, p) for c, p in self._boxes])]
+
+
+class WasteMapTests(unittest.TestCase):
+    def test_every_category_in_the_map_earns_points(self):
+        self.assertTrue(set(app.WASTE_MAP.values()) <= set(app.POINTS_MAP))
+
+    def test_every_class_of_the_shipped_model_is_mapped(self):
+        """Loads the real best.pt in a separate process (this one has a fake ultralytics)."""
+        import subprocess
+        if not (APP_DIR / "best.pt").exists():
+            self.skipTest("best.pt not present")
+        code = "import json; from ultralytics import YOLO; print(json.dumps(list(YOLO('best.pt').names.values())))"
+        proc = subprocess.run([sys.executable, "-I", "-c", code], cwd=APP_DIR,
+                              capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            self.skipTest("ultralytics could not load best.pt here")
+        import json
+        names = json.loads(proc.stdout.strip().splitlines()[-1])
+        missing = sorted({n.lower() for n in names} - set(app.WASTE_MAP))
+        self.assertEqual(missing, [], "best.pt classes missing from config/waste_map.json")
+
+    def test_space_is_blocked_when_the_model_has_unmapped_classes(self):
+        db = FakeFirestore()
+        coco_like = _ScriptedModel({0: "person"}, [(0, 0.95)])   # e.g. the yolov8n.pt fallback
+        with mock.patch.object(app, "db", db):
+            out, _ = run_main({3: SPACE, 5: QUIT}, model=coco_like)
+        self.assertEqual(db.sets, [], "QR issued for an object the waste map does not know (M-22)")
+        self.assertIn("[AI ERROR]", out)
+        self.assertIn("[BLOCKED]", out)
+
+
+class OneVotePerFrameTest(unittest.TestCase):
+    def test_weak_duplicate_boxes_do_not_outvote_a_confident_box(self):
+        db = FakeFirestore()
+        m = _ScriptedModel({0: "fork", 1: "can"}, [(0, 0.45), (0, 0.45), (1, 0.92)])
+        with mock.patch.object(app, "db", db):
+            run_main({3: SPACE, 5: QUIT}, model=m)
+        self.assertEqual(len(db.sets), 1)
+        self.assertEqual(db.sets[0][2]["wasteType"], "Recyclable", "per-box voting picked the weak boxes (M-20)")
+
+
+class DetectionLogTest(unittest.TestCase):
+    def test_detection_records_label_and_model_version(self):
+        db = FakeFirestore()
+        with mock.patch.object(app, "db", db):
+            run_main({3: SPACE, 5: QUIT})
+        detections = [d for c, d in db.adds if c == "detections"]
+        self.assertEqual(len(detections), 1)
+        d = detections[0]
+        self.assertEqual(d["label"], "can")
+        self.assertEqual(d["wasteType"], "Recyclable")
+        self.assertEqual(d["modelSha256"], app.MODEL_SHA256)
+        self.assertEqual(d["token"], db.sets[0][1])
 
 
 # ── static guard: the C-04 bug class can't come back ──────────────────────────

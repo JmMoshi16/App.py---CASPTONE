@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import hashlib
 import json
 import os
 import sys
@@ -77,11 +78,24 @@ except Exception as e:
 print("[AI] Loading YOLO model...")
 try:
     model = YOLO("best.pt")
+    MODEL_FILE = "best.pt"
     print("[AI] Loaded: best.pt")
 except Exception as e:
     print(f"[AI WARNING] best.pt failed to load ({e}), falling back to yolov8n.pt")
     model = YOLO("yolov8n.pt")
+    MODEL_FILE = "yolov8n.pt"
     print("[AI] Loaded: yolov8n.pt")
+
+
+def _sha256(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return "unknown"
+
+
+# Recorded on every detection so results can be traced to the exact weights (audit H-04 / M-21)
+MODEL_SHA256 = _sha256(MODEL_FILE)
 
 # ── Layout ─────────────────────────────────────────────────────────────────────
 WIN_W, WIN_H      = 1280, 720
@@ -126,31 +140,14 @@ WASTE_TAG = {
     'Residual':      'RES',
 }
 POINTS_MAP = _RULES.get("points", {'Biodegradable': 15, 'Recyclable': 10, 'Residual': 5})
-WASTE_MAP  = {
-    # legacy 3-class
-    'biodegradable':  'Biodegradable',
-    'recyclable':     'Recyclable',
-    'residual':       'Residual',
-    # model classes (all lowercased via .lower() in detection loop)
-    'fries':          'Biodegradable',
-    'plain rice':     'Biodegradable',
-    'bowl':           'Biodegradable',
-    'bottle':         'Recyclable',
-    'can':            'Recyclable',
-    'metal':          'Recyclable',
-    'straw':          'Recyclable',
-    'paper-cup':      'Recyclable',
-    'paper cup':      'Recyclable',
-    'plastic-cup':    'Recyclable',
-    'cigarette':      'Residual',
-    'fork':           'Residual',
-    'spoon':          'Residual',
-    'plastic-spoon':  'Residual',
-    'tissue':         'Biodegradable',
-    'foam box':       'Residual',
-    'styro':          'Residual',
-    '1':              'Residual',   # class 0 anomaly — treat as residual
-}
+# Model label (lower-cased) -> waste category; reviewed list lives in config/waste_map.json (audit M-22)
+WASTE_MAP = json.loads((_APP_DIR / "config" / "waste_map.json").read_text(encoding="utf-8"))["map"]
+MIN_BOX_CONF = 0.30
+
+
+def unmapped_labels(m):
+    """Model class names that have no waste category. Non-empty => the loaded model does not match the map."""
+    return sorted({str(n).lower() for n in m.names.values()} - set(WASTE_MAP))
 
 F  = cv2.FONT_HERSHEY_SIMPLEX
 FB = cv2.FONT_HERSHEY_DUPLEX
@@ -920,6 +917,13 @@ def main():
 
     _start_heartbeat()   # 3.4: keep kiosks/{KIOSK_ID} updated while running
 
+    # (audit M-22) A model whose classes are not all in waste_map.json would silently score
+    # unknown objects as Residual — e.g. the yolov8n.pt fallback sees a "person". Refuse QRs instead.
+    bad_labels = unmapped_labels(model)
+    if bad_labels:
+        print(f"[AI ERROR] {MODEL_FILE} has {len(bad_labels)} class(es) missing from config/waste_map.json "
+              f"(e.g. {', '.join(bad_labels[:5])}). QR codes are DISABLED until the map or model is fixed.")
+
 
     latest_label      = "Unknown"
     latest_waste_type = "Residual"
@@ -982,42 +986,45 @@ def main():
             fh, fw   = frame.shape[:2]
             sx, sy   = CAM_W / fw, WIN_H / fh   # scale factors to cam_r coords
             detected = False
+            # (audit M-20) One vote per frame: only the most confident box counts. Voting once per
+            # box let several weak boxes of one class outvote a single confident box of another.
+            box, conf = None, 0.0
             for r in results:
-                for box in r.boxes:
-                    cid  = int(box.cls[0])
-                    lbl  = model.names[cid].lower()
-                    conf = float(box.conf[0])
-                    if conf < 0.30:
-                        continue
-                    detected = True
-                    detect_history.append((lbl, conf))
-                    # majority vote from history
-                    vote_lbl = Counter(h[0] for h in detect_history).most_common(1)[0][0]
-                    vote_conf = max(h[1] for h in detect_history if h[0] == vote_lbl)
-                    latest_label      = vote_lbl
-                    latest_waste_type = WASTE_MAP.get(vote_lbl, 'Residual')
-                    latest_conf       = vote_conf
-                    HOLD_FRAMES       = 0
-                    # beep once when a new class is first confirmed
-                    if vote_lbl != _last_beep_type:
-                        _last_beep_type = vote_lbl
-                        threading.Thread(target=_beep, args=(880, 120), daemon=True).start()
-                    # scale bbox from native frame → cam_r
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    x1, y1 = int(x1 * sx), int(y1 * sy)
-                    x2, y2 = int(x2 * sx), int(y2 * sy)
-                    ac  = WASTE_COLOR[latest_waste_type]
-                    cv2.rectangle(cam_r, (x1, y1), (x2, y2), ac, 2, cv2.LINE_AA)
-                    # label tag above box
-                    tag = f"{latest_waste_type}  {vote_conf * 100:.0f}%"
-                    (tw, th), _ = cv2.getTextSize(tag, F, 0.44, 1)
-                    rrect(cam_r, x1, y1 - th - 10, x1 + tw + 10, y1, 4, ac)
-                    cv2.putText(cam_r, tag, (x1 + 5, y1 - 3), F, 0.44, BG, 1, cv2.LINE_AA)
-                    # confidence bar directly on bbox bottom edge
-                    bar_w = x2 - x1
-                    bar_y = y2 - 6
-                    rrect(cam_r, x1, bar_y, x2, y2, 0, GRAY_DIM)
-                    rrect(cam_r, x1, bar_y, x1 + int(bar_w * vote_conf), y2, 0, ac)
+                for b in r.boxes:
+                    c = float(b.conf[0])
+                    if c >= MIN_BOX_CONF and c > conf:
+                        box, conf = b, c
+            if box is not None:
+                lbl  = model.names[int(box.cls[0])].lower()
+                detected = True
+                detect_history.append((lbl, conf))
+                # majority vote from history
+                vote_lbl = Counter(h[0] for h in detect_history).most_common(1)[0][0]
+                vote_conf = max(h[1] for h in detect_history if h[0] == vote_lbl)
+                latest_label      = vote_lbl
+                latest_waste_type = WASTE_MAP.get(vote_lbl, 'Residual')
+                latest_conf       = vote_conf
+                HOLD_FRAMES       = 0
+                # beep once when a new class is first confirmed
+                if vote_lbl != _last_beep_type:
+                    _last_beep_type = vote_lbl
+                    threading.Thread(target=_beep, args=(880, 120), daemon=True).start()
+                # scale bbox from native frame → cam_r
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                x1, y1 = int(x1 * sx), int(y1 * sy)
+                x2, y2 = int(x2 * sx), int(y2 * sy)
+                ac  = WASTE_COLOR[latest_waste_type]
+                cv2.rectangle(cam_r, (x1, y1), (x2, y2), ac, 2, cv2.LINE_AA)
+                # label tag above box
+                tag = f"{latest_waste_type}  {vote_conf * 100:.0f}%"
+                (tw, th), _ = cv2.getTextSize(tag, F, 0.44, 1)
+                rrect(cam_r, x1, y1 - th - 10, x1 + tw + 10, y1, 4, ac)
+                cv2.putText(cam_r, tag, (x1 + 5, y1 - 3), F, 0.44, BG, 1, cv2.LINE_AA)
+                # confidence bar directly on bbox bottom edge
+                bar_w = x2 - x1
+                bar_y = y2 - 6
+                rrect(cam_r, x1, bar_y, x2, y2, 0, GRAY_DIM)
+                rrect(cam_r, x1, bar_y, x1 + int(bar_w * vote_conf), y2, 0, ac)
             if not detected:
                 HOLD_FRAMES += 1
                 if HOLD_FRAMES > HOLD_MAX:
@@ -1089,6 +1096,8 @@ def main():
             if db is None:
                 # A QR for a token that was never stored could never be redeemed (audit C-03): refuse.
                 print("[BLOCKED] Firebase is offline - not issuing a QR code (it could never be redeemed).")
+            elif bad_labels:
+                print("[BLOCKED] The loaded model does not match config/waste_map.json - not issuing a QR code.")
             elif latest_label == "Unknown":
                 # (audit H-03) No waste detected yet — refuse so pressing SPACE on an empty scene
                 # does not issue a +5 Residual QR.
@@ -1122,7 +1131,10 @@ def main():
                     try:
                         db.collection("detections").add({
                             "wasteType":  waste_type,
+                            "label":      latest_label,                # raw model class (audit M-21)
                             "confidence": float(latest_conf),
+                            "modelFile":  MODEL_FILE,
+                            "modelSha256": MODEL_SHA256,
                             "timestamp":  firestore.SERVER_TIMESTAMP,
                             "token":      token,
                             "kioskId":    KIOSK_ID,

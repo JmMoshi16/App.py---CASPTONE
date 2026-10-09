@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# LEGACY: this script did NOT produce the shipped best.pt (20 classes, imgsz 640, trained on Kaggle).
+# See docs/ml-model-card.md (audit H-04).
 # train.py - ECOReward Bin Custom Model Trainer
 # Run this after you have photos in dataset/images/train and dataset/images/val
 
