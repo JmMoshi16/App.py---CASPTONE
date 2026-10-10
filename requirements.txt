@@ -1,11 +1,13 @@
-# ECOReward Bin — kiosk dependencies
-# Python 3.10+ on Windows, CPU only.
-# Install:  pip install -r requirements.txt
-
+# ECOReward kiosk — Python 3.11 on Windows, CPU only.
+#   py -3.11 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   py -3.11 -m pip install -r requirements.txt
 opencv-python>=4.8
-ultralytics>=8.2           # YOLOv8; also installs torch (CPU)
-qrcode[pil]>=7.4
-firebase-admin>=6.5
-pyserial>=3.5              # FIX-C-01: ESP32 serial communication
-openvino>=2024.0           # FIX-M-02: optional OpenVINO runtime (export first)
-requests>=2.31             # used by kiosk_firestore.py
+ultralytics>=8.2
+numpy
+qrcode[pil]>=7.4          # also provides Pillow, used for the kiosk's typography
+firebase-admin>=6.5       # legacy service-account mode and the admin tools
+requests>=2.31            # kiosk identity (kiosk_firestore.py)
+pyserial>=3.5             # ESP32 sorter ("sorter": "esp32"); not needed in attendant or simulated mode
+
+# Optional: faster CPU inference after exporting best.pt (see README, "OpenVINO")
+# openvino>=2024.0
