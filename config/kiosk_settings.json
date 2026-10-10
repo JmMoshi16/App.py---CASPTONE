@@ -1,0 +1,23 @@
+{
+  "_comment": "Kiosk settings (no secrets). Command-line flags override these; see README 'Running the kiosk'. sorter: attendant = staff confirm with SPACE (no hardware), esp32 = servo + load cell over USB serial, sim = simulated ESP32 (labelled SIMULATION).",
+  "width": 1280,
+  "height": 720,
+  "fullscreen": false,
+  "reduce_motion": false,
+  "sounds": true,
+  "camera_index": 0,
+  "sorter": "attendant",
+  "serial_port": "auto",
+  "serial_baud": 115200,
+  "sort_ack_timeout": 5.0,
+  "drop_confirm_timeout": 10.0,
+  "issue_timeout": 20.0,
+  "qr_display_seconds": 180.0,
+  "success_seconds": 4.0,
+  "failure_seconds": 7.0,
+  "lock_votes": 5,
+  "rearm_clear_frames": 10,
+  "min_drop_grams": 5.0,
+  "bins_min_interval": 60.0,
+  "log_dir": "logs"
+}

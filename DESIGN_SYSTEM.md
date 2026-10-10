@@ -49,10 +49,11 @@ Full-screen moments (success, failure, receipt, history, diagnostics) use a cent
 | `ink_3` | `#77716B` | tertiary text — only ≥ 18 px or on white | 4.82 on white |
 | `coffee` | `#795548` | brand accent, wordmark | 5.92 on canvas |
 | `forest` | `#247A52` | primary actions, success, Biodegradable | 5.28 on white |
-| `forest_dark` | `#1B5E3F` | pressed primary | — |
+| `forest_dark` | `#1B5E3F` | pressed primary; text on `sage` (forest on sage is only 4.21) | 6.16 on sage |
 | `sage` | `#DCE9DF` | success / Biodegradable tint | ink 13.7 on it |
 | `blue` | `#2B6CB0` | Recyclable | 5.42 on white |
 | `blue_tint` | `#DDE8F4` | Recyclable tint | — |
+| `blue_ink` | `#1F5A94` | Recyclable text on its tint | 5.74 on blue_tint |
 | `charcoal` | `#4A4440` | Residual | white 9.58 on it |
 | `charcoal_tint` | `#E7E3DF` | Residual tint | — |
 | `amber` | `#D99A26` | warning **fill/icon only** (2.2 on canvas as text) | ink 7.0 on it |
