@@ -1,0 +1,481 @@
+# -*- coding: utf-8 -*-
+"""Product-level kiosk tests: every screen renders and scans, and the real main() loop survives the things
+an unattended café kiosk meets (slow network, camera loss, model errors, repeated deposits, taps).
+
+Same fakes as test_kiosk_phase1 (no Firebase, no model weights, no camera, no window). Real time passes:
+the sorter simulator and the timeouts run on the wall clock with short settings.
+
+    py -3.11 -I -m unittest discover -s tests -v
+"""
+import contextlib
+import io
+import json
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import cv2
+import numpy as np
+
+import test_kiosk_phase1 as p1
+from test_kiosk_phase1 import FakeBox, FakeCap, FakeFirestore, FakeModel
+
+app = None
+Renderer = View = None
+
+
+def setUpModule():
+    global app, Renderer, View
+    if p1.app is None:
+        p1.setUpModule()
+    app = p1.app
+    from kiosk.ui.screens import Renderer as R, View as V
+    Renderer, View = R, V
+
+
+# ── a flexible driver for the real main() loop ────────────────────────────────
+class ScriptedModel:
+    """Sees a can while `present[0]` is true."""
+    names = {0: "can"}
+
+    def __init__(self, present):
+        self.present = present
+
+    def __call__(self, frame, conf=0.25, verbose=False):
+        return [types.SimpleNamespace(boxes=[FakeBox(0, 0.92)] if self.present[0] else [])]
+
+
+def drive(controller, *, model=None, db=None, settings=None, max_frames=900, inline=True, extra=()):
+    """Run app.main() until `controller(n, seen)` returns ord('q'). `seen` lists (phase, overlay) per frame.
+    Returns (stdout, seen, mouse_callback_holder)."""
+    seen, mouse = [], {}
+    calls = {"n": 0}
+    s = {"width": 1280, "height": 720, "sounds": False, "success_seconds": 0.3, "failure_seconds": 0.3}
+    s.update(settings or {})
+    tmp = Path(tempfile.mkdtemp()) / "settings.json"
+    tmp.write_text(json.dumps(s), encoding="utf-8")
+    real_render = Renderer.render
+
+    def render(self, cam, v, now, transition=True):
+        seen.append((v.phase, v.overlay))
+        return real_render(self, cam, v, now, transition)
+
+    def wait_key(delay=0):
+        n = calls["n"]
+        calls["n"] += 1
+        if n > max_frames:
+            raise AssertionError(f"main() did not finish in {max_frames} frames; last phases {seen[-5:]}")
+        time.sleep(0.005)
+        return controller(n, seen) or 255
+
+    out = io.StringIO()
+    with contextlib.ExitStack() as st:
+        st.enter_context(contextlib.redirect_stdout(out))
+        st.enter_context(mock.patch.object(app, "SETTINGS_FILE", tmp))
+        st.enter_context(mock.patch.object(app.cv2, "VideoCapture", lambda i: FakeCap()))
+        for name in ("namedWindow", "resizeWindow", "destroyAllWindows"):
+            st.enter_context(mock.patch.object(app.cv2, name, lambda *a, **k: None))
+        st.enter_context(mock.patch.object(app.cv2, "imshow", lambda name, img: None))
+        st.enter_context(mock.patch.object(app.cv2, "waitKey", wait_key))
+        st.enter_context(mock.patch.object(app.cv2, "setMouseCallback", lambda w, cb: mouse.update(cb=cb)))
+        st.enter_context(mock.patch.object(app, "draw_splash_animation", lambda name: None))
+        st.enter_context(mock.patch.object(app, "model", model or FakeModel()))
+        st.enter_context(mock.patch.object(app, "db", db if db is not None else FakeFirestore()))
+        st.enter_context(mock.patch.object(Renderer, "render", render))
+        if inline:
+            st.enter_context(mock.patch.object(app, "run_in_background", lambda fn: fn()))
+        for p in extra:
+            st.enter_context(p)
+        app.main()
+    return out.getvalue(), seen, mouse
+
+
+def phase(seen):
+    return seen[-1][0] if seen else None
+
+
+def tokens(db):
+    return [doc for coll, doc, _ in db.sets if coll == "qr_tokens"]
+
+
+def claim(db, token):
+    db.deliver_snapshot("qr_tokens", token, {"usedBy": ["customer-1"]})
+
+
+class SimulatedSorterEndToEnd(unittest.TestCase):
+    def test_two_deposits_in_a_row_each_sorted_confirmed_issued_and_claimed(self):
+        db = FakeFirestore()
+        present = [True]
+        state = {"done": 0, "away_since": None}
+
+        def controller(n, seen):
+            ph = phase(seen)
+            if ph == "qr" and len(tokens(db)) > state["done"]:
+                claim(db, tokens(db)[state["done"]])
+                state["done"] += 1
+            if ph == "complete":
+                present[0] = False                      # the customer leaves; the next one arrives later
+                state["away_since"] = n
+            if state["away_since"] is not None and n - state["away_since"] > 15 and ph == "ready":
+                present[0] = True
+                state["away_since"] = None
+            if state["done"] == 2 and ph == "ready":
+                return ord("q")
+
+        from kiosk.hardware import SimulatedSorter
+        fast = mock.patch.object(app, "make_sorter", lambda *a, **k: SimulatedSorter(ack_s=0.05, drop_s=0.12))
+        out, seen, _ = drive(controller, db=db, model=ScriptedModel(present), settings={"sorter": "sim"}, extra=[fast])
+        self.assertEqual(len(tokens(db)), 2, out)
+        self.assertEqual(out.count("[SCANNED]"), 2)
+        self.assertIn("[SCANNED] +10 pts | Total scans: 2", out)
+        order = [p for i, (p, _) in enumerate(seen) if i == 0 or seen[i - 1][0] != p]
+        one = ["detected", "sorting", "confirming", "issuing", "qr", "complete", "ready"]
+        self.assertEqual(order[:14], one + one, order)   # detection runs before the first frame is drawn
+        unsubscribed = [doc for _, doc in db.unsubscribed]
+        self.assertEqual(unsubscribed, tokens(db), "each QR's watcher must stop when it is claimed (K-10)")
+        self.assertIn("(SIMULATED)", out)
+
+
+class TokenContractTests(unittest.TestCase):
+    """What the phone app, the web Manual Claim and the rules' isNewKioskToken() rely on (audit K-01)."""
+
+    def test_token_document_and_payload(self):
+        import re
+        import uuid
+        from datetime import datetime, timedelta, timezone
+        db = FakeFirestore()
+        with mock.patch.object(app, "db", db), contextlib.redirect_stdout(io.StringIO()):
+            before = datetime.now(timezone.utc)
+            info = app.issue_token("Biodegradable", "plain rice", 0.81)
+        coll, token, data = db.sets[0]
+        self.assertEqual(coll, "qr_tokens")
+        self.assertEqual(set(data), {"wasteType", "expiresAt", "usedBy", "isUsed", "createdAt", "claimCode"})
+        self.assertEqual(str(uuid.UUID(token, version=4)), token)
+        self.assertEqual(info["payload"], f"ECOBIN:Biodegradable:{token}")
+        self.assertEqual(len(info["payload"].split(":")), 3)
+        self.assertIsInstance(data["expiresAt"], datetime, "expiresAt must be stored as a Timestamp, not a string")
+        self.assertIsNotNone(data["expiresAt"].tzinfo, "naive datetimes are read as local time")
+        self.assertAlmostEqual((data["expiresAt"] - before).total_seconds(), app.QR_EXPIRY_MINUTES * 60, delta=5)
+        self.assertIs(data["createdAt"], app.SERVER_TS, "the rules require createdAt == request.time")
+        self.assertEqual((data["usedBy"], data["isUsed"]), ([], False))
+        self.assertRegex(data["claimCode"], r"^\d{4}$")
+        self.assertEqual(info["claim_code"], data["claimCode"])
+        det = [d for c, d in db.adds if c == "detections"][0]
+        self.assertIs(det["timestamp"], app.SERVER_TS)
+        self.assertEqual(det["kioskId"], app.KIOSK_ID)
+
+    def test_kiosk_never_writes_customer_collections(self):
+        src = Path(app.__file__).read_text(encoding="utf-8")
+        for coll in ("users", "waste_logs", "redemptions", "profiles"):
+            self.assertNotRegex(src, rf'collection\(\s*["\']{coll}["\']', f"the kiosk must not touch {coll}")
+
+
+class NonBlockingTests(unittest.TestCase):
+    def test_a_slow_token_write_does_not_freeze_the_screen(self):
+        class SlowDb(FakeFirestore):
+            def collection(self, name):
+                coll = super().collection(name)
+                if name == "qr_tokens":
+                    real = coll.document
+
+                    def document(doc_id):
+                        ref = real(doc_id)
+                        orig = ref.set
+                        ref.set = lambda data: (time.sleep(0.6), orig(data))
+                        return ref
+                    coll.document = document
+                return coll
+
+        db = SlowDb()
+        marks = {}
+
+        def controller(n, seen):
+            if n == 3:
+                marks["space"] = len(seen)
+                return 32
+            if phase(seen) == "qr":
+                marks["qr"] = len(seen)
+                return ord("q")
+
+        out, seen, _ = drive(controller, db=db, inline=False)
+        self.assertIn("qr", marks, out)
+        frames_while_writing = marks["qr"] - marks["space"]
+        self.assertGreaterEqual(frames_while_writing, 10,
+                                f"only {frames_while_writing} frames drawn during a 0.6 s write: the UI blocked (K-07)")
+        self.assertIn("issuing", [p for p, _ in seen[marks["space"]:marks["qr"]]])
+
+
+class QrLifetimeInTheLoop(unittest.TestCase):
+    def test_walk_away_returns_to_ready_and_stops_polling(self):
+        db = FakeFirestore()
+
+        def controller(n, seen):
+            if n == 3:
+                return 32
+            if any(p == "qr" for p, _ in seen) and phase(seen) != "qr":   # left the QR (ready, then the can again)
+                return ord("q")
+
+        out, seen, _ = drive(controller, db=db, settings={"qr_display_seconds": 0.3})
+        self.assertEqual([doc for _, doc in db.unsubscribed], tokens(db))
+        self.assertIn("[QR] back to ready", out)
+
+    def test_tap_on_claim_code_opens_the_receipt_and_back_closes_it(self):
+        db = FakeFirestore()
+        holder = {}
+
+        def tap(action):
+            for x1, y1, x2, y2, a in app._renderer.buttons:
+                if a == action:
+                    holder["cb"](cv2.EVENT_LBUTTONUP, (x1 + x2) // 2, (y1 + y2) // 2, 0, None)
+                    return True
+            return False
+
+        def controller(n, seen):
+            if n == 3:
+                return 32
+            if phase(seen) == "qr" and seen[-1][1] is None and "opened" not in holder:
+                holder["opened"] = tap("receipt")
+            elif seen[-1][1] == "receipt" and "closed" not in holder:
+                holder["closed"] = tap("close")
+            elif holder.get("closed") and seen[-1][1] is None:
+                return ord("q")
+
+        def capture(window, cb):
+            holder["cb"] = cb
+        out, seen, _ = drive(controller, db=db, extra=[mock.patch.object(app.cv2, "setMouseCallback", capture)])
+        self.assertTrue(holder.get("opened") and holder.get("closed"), seen[-5:])
+        self.assertIn(("qr", "receipt"), seen)
+
+
+class RecoveryTests(unittest.TestCase):
+    def test_camera_outage_shows_a_message_and_recovers(self):
+        opens = {"n": 0}
+
+        class FlakyCap(FakeCap):
+            def __init__(self):
+                opens["n"] += 1
+                self.reads = 0
+                self.opened = opens["n"] > 2          # the first two attempts fail
+
+            def isOpened(self):
+                return self.opened
+
+            def read(self):
+                self.reads += 1
+                if opens["n"] == 3 and self.reads > 5:    # then the feed drops once
+                    return False, None
+                return super().read()
+
+        class FastCamera(app.Camera):
+            def __init__(self, index):
+                super().__init__(index, retry_s=0.05, fail_limit=5)
+
+        def controller(n, seen):
+            if opens["n"] >= 4 and phase(seen) == "detected":
+                return ord("q")
+
+        out, seen, _ = drive(controller, extra=[mock.patch.object(app.cv2, "VideoCapture", lambda i: FlakyCap()),
+                                                mock.patch.object(app, "Camera", FastCamera)])
+        self.assertIn("[CAMERA ERROR] Could not access webcam", out)
+        self.assertIn("[CAMERA] Lost feed", out)
+        self.assertIn("[CAMERA] Re-opened camera 0.", out)
+
+    def test_inference_errors_are_logged_and_the_loop_continues(self):
+        state = {"n": 0}
+
+        class Crashy(FakeModel):
+            def __call__(self, frame, conf=0.25, verbose=False):
+                state["n"] += 1
+                if state["n"] <= 3:
+                    raise RuntimeError("bad tensor")
+                return super().__call__(frame, conf, verbose)
+
+        out, seen, _ = drive(lambda n, seen: ord("q") if phase(seen) == "detected" else None, model=Crashy())
+        self.assertIn("[AI ERROR] inference failed: bad tensor", out)
+        self.assertEqual(phase(seen), "detected")
+
+    def test_a_drawing_error_does_not_end_the_kiosk(self):
+        state = {"n": 0}
+        real = app.draw_camera_hud
+
+        def flaky(*a, **k):
+            state["n"] += 1
+            if state["n"] == 2:
+                raise ValueError("bad layout")
+            return real(*a, **k)
+
+        out, seen, _ = drive(lambda n, seen: ord("q") if n > 6 else None,
+                             extra=[mock.patch.object(app, "draw_camera_hud", flaky)])
+        self.assertIn("[ERROR] bad layout", out)
+        self.assertGreater(state["n"], 4)
+
+    def test_staff_overlays_open_and_close(self):
+        keys = {2: ord("d"), 4: ord("d"), 5: ord("h"), 7: 27, 9: ord("q")}
+        out, seen, _ = drive(lambda n, seen: keys.get(n))
+        overlays = [o for _, o in seen]
+        self.assertIn("diagnostics", overlays)
+        self.assertIn("history", overlays)
+        self.assertIsNone(overlays[-1])
+        self.assertNotIn("[ERROR]", out)
+
+
+class BinsTests(unittest.TestCase):
+    def _sorter(self, simulated):
+        from kiosk.hardware import Fill, LinkState
+        s = types.SimpleNamespace(mode="esp32", simulated=simulated, state=LinkState.CONNECTED, detail="", port="COM3",
+                                  unparsed=0, recent=[], ready=True, send_sort=lambda w: True, close=lambda: None)
+        sent = {"done": False}
+
+        def poll(now=None):
+            if sent["done"]:
+                return []
+            sent["done"] = True
+            return [Fill(12, 55, 90)]
+        s.poll = poll
+        return s
+
+    def test_real_fill_levels_are_written_in_the_dashboard_shape(self):
+        db = FakeFirestore()
+        drive(lambda n, seen: ord("q") if n > 3 else None, db=db, settings={"sorter": "esp32"},
+              extra=[mock.patch.object(app, "make_sorter", lambda *a, **k: self._sorter(False))])
+        bins = {doc: data for coll, doc, data in db.sets if coll == "bins"}
+        self.assertEqual(sorted(bins), sorted(f"{app.KIOSK_ID}-{s}" for s in ("bio", "rec", "res")))
+        b = bins[f"{app.KIOSK_ID}-res"]
+        self.assertEqual(set(b), {"location", "fillLevel", "status", "lastUpdated"})   # web lib/types.ts BinStatus
+        self.assertEqual((b["fillLevel"], b["status"]), (90, "online"))
+        self.assertIs(b["lastUpdated"], app.SERVER_TS)
+
+    @unittest.skipUnless(__import__("os").environ.get("FIRESTORE_EMULATOR_HOST"), "Firestore emulator not running")
+    def test_the_rules_accept_the_kiosks_own_bins_and_the_admin_reads_them(self):
+        kiosk_db = p1._emulator_client("kiosk-bins", {"kiosk": True})
+        admin_db = p1._emulator_client("staff-bins", {"admin": True})
+        with mock.patch.object(app, "db", kiosk_db), mock.patch.object(app, "KIOSK_ID", "kiosk-bins"), \
+                mock.patch.object(app, "SERVER_TS", app.KIOSK_SERVER_TIMESTAMP):
+            with mock.patch.object(app, "_warn_once", lambda key, msg, every=600: self.fail(msg)):
+                app.BinsReporter()._write((12, 55, 90))
+        doc = admin_db.collection("bins").document("kiosk-bins-res").get().to_dict()
+        self.assertEqual((doc["fillLevel"], doc["status"]), (90, "online"))
+        self.assertIsNotNone(doc["lastUpdated"])
+
+    def test_simulated_readings_are_never_written(self):
+        db = FakeFirestore()
+        drive(lambda n, seen: ord("q") if n > 3 else None, db=db, settings={"sorter": "esp32"},
+              extra=[mock.patch.object(app, "make_sorter", lambda *a, **k: self._sorter(True))])
+        self.assertEqual([c for c, _, _ in db.sets if c == "bins"], [])
+
+
+# ── screens ───────────────────────────────────────────────────────────────────
+def _views():
+    from kiosk.flow import Detection, Failure, FlowConfig, Phase, Toast, TransactionFlow
+    det = Detection("can", "Recyclable", 0.87, (260, 140, 380, 350))
+    tx = types.SimpleNamespace(waste_type="Recyclable", claim_code="4821", token="2f1c0a8e-1111-4c2d-9e7a-0b5d2c7e9a10")
+    payload = "ECOBIN:Recyclable:" + tx.token
+    pts = {"Biodegradable": 15, "Recyclable": 10, "Residual": 5}
+
+    def stages(mode, ph, failure=None):
+        f = TransactionFlow(FlowConfig(mode=mode))
+        f.phase, f.failure = Phase(ph), failure
+        return f.stages()
+    fail = Failure("sorter_timeout", "The sorter didn't respond", "Please take your item and try again.")
+    base = dict(points=pts, clock="10:42 AM")
+    qr = dict(tx=tx, qr_modules=app.qr_modules(payload), secs_left=1080, total_secs=1200,
+              expires_local="11:02 AM", issued_local="10:42 AM", issued_date="Oct 10, 2026", phase_age=5)
+    return payload, {
+        "ready": View(phase="ready", stages=stages("attendant", "ready"), **base),
+        "ready-offline": View(phase="ready", mode="esp32", online=False, sorter_state="reconnecting",
+                              stages=stages("esp32", "ready"), **base),
+        "detected": View(phase="detected", detection=det, latest=det, stages=stages("attendant", "detected"), **base),
+        "detected-esp32": View(phase="detected", mode="esp32", sorter_state="connected", sorter_ready=True,
+                               detection=det, latest=det, lock_progress=0.6, stages=stages("esp32", "detected"), **base),
+        "sorting-sim": View(phase="sorting", mode="sim", sorter_state="connected", tx=tx,
+                            stages=stages("sim", "sorting"), **base),
+        "issuing": View(phase="issuing", tx=tx, stages=stages("attendant", "issuing"), **base),
+        "qr": View(phase="qr", stages=stages("attendant", "qr"), **qr, **base),
+        "receipt": View(phase="qr", overlay="receipt", stages=stages("attendant", "qr"), **qr, **base),
+        "complete": View(phase="complete", tx=tx, phase_age=5, seconds_to_ready=3, **base),
+        "failed": View(phase="failed", mode="esp32", tx=tx, failure=fail, seconds_to_ready=5,
+                       stages=stages("esp32", "failed", fail), **base),
+        "history": View(phase="ready", overlay="history", history=[
+            {"waste_type": "Residual", "points": 5, "claim_code": "7310", "ts": "9:31 AM"}], **base),
+        "history-empty": View(phase="ready", overlay="history", **base),
+        "diagnostics": View(phase="ready", overlay="diagnostics", diagnostics=[("Kiosk", [("Name", "x")])], **base),
+        "no-camera": View(phase="ready", camera_ok=False, toast=Toast("No item detected yet", "info", 2.0), **base),
+        "model-mismatch": View(phase="detected", model_ok=False, detection=Detection("person", None, 0.9),
+                               latest=Detection("person", None, 0.9, (10, 10, 600, 470)), **base),
+    }
+
+
+class ScreenTests(unittest.TestCase):
+    SIZES = [(1280, 720), (1024, 600), (1920, 1080)]
+
+    def setUp(self):
+        self.cam = np.full((480, 640, 3), 120, np.uint8)
+
+    def test_every_screen_renders_at_every_supported_size(self):
+        _, views = _views()
+        for w, h in self.SIZES:
+            r = Renderer(w, h)
+            for name, v in views.items():
+                with self.subTest(size=f"{w}x{h}", screen=name):
+                    img = r.render(None if not v.camera_ok else self.cam, v, 1.0, transition=False)
+                    self.assertEqual(img.shape, (h, w, 3))
+                    self.assertGreater(float(img.std()), 5.0, "blank frame")
+
+    def test_the_qr_on_screen_scans_to_the_exact_payload(self):
+        payload, views = _views()
+        detector = cv2.QRCodeDetector()
+        for w, h in self.SIZES:
+            with self.subTest(size=f"{w}x{h}"):
+                img = Renderer(w, h).render(self.cam, views["qr"], 10.0, transition=False)
+                text, _, _ = detector.detectAndDecode(img)
+                self.assertEqual(text, payload)
+
+    def test_touch_targets_are_at_least_44_px_on_the_7_inch_screen(self):
+        _, views = _views()
+        r = Renderer(1024, 600)
+        for name in ("qr", "receipt", "failed", "history"):
+            r.render(self.cam, views[name], 1.0, transition=False)
+            for x1, y1, x2, y2, action in r.buttons:
+                self.assertGreaterEqual(min(x2 - x1, y2 - y1), 44, f"{name}/{action} button is too small")
+
+    def test_text_colours_meet_wcag_aa(self):
+        from kiosk.ui.theme import C
+
+        def lum(bgr):
+            def ch(c):
+                c /= 255
+                return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+            b, g, r = bgr
+            return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+
+        def ratio(a, b):
+            la, lb = sorted([lum(a), lum(b)], reverse=True)
+            return (la + 0.05) / (lb + 0.05)
+        pairs = {   # (text, background) pairs the screens actually use for normal-size text
+            "ink/canvas": (C.ink, C.canvas), "ink_2/canvas": (C.ink_2, C.canvas), "ink_2/surface": (C.ink_2, C.surface),
+            "forest/surface": (C.forest, C.surface), "blue/surface": (C.blue, C.surface),
+            "charcoal/surface": (C.charcoal, C.surface), "white/forest": (C.white, C.forest),
+            "white/error": (C.white, C.error), "ink/amber": (C.ink, C.amber), "amber_ink/amber_tint": (C.amber_ink, C.amber_tint),
+            "error_ink/error_tint": (C.error_ink, C.error_tint), "forest_dark/sage(chip)": (C.forest_dark, C.sage),
+            "blue_ink/blue_tint": (C.blue_ink, C.blue_tint), "charcoal/charcoal_tint": (C.charcoal, C.charcoal_tint), "ink/sunken": (C.ink, C.sunken), "ink_2/sunken": (C.ink_2, C.sunken),
+            "white/blue": (C.white, C.blue), "white/charcoal": (C.white, C.charcoal),
+        }
+        low = {k: round(ratio(*v), 2) for k, v in pairs.items() if ratio(*v) < 4.5}
+        self.assertEqual(low, {})
+
+    def test_steady_state_frame_cost(self):
+        _, views = _views()
+        r = Renderer(1280, 720)
+        r.render(self.cam, views["detected-esp32"], 0.0)
+        t = time.perf_counter()
+        for i in range(30):
+            r.render(self.cam, views["detected-esp32"], 1.0 + i * 0.03)
+        ms = (time.perf_counter() - t) / 30 * 1000
+        self.assertLess(ms, 40, f"{ms:.1f} ms per frame")   # measured ≈ 6 ms on the development PC
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,26 +1,52 @@
 # -*- coding: utf-8 -*-
+"""ECOReward Bin kiosk: camera -> YOLOv8 -> deposit confirmation -> Firestore token -> QR -> phone claim.
+
+    py -3.11 app.py                        staff confirm deposits with SPACE (no sorter hardware)
+    py -3.11 app.py --sorter esp32         ESP32 servo + load cell over USB serial (README "ESP32 protocol")
+    py -3.11 app.py --no-hardware          simulated ESP32 for demos (labelled SIMULATION on screen)
+    py -3.11 app.py --fullscreen           fill the kiosk display
+    py -3.11 app.py --help                 every option; defaults live in config/kiosk_settings.json
+
+Staff keys: SPACE confirm deposit (attendant mode) · R claim-code receipt · H history · D diagnostics ·
+Esc close · Q quit. Customers only need the touch screen (or nothing at all in ESP32 mode).
+
+Layout of the code: this file wires Firestore, the model and the camera to the pieces in kiosk/
+(config, hardware, flow, ui). The token contract with the phone app and the Firestore rules is in
+issue_token() and must not change: ECOBIN:<Type>:<uuid4>, Timestamp expiresAt, server-time createdAt.
+"""
 import hashlib
 import json
+import logging
+import logging.handlers
 import os
-import sys
 import platform
-from pathlib import Path
-import cv2
-import uuid
+import queue
 import secrets
-import qrcode
-import numpy as np
+import sys
 import threading
-from collections import deque, Counter
+import time
+import traceback
+import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import cv2
+import numpy as np
+import qrcode
 import firebase_admin
 from firebase_admin import credentials, firestore
 from ultralytics import YOLO
 
-# kiosk_firestore.py sits next to this file; isolated mode (python -I) does not add this folder itself.
+# kiosk_firestore.py and kiosk/ sit next to this file; isolated mode (python -I) does not add this folder itself.
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kiosk_firestore import KioskFirestore, SERVER_TIMESTAMP as KIOSK_SERVER_TIMESTAMP  # noqa: E402
+from kiosk.config import load_settings  # noqa: E402
+from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SendSort, Sound, StopWatching,  # noqa: E402
+                        TransactionFlow, WatchToken)
+from kiosk.hardware import DeviceError, Fill, make_sorter  # noqa: E402
+from kiosk.ui.screens import Renderer, View  # noqa: E402
 
 # ── Platform-safe beep ────────────────────────────────────────────────────────
 if platform.system() == 'Windows':
@@ -30,6 +56,43 @@ if platform.system() == 'Windows':
 else:
     def _beep(freq=880, dur=120):  # no-op on Linux/macOS
         pass
+
+# ── Logging: console (as before) + one file per day for unattended operation ──
+_file_log = logging.getLogger("ecoreward.kiosk")
+_file_log.propagate = False
+_warned = {}
+
+
+def log(msg):
+    """Print (operators and the tests read stdout) and append to the daily log file once it is set up."""
+    print(msg)
+    if _file_log.handlers:
+        _file_log.info(str(msg).strip())
+
+
+def _warn_once(key, msg, every=600):
+    """Log a repeating problem at most once per `every` seconds instead of on every frame/beat."""
+    now = time.monotonic()
+    if now - _warned.get(key, -1e9) >= every:
+        _warned[key] = now
+        log(msg)
+
+
+def _setup_file_log(log_dir):
+    if _file_log.handlers:
+        return _file_log.handlers[0].baseFilename
+    path = Path(os.environ.get("ECOREWARD_LOG_DIR", "").strip() or _APP_DIR / log_dir)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        h = logging.handlers.TimedRotatingFileHandler(path / "kiosk.log", when="midnight", backupCount=14,
+                                                      encoding="utf-8")
+    except OSError as e:
+        print(f"[LOG] file logging disabled ({e})")
+        return None
+    h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _file_log.addHandler(h)
+    _file_log.setLevel(logging.INFO)
+    return h.baseFilename
 
 # ── Firebase ───────────────────────────────────────────────────────────────────
 _APP_DIR     = Path(__file__).resolve().parent
@@ -102,72 +165,50 @@ else:
         print("[FIREBASE ERROR] Running OFFLINE: QR codes will NOT be issued until this is fixed (see README).")
 
 # ── YOLO ───────────────────────────────────────────────────────────────────────
+# An OpenVINO export (README "Faster inference") is used when present; otherwise the PyTorch weights.
+_OPENVINO_DIR = _APP_DIR / "best_openvino_model"
+MODEL_FILE = str(_OPENVINO_DIR) if _OPENVINO_DIR.is_dir() else "best.pt"
 print("[AI] Loading YOLO model...")
 try:
-    model = YOLO("best.pt")
-    MODEL_FILE = "best.pt"
-    print("[AI] Loaded: best.pt")
+    model = YOLO(MODEL_FILE)
+    print(f"[AI] Loaded: {Path(MODEL_FILE).name}")
 except Exception as e:
-    print(f"[AI WARNING] best.pt failed to load ({e}), falling back to yolov8n.pt")
+    print(f"[AI WARNING] {Path(MODEL_FILE).name} failed to load ({e}), falling back to yolov8n.pt")
     model = YOLO("yolov8n.pt")
     MODEL_FILE = "yolov8n.pt"
     print("[AI] Loaded: yolov8n.pt")
 
 
 def _sha256(path):
+    """Fingerprint of the weights (for an OpenVINO folder: its .bin file)."""
+    p = Path(path)
     try:
-        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    except OSError:
+        if p.is_dir():
+            p = next(iter(sorted(p.glob("*.bin"))))
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except (OSError, StopIteration):
         return "unknown"
 
 
 # Recorded on every detection so results can be traced to the exact weights (audit H-04 / M-21)
 MODEL_SHA256 = _sha256(MODEL_FILE)
 
-# ── Layout ─────────────────────────────────────────────────────────────────────
-WIN_W, WIN_H      = 1280, 720
-CAM_W             = 820
-PANEL_W           = WIN_W - CAM_W          # 460
-MARGIN            = 20
-# Load canonical business rules — single source of truth shared with Flutter and web (audit M-24)
+# ── Business rules and settings ────────────────────────────────────────────────
+# Canonical business rules — single source of truth shared with Flutter and web (audit M-24)
 _RULES_FILE = _APP_DIR / "config" / "rules.json"
 _RULES = json.loads(_RULES_FILE.read_text(encoding="utf-8")) if _RULES_FILE.exists() else {}
 QR_EXPIRY_MINUTES = _RULES.get("qrExpiryMinutes", 20)
+# Kiosk settings (display, sorter, timeouts); ECOREWARD_KIOSK_SETTINGS points to another file.
+SETTINGS_FILE = Path(os.environ.get("ECOREWARD_KIOSK_SETTINGS", "").strip()
+                     or _APP_DIR / "config" / "kiosk_settings.json")
+WIN_W, WIN_H = 1280, 720          # default canvas; --fullscreen uses the screen size
+WINDOW = "ECOReward Bin"
 
 # Kiosk identity: hostname-based so the web admin can tell which machine sent each heartbeat
 KIOSK_NAME = platform.node() or "kiosk-default"
 # With the kiosk identity the rules only let it write kiosks/{its own uid}; the PC name is stored as `name`.
 KIOSK_ID = db.uid if DB_MODE == "kiosk" else KIOSK_NAME
 
-# ── Palette BGR ────────────────────────────────────────────────────────────────
-BG        = (  8,  10,  14)   # near-black
-CARD      = ( 18,  22,  28)   # dark card
-CARD2     = ( 26,  31,  40)   # slightly lighter card
-BORDER    = ( 38,  44,  54)   # subtle border
-ACCENT    = ( 80, 200, 120)   # soft green  (kiosk brand)
-WHITE     = (255, 255, 255)
-OFF_WHITE = (200, 205, 215)
-GRAY      = (100, 108, 120)
-GRAY_DIM  = ( 38,  44,  54)
-BLACK     = (  0,   0,   0)
-AMBER     = ( 40, 180, 255)   # orange-amber for points
-RED_SOFT  = ( 70,  70, 210)
-
-WASTE_COLOR = {
-    'Biodegradable': ( 60, 180,  80),   # green
-    'Recyclable':    ( 30, 160, 255),   # blue
-    'Residual':      ( 80,  80, 200),   # muted red
-}
-WASTE_EMOJI_LABEL = {
-    'Biodegradable': 'BIODEGRADABLE',
-    'Recyclable':    'RECYCLABLE',
-    'Residual':      'RESIDUAL',
-}
-WASTE_TAG = {
-    'Biodegradable': 'BIO',
-    'Recyclable':    'REC',
-    'Residual':      'RES',
-}
 POINTS_MAP = _RULES.get("points", {'Biodegradable': 15, 'Recyclable': 10, 'Residual': 5})
 # Model label (lower-cased) -> waste category; reviewed list lives in config/waste_map.json (audit M-22)
 WASTE_MAP = json.loads((_APP_DIR / "config" / "waste_map.json").read_text(encoding="utf-8"))["map"]
@@ -177,538 +218,6 @@ MIN_BOX_CONF = 0.30
 def unmapped_labels(m):
     """Model class names that have no waste category. Non-empty => the loaded model does not match the map."""
     return sorted({str(n).lower() for n in m.names.values()} - set(WASTE_MAP))
-
-F  = cv2.FONT_HERSHEY_SIMPLEX
-FB = cv2.FONT_HERSHEY_DUPLEX
-
-# ── Drawing primitives ─────────────────────────────────────────────────────────
-def blend(img, x1, y1, x2, y2, color, alpha):
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
-    if x2 <= x1 or y2 <= y1:
-        return
-    roi = img[y1:y2, x1:x2]
-    ov  = roi.copy()
-    ov[:] = color
-    cv2.addWeighted(ov, alpha, roi, 1 - alpha, 0, roi)
-    img[y1:y2, x1:x2] = roi
-
-def rrect(img, x1, y1, x2, y2, r, color, t=-1):
-    r = max(0, min(r, (x2 - x1) // 2, (y2 - y1) // 2))
-    if t == -1:
-        cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, -1)
-        cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), color, -1)
-        for cx, cy in [(x1+r, y1+r), (x2-r, y1+r), (x1+r, y2-r), (x2-r, y2-r)]:
-            cv2.circle(img, (cx, cy), r, color, -1)
-    else:
-        cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, t)
-        cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), color, t)
-        for cx, cy in [(x1+r, y1+r), (x2-r, y1+r), (x1+r, y2-r), (x2-r, y2-r)]:
-            cv2.ellipse(img, (cx, cy), (r, r), 0, 0, 360, color, t)
-
-def putc(img, text, cx, y, font, scale, color, thick=1):
-    (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
-    cv2.putText(img, text, (cx - tw // 2, y), font, scale, color, thick, cv2.LINE_AA)
-
-def putr(img, text, rx, y, font, scale, color, thick=1):
-    (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
-    cv2.putText(img, text, (rx - tw, y), font, scale, color, thick, cv2.LINE_AA)
-
-def putl(img, text, lx, y, font, scale, color, thick=1):
-    cv2.putText(img, text, (lx, y), font, scale, color, thick, cv2.LINE_AA)
-
-def arc(img, cx, cy, r, frac, color, bg=GRAY_DIM, thick=8):
-    cv2.ellipse(img, (cx, cy), (r, r), -90, 0, 360, bg, thick, cv2.LINE_AA)
-    if frac > 0:
-        cv2.ellipse(img, (cx, cy), (r, r), -90, 0, int(360 * frac), color, thick, cv2.LINE_AA)
-
-def vgrad(img, x1, y1, x2, y2, c_top, c_bot):
-    for y in range(y1, y2):
-        t   = (y - y1) / max(y2 - y1, 1)
-        col = tuple(int(c_top[i] * (1 - t) + c_bot[i] * t) for i in range(3))
-        cv2.line(img, (x1, y), (x2, y), col, 1)
-
-def hgrad(img, x1, y1, x2, y2, c1, c2):
-    for x in range(x1, x2):
-        t   = (x - x1) / max(x2 - x1, 1)
-        col = tuple(int(c1[i] * (1 - t) + c2[i] * t) for i in range(3))
-        cv2.line(img, (x, y1), (x, y2), col, 1)
-
-def divider(img, x1, x2, y, color=BORDER):
-    cv2.line(img, (x1, y), (x2, y), color, 1)
-
-def dot_divider(img, x1, x2, y, color=BORDER):
-    for dx in range(x1, x2, 10):
-        cv2.line(img, (dx, y), (dx + 5, y), color, 1)
-
-def generate_qr(data, size=220):
-    box = max(4, size // 35)
-    qr  = qrcode.QRCode(version=1, box_size=box, border=4,
-                        error_correction=qrcode.constants.ERROR_CORRECT_M)
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    return cv2.resize(arr, (size, size), interpolation=cv2.INTER_NEAREST)
-
-# ── Camera HUD ─────────────────────────────────────────────────────────────────
-def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count):
-    h, w = cam.shape[:2]
-    out  = cam.copy()
-    acc  = WASTE_COLOR.get(waste_type, ACCENT)
-
-    # ── top bar ──
-    blend(out, 0, 0, w, 52, BG, 0.90)
-    # left: brand
-    rrect(out, 12, 10, 130, 42, 8, CARD2)
-    putl(out, "ECO",    20, 34, FB, 0.62, ACCENT, 2)
-    putl(out, "REWARD", 58, 34, FB, 0.62, WHITE,  1)
-
-    # center: clock
-    _t = datetime.now()
-    putc(out, _t.strftime("%I:%M %p"), w // 2, 32, FB, 0.52, OFF_WHITE, 1)
-    putc(out, _t.strftime("%A, %b %d"), w // 2, 46, F, 0.30, GRAY, 1)
-
-    # right: status pills
-    fb_color = ACCENT if fb_ok else RED_SOFT
-    fb_text  = "LIVE" if fb_ok else "OFFLINE"
-    (ftw, _), _ = cv2.getTextSize(fb_text, F, 0.30, 1)
-    fx = w - ftw - 36
-    rrect(out, fx - 14, 10, fx + ftw + 10, 30, 6, CARD2)
-    cv2.circle(out, (fx - 6, 20), 3, fb_color, -1, cv2.LINE_AA)
-    putl(out, fb_text, fx, 26, F, 0.30, fb_color, 1)
-
-    sc_text = f"SCANS  {scan_count}"
-    (stw, _), _ = cv2.getTextSize(sc_text, F, 0.30, 1)
-    sx = fx - stw - 36
-    rrect(out, sx - 10, 10, sx + stw + 10, 30, 6, CARD2)
-    putl(out, sc_text, sx, 26, F, 0.30, AMBER, 1)
-
-    # history icon pill — clock symbol + label
-    hx = sx - 64
-    rrect(out, hx - 10, 10, hx + 54, 30, 6, CARD2)
-    # draw mini clock face
-    hcx, hcy = hx + 8, 20
-    cv2.circle(out, (hcx, hcy), 7, ACCENT, 1, cv2.LINE_AA)
-    cv2.line(out, (hcx, hcy), (hcx, hcy - 4), ACCENT, 1, cv2.LINE_AA)
-    cv2.line(out, (hcx, hcy), (hcx + 3, hcy), ACCENT, 1, cv2.LINE_AA)
-    putl(out, "HIST", hx + 19, 26, F, 0.27, ACCENT, 1)
-
-    # thin accent line under top bar
-    cv2.line(out, (0, 52), (w, 52), BORDER, 1)
-
-    # Firebase offline: say so loudly. A QR could never be redeemed, so SPACE is disabled.
-    if not fb_ok:
-        blend(out, 0, 53, w, 85, RED_SOFT, 0.88)
-        putc(out, "FIREBASE OFFLINE  -  QR codes disabled  (check the credential, see README)",
-             w // 2, 75, F, 0.46, WHITE, 1)
-
-    # ── scan frame ──
-    cx, cy = w // 2, h // 2
-    bx, by = 190, 160
-    x1, y1, x2, y2 = cx - bx, cy - by, cx + bx, cy + by
-
-    # dim outside scan zone
-    blend(out, 0,  0,  w,  y1, BLACK, 0.35)
-    blend(out, 0,  y2, w,  h,  BLACK, 0.35)
-    blend(out, 0,  y1, x1, y2, BLACK, 0.35)
-    blend(out, x2, y1, w,  y2, BLACK, 0.35)
-
-    # corner brackets — thick, clean
-    cl, lw = 28, 3
-    for px, py, dx, dy in [(x1, y1, 1, 1), (x2, y1, -1, 1),
-                            (x1, y2, 1, -1), (x2, y2, -1, -1)]:
-        cv2.line(out, (px, py), (px + dx * cl, py), acc, lw, cv2.LINE_AA)
-        cv2.line(out, (px, py), (px, py + dy * cl), acc, lw, cv2.LINE_AA)
-
-    # subtle inner glow on scan zone
-    blend(out, x1, y1, x2, y2, acc, 0.03)
-
-    # center crosshair — tiny, minimal
-    cv2.line(out, (cx - 8, cy), (cx + 8, cy), acc, 1, cv2.LINE_AA)
-    cv2.line(out, (cx, cy - 8), (cx, cy + 8), acc, 1, cv2.LINE_AA)
-
-    # ── bottom detection card ──
-    card_h = 88
-    blend(out, 0, h - card_h, w, h, BG, 0.92)
-    cv2.line(out, (0, h - card_h), (w, h - card_h), BORDER, 1)
-
-    if label != "Unknown" and confidence > 0:
-        # left accent bar
-        cv2.rectangle(out, (0, h - card_h), (4, h), acc, -1)
-
-        # waste type badge
-        badge_text = f"  {WASTE_EMOJI_LABEL[waste_type]}  "
-        (bw2, bh2), _ = cv2.getTextSize(badge_text, FB, 0.58, 2)
-        bx2 = 18
-        rrect(out, bx2, h - card_h + 12, bx2 + bw2 + 4, h - card_h + 12 + bh2 + 10, 8, acc)
-        putl(out, badge_text, bx2 + 2, h - card_h + 12 + bh2 + 2, FB, 0.58, BG, 2)
-
-        # confidence bar
-        bar_x = 18
-        bar_y = h - 30
-        bar_w = 200
-        bar_h2 = 6
-        rrect(out, bar_x, bar_y, bar_x + bar_w, bar_y + bar_h2, 3, CARD2)
-        rrect(out, bar_x, bar_y, bar_x + int(bar_w * confidence), bar_y + bar_h2, 3, acc)
-        putl(out, f"{confidence * 100:.0f}% confidence", bar_x, h - 10, F, 0.32, GRAY, 1)
-
-        # points — right side, large
-        pts_str = f"+{POINTS_MAP[waste_type]}"
-        (pw, _), _ = cv2.getTextSize(pts_str, FB, 1.4, 3)
-        putr(out, pts_str, w - 16, h - 22, FB, 1.4, AMBER, 3)
-        putr(out, "pts", w - 16, h - 8, F, 0.36, GRAY, 1)
-
-        # hint
-        putc(out, "SPACE  to generate QR      H  history", cx, h - 10, F, 0.32, GRAY, 1)
-
-    else:
-        # idle state — centered instruction
-        putc(out, "Place item in front of camera", cx, h - 46, FB, 0.55, OFF_WHITE, 1)
-        putc(out, "AI will detect and classify automatically", cx, h - 22, F, 0.34, GRAY, 1)
-        putc(out, "SPACE  generate QR     H  history     Q  quit", cx, h - 6, F, 0.28, GRAY_DIM, 1)
-
-    return out
-
-# ── QR Panel ───────────────────────────────────────────────────────────────────
-def draw_qr_panel(cam_frame, qr_img, waste_type, points, secs_left, claim_code, total_secs):
-    acc   = WASTE_COLOR.get(waste_type, ACCENT)
-    panel = np.zeros((WIN_H, PANEL_W, 3), np.uint8)
-    panel[:] = BG
-
-    PW = PANEL_W
-    M  = MARGIN
-
-    # ── header bar ──
-    blend(panel, 0, 0, PW, 58, CARD, 1.0)
-    # brand
-    putl(panel, "ECO",    M, 38, FB, 0.70, ACCENT, 2)
-    putl(panel, "REWARD", M + 40, 38, FB, 0.70, WHITE, 1)
-    # subtitle right
-    putr(panel, "Smart Waste Kiosk", PW - M, 38, F, 0.28, GRAY, 1)
-    # thin accent line under header
-    cv2.line(panel, (0, 58), (PW, 58), acc, 2)
-
-    y = 70
-
-    # ── waste + points row (side by side) ──
-    half = (PW - M * 2 - 8) // 2
-
-    # waste pill
-    rrect(panel, M, y, M + half, y + 56, 10, CARD)
-    cv2.rectangle(panel, (M, y), (M + 3, y + 56), acc, -1)
-    putl(panel, "WASTE TYPE", M + 10, y + 16, F, 0.25, GRAY, 1)
-    # tag badge inline
-    tag_txt = WASTE_TAG[waste_type]
-    (tw, _), _ = cv2.getTextSize(tag_txt, F, 0.30, 1)
-    rrect(panel, M + 10, y + 22, M + 10 + tw + 10, y + 42, 4, acc)
-    putl(panel, tag_txt, M + 15, y + 38, F, 0.30, BG, 1)
-    putl(panel, waste_type, M + 10 + tw + 18, y + 40, FB, 0.44, WHITE, 1)
-
-    # points pill
-    px2 = M + half + 8
-    rrect(panel, px2, y, px2 + half, y + 56, 10, CARD)
-    cv2.rectangle(panel, (px2, y), (px2 + 3, y + 56), AMBER, -1)
-    putl(panel, "POINTS", px2 + 10, y + 16, F, 0.25, GRAY, 1)
-    pts_str = f"+{points}"
-    putl(panel, pts_str, px2 + 10, y + 46, FB, 0.80, AMBER, 2)
-    (ptw, _), _ = cv2.getTextSize(pts_str, FB, 0.80, 2)
-    putl(panel, "pts", px2 + 14 + ptw, y + 46, F, 0.30, GRAY, 1)
-
-    y += 64
-
-    # ── QR code card ──
-    qr_size   = 220
-    pad       = 12
-    card_top  = y
-    card_h    = qr_size + pad * 2 + 36   # 36 for label above QR
-    rrect(panel, M, card_top, PW - M, card_top + card_h, 12, CARD)
-
-    # label
-    putc(panel, "Scan with ECOReward App", PW // 2, card_top + 22, F, 0.30, GRAY, 1)
-
-    # QR white frame
-    qx = (PW - qr_size) // 2
-    qy = card_top + 30
-    # outer glow border
-    rrect(panel, qx - pad - 2, qy - pad - 2,
-          qx + qr_size + pad + 2, qy + qr_size + pad + 2, 10, acc)
-    rrect(panel, qx - pad, qy - pad,
-          qx + qr_size + pad, qy + qr_size + pad, 8, WHITE)
-    panel[qy:qy + qr_size, qx:qx + qr_size] = cv2.resize(
-        qr_img, (qr_size, qr_size), interpolation=cv2.INTER_NEAREST)
-
-    # corner brackets over QR
-    cl = 20
-    for px3, py3, dx, dy in [
-        (qx - pad, qy - pad, 1, 1), (qx + qr_size + pad, qy - pad, -1, 1),
-        (qx - pad, qy + qr_size + pad, 1, -1),
-        (qx + qr_size + pad, qy + qr_size + pad, -1, -1)
-    ]:
-        cv2.line(panel, (px3, py3), (px3 + dx * cl, py3), acc, 3, cv2.LINE_AA)
-        cv2.line(panel, (px3, py3), (px3, py3 + dy * cl), acc, 3, cv2.LINE_AA)
-
-    y = card_top + card_h + 10
-
-    # ── timer card ──
-    frac    = secs_left / max(total_secs, 1)
-    t_color = ACCENT if frac > 0.4 else AMBER if frac > 0.15 else RED_SOFT
-    tch     = 68
-    rrect(panel, M, y, PW - M, y + tch, 10, CARD)
-
-    # arc timer
-    arc_cx = M + 42
-    arc_cy = y + tch // 2
-    arc(panel, arc_cx, arc_cy, 26, frac, t_color, GRAY_DIM, 6)
-    mins, secs_r = secs_left // 60, secs_left % 60
-    putc(panel, f"{mins:02d}:{secs_r:02d}", arc_cx, arc_cy + 6, F, 0.44, t_color, 2)
-
-    # text
-    putl(panel, "EXPIRES IN", M + 82, y + 20, F, 0.26, GRAY, 1)
-    exp_time = (datetime.now() + timedelta(seconds=secs_left)).strftime("%I:%M %p")  # local display only
-    putl(panel, f"at {exp_time}", M + 82, y + 44, FB, 0.52, WHITE, 1)
-
-    # thin progress bar
-    bw2 = PW - M * 2 - 8
-    bx2 = M + 4
-    by2 = y + tch - 8
-    rrect(panel, bx2, by2, bx2 + bw2, by2 + 4, 2, GRAY_DIM)
-    rrect(panel, bx2, by2, bx2 + int(bw2 * frac), by2 + 4, 2, t_color)
-    y += tch + 8
-
-    # ── claim code hint row ──
-    cch = 38
-    rrect(panel, M, y, PW - M, y + cch, 8, CARD)
-    cv2.rectangle(panel, (M, y), (M + 3, y + cch), AMBER, -1)
-    putl(panel, "CLAIM CODE", M + 10, y + 14, F, 0.24, GRAY, 1)
-    putr(panel, f"ECO-{claim_code}", PW - M - 10, y + 28, FB, 0.46, AMBER, 1)
-    y += cch + 8
-
-    # ── footer ──
-    blend(panel, 0, WIN_H - 44, PW, WIN_H, CARD, 1.0)
-    cv2.line(panel, (0, WIN_H - 44), (PW, WIN_H - 44), BORDER, 1)
-    putc(panel, "R  — No phone? Show receipt to staff",
-         PW // 2, WIN_H - 24, F, 0.30, AMBER, 1)
-    putc(panel, "Single use  •  Auto-expires on scan",
-         PW // 2, WIN_H - 8, F, 0.26, GRAY_DIM, 1)
-
-    cam_r = cv2.resize(cam_frame, (CAM_W, WIN_H))
-    return np.hstack([cam_r, panel])
-
-# ── Receipt / Manual Claim Screen ─────────────────────────────────────────────
-def draw_receipt(cam_frame, waste_type, points, claim_code, token=""):
-    base = cv2.resize(cam_frame, (WIN_W, WIN_H))
-    acc  = WASTE_COLOR.get(waste_type, ACCENT)
-    blend(base, 0, 0, WIN_W, WIN_H, BLACK, 0.86)
-
-    rw, rh = 560, 500
-    rx  = WIN_W // 2 - rw // 2
-    ry  = WIN_H // 2 - rh // 2
-    cx2 = WIN_W // 2
-
-    # ── card shadow (subtle dark offset) ──
-    rrect(base, rx + 4, ry + 4, rx + rw + 4, ry + rh + 4, 16, (4, 5, 7))
-
-    # ── card body ──
-    rrect(base, rx, ry, rx + rw, ry + rh, 16, CARD)
-
-    # ── top accent gradient bar ──
-    for xi in range(rx, rx + rw):
-        t   = (xi - rx) / rw
-        col = tuple(int(acc[i] * (1 - t * 0.4)) for i in range(3))
-        cv2.line(base, (xi, ry), (xi, ry + 5), col, 1)
-
-    # ── header section ──
-    blend(base, rx, ry, rx + rw, ry + 78, CARD2, 1.0)
-    cv2.line(base, (rx, ry + 78), (rx + rw, ry + 78), BORDER, 1)
-
-    # brand mark
-    putc(base, "ECO",    cx2 - 28, ry + 36, FB, 0.72, ACCENT, 2)
-    putc(base, "REWARD", cx2 + 28, ry + 36, FB, 0.72, WHITE,  1)
-    # fix overlap — draw as one centered string
-    putc(base, "ECOREWARD", cx2, ry + 36, FB, 0.72, ACCENT, 2)
-    # overwrite right half in white
-    (ew, _), _ = cv2.getTextSize("ECOREWARD", FB, 0.72, 2)
-    (lw, _), _ = cv2.getTextSize("ECO",       FB, 0.72, 2)
-    cv2.putText(base, "REWARD", (cx2 - ew // 2 + lw, ry + 36),
-                FB, 0.72, WHITE, 2, cv2.LINE_AA)
-    putc(base, "Official Waste Receipt", cx2, ry + 60, F, 0.30, GRAY, 1)
-
-    # ── info rows ──
-    def row(label, value, vy, vc=OFF_WHITE, bold=False):
-        putl(base, label, rx + 28, vy, F, 0.34, GRAY, 1)
-        font = FB if bold else F
-        putr(base, value, rx + rw - 28, vy, font, 0.38, vc, 1)
-
-    dot_divider(base, rx + 20, rx + rw - 20, ry + 88)
-
-    _rt = datetime.now()
-    row("Date",       _rt.strftime("%B %d, %Y"),   ry + 112)
-    row("Time",       _rt.strftime("%I:%M:%S %p"), ry + 136)
-    row("Waste Type", waste_type,                             ry + 160, acc,   bold=True)
-    row("Points",     f"+{points} pts",                       ry + 184, AMBER, bold=True)
-    row("Status",     "PENDING CLAIM",                        ry + 208, ACCENT)
-
-    dot_divider(base, rx + 20, rx + rw - 20, ry + 222)
-
-    # ── claim code section ──
-    putc(base, "MANUAL CLAIM CODE", cx2, ry + 244, F, 0.30, GRAY, 1)
-    display_code = f"ECO-{claim_code}"
-
-    # code box — larger, prominent
-    cw2 = 340
-    cbx1, cbx2 = cx2 - cw2 // 2, cx2 + cw2 // 2
-    cby1, cby2 = ry + 252, ry + 310
-    rrect(base, cbx1, cby1, cbx2, cby2, 12, CARD2)
-    # accent border
-    rrect(base, cbx1, cby1, cbx2, cby2, 12, acc, t=2)
-    # letter-spaced code — draw chars with spacing
-    putc(base, display_code, cx2, cby2 - 12, FB, 1.10, WHITE, 3)
-
-    # copy hint
-    putc(base, "Show this code to staff to claim your points",
-         cx2, ry + 330, F, 0.30, GRAY, 1)
-
-    dot_divider(base, rx + 20, rx + rw - 20, ry + 344)
-
-    # ── ref + validity ──
-    putc(base, f"Ref: {token[:18].upper()}...", cx2, ry + 366, F, 0.26, GRAY_DIM, 1)
-    putc(base, "Valid for one claim only  •  Single use",
-         cx2, ry + 386, F, 0.27, GRAY_DIM, 1)
-
-    dot_divider(base, rx + 20, rx + rw - 20, ry + 400)
-
-    # ── eco footer strip ──
-    blend(base, rx, ry + 400, rx + rw, ry + rh, CARD2, 1.0)
-    putc(base, "Thank you for helping the environment!",
-         cx2, ry + 432, FB, 0.42, acc, 1)
-    putc(base, "ECOReward Smart Waste System  •  ecoreward-bin",
-         cx2, ry + 456, F, 0.26, GRAY_DIM, 1)
-
-    # ── bottom hint ──
-    putc(base, "R  close receipt          Q  quit",
-         WIN_W // 2, WIN_H - 12, F, 0.30, GRAY_DIM, 1)
-    return base
-
-
-# ── History Overlay ─────────────────────────────────────────────────────────
-def draw_history(cam_frame, history):
-    base = cv2.resize(cam_frame, (WIN_W, WIN_H))
-    blend(base, 0, 0, WIN_W, WIN_H, BLACK, 0.88)
-
-    pw, ph = 700, 560
-    px = WIN_W // 2 - pw // 2
-    py = WIN_H // 2 - ph // 2
-    cx = WIN_W // 2
-
-    # card bg
-    rrect(base, px + 4, py + 4, px + pw + 4, py + ph + 4, 16, (4, 5, 7))
-    rrect(base, px, py, px + pw, py + ph, 16, CARD)
-
-    # header
-    blend(base, px, py, px + pw, py + 62, CARD2, 1.0)
-    cv2.line(base, (px, py + 62), (px + pw, py + 62), ACCENT, 2)
-    # clock icon
-    ic = (px + 36, py + 32)
-    cv2.circle(base, ic, 16, ACCENT, 2, cv2.LINE_AA)
-    cv2.line(base, ic, (ic[0], ic[1] - 10), ACCENT, 2, cv2.LINE_AA)
-    cv2.line(base, ic, (ic[0] + 8, ic[1]), ACCENT, 2, cv2.LINE_AA)
-    cv2.circle(base, ic, 2, ACCENT, -1, cv2.LINE_AA)
-
-    putl(base, "SCAN HISTORY", px + 62, py + 28, FB, 0.62, WHITE, 2)
-    putl(base, f"{len(history)} total redeemed", px + 64, py + 50, F, 0.28, GRAY, 1)
-    putc(base, "H  close", px + pw - 50, py + 38, F, 0.28, GRAY_DIM, 1)
-
-    # column headers
-    hy = py + 66
-    blend(base, px, hy, px + pw, hy + 22, GRAY_DIM, 0.5)
-    putl(base, "#",          px + 14,  hy + 15, F, 0.27, GRAY, 1)
-    putl(base, "WASTE TYPE", px + 40,  hy + 15, F, 0.27, GRAY, 1)
-    putl(base, "POINTS",     px + 238, hy + 15, F, 0.27, GRAY, 1)
-    putl(base, "CLAIM CODE", px + 338, hy + 15, F, 0.27, GRAY, 1)
-    putl(base, "TIME",       px + 508, hy + 15, F, 0.27, GRAY, 1)
-
-    row_h  = 44
-    max_rows = 9
-    entries = list(reversed(history))
-    visible = entries[:max_rows]
-    ry = hy + 26
-
-    if not visible:
-        putc(base, "No scans yet",              cx, WIN_H // 2 - 10, FB, 0.58, GRAY, 1)
-        putc(base, "Generate a QR and scan it", cx, WIN_H // 2 + 20, F,  0.34, GRAY_DIM, 1)
-    else:
-        for i, entry in enumerate(visible):
-            row_y = ry + i * row_h
-            acc   = WASTE_COLOR.get(entry['waste_type'], ACCENT)
-            if i % 2 == 0:
-                blend(base, px, row_y, px + pw, row_y + row_h, CARD2, 0.6)
-            cv2.rectangle(base, (px, row_y + 4), (px + 3, row_y + row_h - 4), acc, -1)
-
-            num  = len(history) - i
-            ty   = row_y + row_h - 14
-            putl(base, str(num),               px + 14,  ty, F,  0.30, GRAY,   1)
-            putl(base, entry['waste_type'],    px + 40,  ty, FB, 0.36, WHITE,  1)
-
-            tag = WASTE_TAG.get(entry['waste_type'], '?')
-            (tw2, _), _ = cv2.getTextSize(tag, F, 0.24, 1)
-            rrect(base, px + 168, row_y + 10, px + 168 + tw2 + 10, row_y + row_h - 10, 4, acc)
-            putl(base, tag, px + 173, row_y + row_h - 12, F, 0.24, BG, 1)
-
-            putl(base, f"+{entry['points']} pts", px + 238, ty, FB, 0.38, AMBER,  1)
-            putl(base, f"ECO-{entry['claim_code']}", px + 338, ty, FB, 0.36, ACCENT, 1)
-            putl(base, entry['ts'],             px + 508, ty, F,  0.30, GRAY,   1)
-
-            cv2.line(base, (px + 8, row_y + row_h), (px + pw - 8, row_y + row_h), BORDER, 1)
-
-        if len(history) > max_rows:
-            putc(base, f"+ {len(history) - max_rows} more (showing latest {max_rows})",
-                 cx, py + ph - 14, F, 0.27, GRAY_DIM, 1)
-
-    # footer
-    blend(base, px, py + ph - 36, px + pw, py + ph, CARD2, 1.0)
-    cv2.line(base, (px, py + ph - 36), (px + pw, py + ph - 36), BORDER, 1)
-    putc(base, "Session history only  •  Press H to close",
-         cx, py + ph - 12, F, 0.28, GRAY_DIM, 1)
-    return base
-
-
-# ── Success Overlay ────────────────────────────────────────────────────────────
-def draw_success(cam_frame, waste_type, points):
-    base = cv2.resize(cam_frame, (WIN_W, WIN_H))
-    acc  = WASTE_COLOR.get(waste_type, ACCENT)
-    blend(base, 0, 0, WIN_W, WIN_H, BLACK, 0.70)
-
-    cw, ch2 = 460, 280
-    cx  = WIN_W // 2
-    cy  = WIN_H // 2
-    bx  = cx - cw // 2
-    by  = cy - ch2 // 2
-
-    # card
-    rrect(base, bx, by, bx + cw, by + ch2, 18, CARD)
-    # top accent
-    rrect(base, bx, by, bx + cw, by + 4, 0, acc)
-    # bottom accent
-    rrect(base, bx, by + ch2 - 4, bx + cw, by + ch2, 0, acc)
-
-    # check circle
-    cv2.circle(base, (cx, by + 72), 32, acc, -1, cv2.LINE_AA)
-    # checkmark
-    cv2.line(base, (cx - 13, by + 72), (cx - 3,  by + 84), BG, 4, cv2.LINE_AA)
-    cv2.line(base, (cx - 3,  by + 84), (cx + 15, by + 56), BG, 4, cv2.LINE_AA)
-
-    putc(base, "TRANSACTION COMPLETE",         cx, by + 122, FB, 0.68, WHITE,     2)
-    putc(base, "QR code scanned successfully", cx, by + 146, F,  0.38, GRAY,      1)
-
-    # points badge
-    badge_w = 210
-    rrect(base, cx - badge_w // 2, by + 158, cx + badge_w // 2, by + 198, 10, CARD2)
-    putc(base, f"+{points} POINTS AWARDED", cx, by + 185, FB, 0.56, AMBER, 2)
-
-    putc(base, waste_type.upper(),              cx, by + 224, F, 0.38, acc,      1)
-    putc(base, "Ready for next transaction",    cx, by + 252, F, 0.34, GRAY_DIM, 1)
-    return base
 
 # ── Firebase watcher ───────────────────────────────────────────────────────────
 # The Firestore listener runs on its own thread and the UI loop in main() runs on this one.
@@ -763,25 +272,36 @@ if DB_MODE == "admin":
     threading.Thread(target=_cleanup_stale_tokens, daemon=True).start()
 
 
-def _start_heartbeat():
-    """3.4: write kiosks/{KIOSK_ID}.lastSeen every 30 s so the web admin can see liveness."""
+def _start_heartbeat(interval=30):
+    """3.4: write kiosks/{KIOSK_ID}.lastSeen now and every 30 s so the web admin can see liveness.
+    Returns stop(), which also marks the kiosk offline (best effort, at most 3 s)."""
     if db is None:
-        return
-    _stop = threading.Event()
+        return lambda: None
+    stop = threading.Event()
+
+    def _write(status):
+        try:
+            db.collection("kiosks").document(KIOSK_ID).set({
+                "lastSeen": SERVER_TS,
+                "status":   status,
+                "name":     KIOSK_NAME,
+            }, merge=True)
+        except Exception as e:
+            _warn_once("heartbeat", f"[HEARTBEAT] could not update kiosks/{KIOSK_ID}: {e}")
 
     def _beat():
-        while not _stop.wait(30):
-            try:
-                db.collection("kiosks").document(KIOSK_ID).set({
-                    "lastSeen": SERVER_TS,
-                    "status":   "online",
-                    "name":     KIOSK_NAME,
-                }, merge=True)
-            except Exception:
-                pass
+        _write("online")
+        while not stop.wait(interval):
+            _write("online")
 
-    t = threading.Thread(target=_beat, daemon=True, name="kiosk-heartbeat")
-    t.start()
+    threading.Thread(target=_beat, daemon=True, name="kiosk-heartbeat").start()
+
+    def _stop():
+        stop.set()
+        t = threading.Thread(target=_write, args=("offline",), daemon=True)
+        t.start()
+        t.join(timeout=3)
+    return _stop
 
 
 def watch_token(token):
@@ -804,398 +324,517 @@ def watch_token(token):
     _watcher = db.collection('qr_tokens').document(token).on_snapshot(on_snap)
     return _watcher
 
-# ── Splash / Startup Animation ────────────────────────────────────────────────
-def draw_splash_animation(window_name):
-    """Plays a branded startup splash animation (≈2.5s) using OpenCV."""
-    import math
-    total_frames = 30    # ~0.5s at 60fps; was 60/120 (audit H-18)
-    cx, cy = WIN_W // 2, WIN_H // 2
 
-    # Easing helpers
-    def ease_out_cubic(t): return 1 - (1 - t) ** 3
-    def ease_in_out(t):    return t * t * (3 - 2 * t)
-    def ease_out_back(t):
-        c1, c3 = 1.70158, 1.70158 + 1
-        return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+def stop_watching():
+    """Stop listening/polling for the current QR (called when it is scanned, expires or is dismissed;
+    otherwise the kiosk-identity poller would keep reading the old token until the next QR — audit K-10)."""
+    global _watcher, _active_token
+    if _watcher:
+        try:
+            _watcher.unsubscribe()
+        except Exception:
+            pass
+    _watcher, _active_token = None, None
 
-    # ── Precompute vignette weights once — they depend only on constants. (audit H-18)
-    # Previously, three GaussianBlur calls ran on *every* frame (3 × 120 = 360 blurs, median 674 ms/frame ≈ 81 s).
-    # Building the weights once + vectorising across channels cuts per-frame work to one float32 round-trip.
-    _card_f = np.array(CARD, np.float32)   # shape (3,) – broadcast target
-    _vig_weights = []
-    for _r, _a in ((460, 0.25), (340, 0.18), (200, 0.08)):
-        _m = np.zeros((WIN_H, WIN_W), np.float32)
-        cv2.circle(_m, (cx, cy), _r, 1.0, -1)
-        cv2.GaussianBlur(_m, (0, 0), _r // 3, dst=_m)
-        _vig_weights.append((_m * _a).astype(np.float32)[:, :, np.newaxis])   # (H, W, 1)
 
-    for frame_i in range(total_frames):
-        t = frame_i / (total_frames - 1)   # 0.0 → 1.0
-        canvas = np.zeros((WIN_H, WIN_W, 3), np.uint8)
+# ── Token issuance (runs on a worker thread) ──────────────────────────────────
+def issue_token(waste_type, label, confidence):
+    """Write qr_tokens/{uuid4} and the detection log; return what the QR screen needs. Raises on failure.
 
-        # ── Phase 1 (0.0–0.15): bg fade in ──────────────────────────────────
-        bg_alpha = min(1.0, t / 0.15)
-        bg_val   = int(ease_out_cubic(bg_alpha) * 14)
-        canvas[:] = (bg_val, bg_val + 2, bg_val + 4)
+    Contract (Flutter validateAndUseQRToken, web manualClaimPoints, rules isNewKioskToken): payload
+    ECOBIN:<Type>:<uuid4>; expiresAt a UTC datetime (stored as a Timestamp, so the rules can enforce expiry
+    with server time); createdAt the server time; usedBy []; isUsed false; claimCode four digits.
+    The QR is shown only after this write succeeded (audit C-03 / H-14)."""
+    if db is None:
+        raise RuntimeError("Firebase is offline")
+    token = str(uuid.uuid4())
+    expires_at = _now() + timedelta(minutes=QR_EXPIRY_MINUTES)
+    claim_code = str(1000 + secrets.randbelow(9000))   # unpredictable manual-claim code
+    payload = f"ECOBIN:{waste_type}:{token}"
+    log(f"\n[QR GENERATED] {waste_type} +{POINTS_MAP[waste_type]}pts token={token[:8]}...")
+    db.collection("qr_tokens").document(token).set({
+        "wasteType": waste_type,
+        "expiresAt": expires_at,            # H-07: Admin SDK stores UTC datetime as Timestamp
+        "usedBy":    [],
+        "isUsed":    False,
+        "createdAt": SERVER_TS,             # H-07
+        "claimCode": claim_code,
+    })
+    log("[FIREBASE] Token saved — waiting for scan...\n")
+    try:   # 3.4 / M-21: traceable detection log; never blocks the QR
+        db.collection("detections").add({
+            "wasteType":   waste_type,
+            "label":       label,
+            "confidence":  float(confidence),
+            "modelFile":   MODEL_FILE,
+            "modelSha256": MODEL_SHA256,
+            "timestamp":   SERVER_TS,
+            "token":       token,
+            "kioskId":     KIOSK_ID,
+        })
+    except Exception as e:
+        _warn_once("detections", f"[FIREBASE] detection log not written: {e}")
+    return {"token": token, "claim_code": claim_code, "expires_at": expires_at, "payload": payload}
 
-        # subtle radial vignette — vectorised: one float32 round-trip per frame (audit H-18)
-        _cf = canvas.astype(np.float32)
-        for _wt in _vig_weights:
-            _cf += _wt * (_card_f - _cf)
-        canvas = np.clip(_cf, 0, 255).astype(np.uint8)
 
-        # ── Phase 2 (0.10–0.50): logo circle scale-in ───────────────────────
-        if t >= 0.10:
-            logo_t  = min(1.0, (t - 0.10) / 0.30)
-            scale   = ease_out_back(logo_t)
-            r_outer = int(80 * scale)
-            r_inner = int(72 * scale)
-            if r_outer > 2:
-                # glow ring
-                for dr in range(8, 0, -1):
-                    alpha_g = 0.04 * (9 - dr) * logo_t
-                    glow_col = tuple(int(ACCENT[i] * alpha_g) for i in range(3))
-                    cv2.circle(canvas, (cx, cy), r_outer + dr, glow_col, 2, cv2.LINE_AA)
-                # filled circle
-                cv2.circle(canvas, (cx, cy), r_outer, CARD2, -1, cv2.LINE_AA)
-                cv2.circle(canvas, (cx, cy), r_outer, ACCENT, 2, cv2.LINE_AA)
+def run_in_background(fn):
+    """Network work never runs on the UI thread (audit K-07). Tests replace this with a direct call."""
+    threading.Thread(target=fn, daemon=True, name="kiosk-worker").start()
 
-                # leaf / eco icon inside — simple overlapping circles
-                if scale > 0.5:
-                    icon_r = int(28 * scale)
-                    leaf_x, leaf_y = cx, cy - 8
-                    cv2.circle(canvas, (leaf_x,          leaf_y), icon_r, ACCENT, -1, cv2.LINE_AA)
-                    cv2.circle(canvas, (leaf_x + icon_r, leaf_y), icon_r, CARD2,  -1, cv2.LINE_AA)
-                    # stem
-                    cv2.line(canvas, (cx, cy - 8 + icon_r - 4),
-                             (cx, cy + icon_r + 4), ACCENT, 2, cv2.LINE_AA)
 
-        # ── Phase 3 (0.40–0.75): brand text slide up ────────────────────────
-        if t >= 0.40:
-            txt_t  = min(1.0, (t - 0.40) / 0.28)
-            txt_a  = ease_out_cubic(txt_t)
-            slide  = int((1 - txt_a) * 30)
-            ty_eco = cy + 104 + slide
+def qr_modules(data):
+    """The QR as one pixel per module (quiet zone included); screens scale it by a whole number."""
+    qr = qrcode.QRCode(version=None, box_size=1, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(data)
+    qr.make(fit=True)
+    return np.where(np.array(qr.get_matrix(), dtype=bool), 0, 255).astype(np.uint8)
 
-            # ECO  REWARD  text
-            (ew, eh), _ = cv2.getTextSize("ECO", FB, 1.10, 3)
-            (rw, _),  _ = cv2.getTextSize("REWARD", FB, 1.10, 2)
-            total_w = ew + rw + 12
-            lx = cx - total_w // 2
 
-            # draw with alpha-sim — just draw dimmed first then bright
-            eco_col    = tuple(int(c * txt_a) for c in ACCENT)
-            reward_col = tuple(int(c * txt_a) for c in WHITE)
-            cv2.putText(canvas, "ECO",    (lx, ty_eco),          FB, 1.10, eco_col,    3, cv2.LINE_AA)
-            cv2.putText(canvas, "REWARD", (lx + ew + 12, ty_eco), FB, 1.10, reward_col, 2, cv2.LINE_AA)
+def generate_qr(data, size=220):
+    """BGR QR image of about `size` pixels with sharp modules (kept for tools and older callers)."""
+    m = qr_modules(data)
+    k = max(1, size // m.shape[0])
+    return cv2.cvtColor(cv2.resize(m, (m.shape[0] * k,) * 2, interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
 
-            # tagline
-            tag_col = tuple(int(c * txt_a) for c in GRAY)
-            putc(canvas, "Smart Waste Kiosk System", cx, ty_eco + 28, F, 0.38, tag_col, 1)
 
-        # ── Phase 4 (0.62–0.88): loading bar ────────────────────────────────
-        if t >= 0.62:
-            bar_t   = min(1.0, (t - 0.62) / 0.26)
-            bar_a   = ease_in_out(bar_t)
-            bar_w   = 280
-            bar_h_v = 4
-            bx1     = cx - bar_w // 2
-            by1     = cy + 148
-            # track
-            rrect(canvas, bx1, by1, bx1 + bar_w, by1 + bar_h_v, 2, CARD2)
-            # fill
-            fill_w  = int(bar_w * bar_a)
-            if fill_w > 2:
-                rrect(canvas, bx1, by1, bx1 + fill_w, by1 + bar_h_v, 2, ACCENT)
-                # leading glow dot
-                cv2.circle(canvas, (bx1 + fill_w, by1 + bar_h_v // 2),
-                           4, ACCENT, -1, cv2.LINE_AA)
+# ── Fill levels -> bins/{kioskId}-{bio|rec|res} for the web dashboard ────────
+class BinsReporter:
+    """Writes real ESP32 fill readings in the web's BinStatus shape. Throttled: on a change of 3+ points
+    (at most once per `min_interval` s) or every 5 minutes. Simulated sorters never report."""
+    KEYS = (("bio", "Biodegradable"), ("rec", "Recyclable"), ("res", "Residual"))
 
-            # loading label
-            pct       = int(bar_a * 100)
-            pct_col   = tuple(int(c * min(1.0, bar_t * 2)) for c in GRAY)
-            putc(canvas, f"Initializing  {pct}%", cx, by1 + 22, F, 0.30, pct_col, 1)
+    def __init__(self, min_interval=60.0, refresh=300.0):
+        self.min_interval, self.refresh = min_interval, refresh
+        self.last, self.last_t = None, -1e9
+        self.latest = None
 
-        # ── Phase 5 (0.88–1.0): fade to black before handoff ────────────────
-        if t >= 0.88:
-            fade_t = (t - 0.88) / 0.12
-            fade_a = ease_in_out(fade_t)
-            overlay = canvas.copy()
-            overlay[:] = (8, 10, 14)
-            cv2.addWeighted(overlay, fade_a, canvas, 1 - fade_a, 0, canvas)
+    def offer(self, fill, now):
+        levels = (fill.bio, fill.rec, fill.res)
+        self.latest = levels
+        if db is None:
+            return False
+        changed = self.last is None or max(abs(a - b) for a, b in zip(levels, self.last)) >= 3
+        due = (changed and now - self.last_t >= self.min_interval) or now - self.last_t >= self.refresh
+        if not due:
+            return False
+        self.last, self.last_t = levels, now
+        run_in_background(lambda: self._write(levels))
+        return True
 
-        cv2.imshow(window_name, canvas)
+    def _write(self, levels):
+        try:
+            for (suffix, name), level in zip(self.KEYS, levels):
+                db.collection("bins").document(f"{KIOSK_ID}-{suffix}").set({
+                    "location":    f"{KIOSK_NAME} · {name}",
+                    "fillLevel":   int(level),
+                    "status":      "online",
+                    "lastUpdated": SERVER_TS,
+                })
+        except Exception as e:
+            _warn_once("bins", f"[BINS] fill levels not written: {e}")
+
+
+# ── Detection ─────────────────────────────────────────────────────────────────
+def detect(frame):
+    """The most confident box at or above MIN_BOX_CONF in this frame, or None (audit M-20: one vote per
+    frame, so several weak boxes of one class cannot outvote a confident box of another)."""
+    results = model(frame, conf=0.15, verbose=False)
+    box, conf = None, 0.0
+    for r in results:
+        for b in r.boxes:
+            c = float(b.conf[0])
+            if c >= MIN_BOX_CONF and c > conf:
+                box, conf = b, c
+    if box is None:
+        return None
+    label = str(model.names[int(box.cls[0])]).lower()
+    return Detection(label, WASTE_MAP.get(label), conf, tuple(float(v) for v in box.xyxy[0]))
+
+
+# ── Camera (reconnects instead of exiting — audit K-08) ───────────────────────
+class Camera:
+    def __init__(self, index, retry_s=3.0, fail_limit=30):
+        self.index, self.retry_s, self.fail_limit = index, retry_s, fail_limit
+        self.cap, self.last, self.fails, self.next_try = None, None, 0, 0.0
+        self.ok, self.ever_opened = False, False
+        self.fps, self._t_prev = 0.0, None
+
+    def read(self, now):
+        """(frame to show or None, fresh: bool). A short glitch keeps showing the last frame."""
+        if self.cap is None:
+            if now < self.next_try:
+                return None, False
+            self._open(now)
+            if self.cap is None:
+                return None, False
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            self.fails += 1
+            if self.fails >= self.fail_limit:
+                log("[CAMERA] Lost feed — re-opening…")
+                self.release()
+                self.next_try = now
+                return None, False
+            return self.last, False
+        if self._t_prev is not None and now > self._t_prev:
+            inst = 1.0 / (now - self._t_prev)
+            self.fps = inst if not self.fps else 0.9 * self.fps + 0.1 * inst
+        self._t_prev = now
+        self.fails, self.ok, self.last = 0, True, frame
+        return frame, True
+
+    def _open(self, now):
+        cap = cv2.VideoCapture(self.index)
+        if cap is not None and cap.isOpened():
+            self.cap, self.fails = cap, 0
+            log(f"[CAMERA] {'Re-opened' if self.ever_opened else 'Opened'} camera {self.index}.")
+            self.ever_opened = True
+            return
+        try:
+            cap.release()
+        except Exception:
+            pass
+        self.ok, self.next_try = False, now + self.retry_s
+        _warn_once("camera", f"[CAMERA ERROR] Could not access webcam {self.index} — retrying every "
+                             f"{self.retry_s:g} s.", every=300)
+
+    def release(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap, self.ok, self._t_prev = None, False, None
+
+
+# ── Screens (thin wrappers so tools and tests can draw one screen) ────────────
+_renderer = None
+
+
+def _get_renderer(width=None, height=None, reduce_motion=False):
+    global _renderer
+    w, h = width or WIN_W, height or WIN_H
+    if _renderer is None or (width and (_renderer.size != (w, h) or _renderer.m.reduce_motion != reduce_motion)):
+        _renderer = Renderer(w, h, reduce_motion)
+    return _renderer
+
+
+def _default_view(waste_type=None, label=None, confidence=0.0, fb_ok=True):
+    det = Detection(label, waste_type, confidence) if label and label != "Unknown" else None
+    return View(phase="detected" if det else "ready", online=fb_ok, detection=det, points=POINTS_MAP,
+                clock=_clock_text())
+
+
+def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count, view=None, now=None):
+    """Ready / detected / working screens (camera on the left, stage panel on the right)."""
+    v = view or _default_view(waste_type, label, confidence, fb_ok)
+    return _get_renderer().render(cam, v, time.monotonic() if now is None else now, transition=view is not None)
+
+
+def draw_qr_panel(cam_frame, qr_img, waste_type, points, secs_left, claim_code, total_secs, view=None, now=None):
+    """QR screen: the code, its countdown, and the claim-code receipt for customers without a phone."""
+    v = view or View(phase="qr", points=POINTS_MAP, secs_left=secs_left, total_secs=total_secs, clock=_clock_text())
+    return _get_renderer().render(cam_frame, v, time.monotonic() if now is None else now,
+                                  transition=view is not None)
+
+
+def draw_success(cam_frame, waste_type, points, view=None, now=None):
+    """The 'Claimed!' moment after the phone took the code."""
+    v = view or View(phase="complete", points=POINTS_MAP, clock=_clock_text())
+    return _get_renderer().render(cam_frame, v, time.monotonic() if now is None else now,
+                                  transition=view is not None)
+
+
+def draw_splash_animation(window_name, reduce_motion=False):
+    """A short (about 0.5 s) brand fade-in while the camera starts. One still frame with reduced motion."""
+    r = _get_renderer(reduce_motion=reduce_motion)
+    frames = 1 if r.m.reduce_motion else 24
+    for i in range(frames):
+        cv2.imshow(window_name, r.splash((i + 1) / frames))
         if cv2.waitKey(20) & 0xFF == ord('q'):
             cv2.destroyAllWindows()
             sys.exit(0)
 
 
-# ── Webcam ─────────────────────────────────────────────────────────────────────
-def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[CAMERA ERROR] Could not access webcam!")
-        sys.exit(1)
+def _clock_text(dt=None):
+    return (dt or datetime.now()).strftime("%I:%M %p").lstrip("0")
 
-    print("\n------------------------------------------")
-    print("  ECOReward Bin  |  1280x720  |  Kiosk Mode")
-    print("  SPACEBAR = Generate QR    H = History    Q = Quit")
-    print("------------------------------------------\n")
 
-    cv2.namedWindow("ECOReward Bin", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("ECOReward Bin", WIN_W, WIN_H)
+def _local_time(dt_utc):
+    return _clock_text(dt_utc.astimezone()) if dt_utc else ""
 
-    # ── Play startup splash ──
-    draw_splash_animation("ECOReward Bin")
 
-    _start_heartbeat()   # 3.4: keep kiosks/{KIOSK_ID} updated while running
+# ── Main loop ─────────────────────────────────────────────────────────────────
+SOUNDS = {"detect": [(880, 120)], "success": [(1046, 110), (1318, 160)], "error": [(330, 260)]}
+
+
+def _screen_size():
+    """Physical screen size; makes the process DPI-aware first so Windows does not upscale the frame."""
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+        u = ctypes.windll.user32
+        return int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1))
+    except Exception:
+        return WIN_W, WIN_H
+
+
+def _diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, started, log_path, bad_labels, renderer):
+    up = int(time.monotonic() - started)
+    shape = camera.last.shape if camera.last is not None else None
+    firestore_mode = {"kiosk": "kiosk identity", "admin": "admin key (legacy)"}.get(DB_MODE, "offline")
+    mapped = "all mapped" if not bad_labels else f"{len(bad_labels)} unmapped"
+    rows = [
+        ("Kiosk", [("Name", KIOSK_NAME), ("Firestore", firestore_mode),
+                   ("Uptime", f"{up // 3600} h {up % 3600 // 60} min"),
+                   ("Log", Path(log_path).name if log_path else "off")]),
+        ("Model", [("File", Path(MODEL_FILE).name), ("SHA-256", MODEL_SHA256[:12] + "…"),
+                   ("Classes", f"{len(model.names)} · {mapped}"),
+                   ("Rule", f"conf ≥ {MIN_BOX_CONF:.2f} · 7-frame vote"), ("Inference", f"{infer_ms:.0f} ms")]),
+        ("Camera", [("Index", settings.camera_index), ("Frame", f"{shape[1]}×{shape[0]}" if shape else "—"),
+                    ("State", "ok" if camera.ok else "reconnecting"),
+                    ("Display", f"{camera.fps:.1f} FPS · {render_ms:.1f} ms draw")]),
+        ("Sorter", [("Mode", sorter.mode + (" (simulated)" if sorter.simulated else "")), ("Port", sorter.port or "—"),
+                    ("State", f"{sorter.state.value}{' · ' + sorter.detail if sorter.detail else ''}"),
+                    ("Unparsed lines", sorter.unparsed), ("Recent", " | ".join(list(sorter.recent)[-3:]) or "—")]),
+        ("Transaction", [("Phase", flow.phase.value), ("Claimed this session", flow.completed),
+                         ("Fonts", renderer.ts.source), ("Screen", f"{renderer.size[0]}×{renderer.size[1]}")]),
+    ]
+    if bins.latest:
+        rows.append(("Fill levels (ESP32)", [(n, f"{v} %") for (_, n), v in zip(BinsReporter.KEYS, bins.latest)]))
+    return rows
+
+
+def _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, now, wall, diagnostics):
+    tx = flow.tx
+    age = now - flow.since
+    expires = tx.expires_at if tx else None
+    return View(
+        phase=flow.phase.value, mode=settings.sorter, online=db is not None, model_ok=not bad_labels,
+        camera_ok=camera.ok, sorter_state=sorter.state.value, sorter_detail=sorter.detail, sorter_ready=sorter.ready,
+        detection=flow.current, latest=flow.latest, lock_progress=flow.lock_progress, armed=flow.armed,
+        stages=flow.stages(), tx=tx, points=POINTS_MAP,
+        qr_modules=modules_cache.get(tx.token) if tx else None,
+        secs_left=max(0, int((expires - wall).total_seconds())) if expires else 0,
+        total_secs=QR_EXPIRY_MINUTES * 60,
+        expires_local=_local_time(expires),
+        issued_local=_local_time(expires - timedelta(minutes=QR_EXPIRY_MINUTES)) if expires else "",
+        issued_date=expires.astimezone().strftime("%b %d, %Y") if expires else "",
+        failure=flow.failure, toast=flow.toast, phase_age=age, completed=flow.completed,
+        history=list(flow.history), overlay=overlay, debug=settings.debug, clock=_clock_text(),
+        seconds_to_ready=max(0.0, (settings.success_seconds if flow.phase == Phase.COMPLETE
+                                   else settings.failure_seconds) - age),
+        diagnostics=diagnostics,
+    )
+
+
+def main(argv=None):
+    """argv=None: settings file only (tests); `python app.py` passes the command line."""
+    settings, problems = load_settings(SETTINGS_FILE, argv)
+    log_path = _setup_file_log(settings.log_dir)
+    for p in problems:
+        log(f"[CONFIG] {p}")
+    width, height = _screen_size() if settings.fullscreen else (settings.width, settings.height)
+    renderer = _get_renderer(width, height, settings.reduce_motion)
+    sorter = make_sorter(settings.sorter, settings.serial_port, settings.serial_baud, log=log)
+    flow = TransactionFlow(FlowConfig(
+        mode=settings.sorter, points=POINTS_MAP, sort_ack_timeout=settings.sort_ack_timeout,
+        drop_confirm_timeout=settings.drop_confirm_timeout, issue_timeout=settings.issue_timeout,
+        qr_display_seconds=settings.qr_display_seconds, success_seconds=settings.success_seconds,
+        failure_seconds=settings.failure_seconds, lock_votes=settings.lock_votes,
+        rearm_clear_frames=settings.rearm_clear_frames, min_drop_grams=settings.min_drop_grams,
+        debug=settings.debug))
+    camera = Camera(settings.camera_index)
+    bins = BinsReporter(settings.bins_min_interval)
+    results = queue.Queue()
+    clicks = deque(maxlen=8)
+
+    log("\n------------------------------------------")
+    log(f"  ECOReward Bin  |  {width}x{height}  |  sorter: {settings.sorter}"
+        f"{' (SIMULATED)' if sorter.simulated else ''}")
+    log("  SPACE confirm (staff)   R receipt   H history   D diagnostics   Q quit")
+    log("------------------------------------------\n")
+
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW, width, height)
+    if settings.fullscreen:
+        try:   # WINDOW_FULLSCREEN is a *property* value; passed to namedWindow it means AUTOSIZE (audit K-04)
+            cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        except cv2.error:
+            pass
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONUP:
+            clicks.append((x, y))
+    try:
+        cv2.setMouseCallback(WINDOW, on_mouse)
+    except cv2.error:
+        pass
+
+    draw_splash_animation(WINDOW)
+    stop_heartbeat = _start_heartbeat()
 
     # (audit M-22) A model whose classes are not all in waste_map.json would silently score
     # unknown objects as Residual — e.g. the yolov8n.pt fallback sees a "person". Refuse QRs instead.
     bad_labels = unmapped_labels(model)
     if bad_labels:
-        print(f"[AI ERROR] {MODEL_FILE} has {len(bad_labels)} class(es) missing from config/waste_map.json "
-              f"(e.g. {', '.join(bad_labels[:5])}). QR codes are DISABLED until the map or model is fixed.")
+        log(f"[AI ERROR] {MODEL_FILE} has {len(bad_labels)} class(es) missing from config/waste_map.json "
+            f"(e.g. {', '.join(bad_labels[:5])}). QR codes are DISABLED until the map or model is fixed.")
 
+    modules_cache = {}
+    overlay = None
+    started = time.monotonic()
+    infer_ms = render_ms = 0.0
+    seen_window = False
+    display = None
 
-    latest_label      = "Unknown"
-    latest_waste_type = "Residual"
-    latest_conf       = 0.0
-    fb_ok             = db is not None
-    scan_count        = 0
+    def play(kind):
+        if settings.sounds:
+            def go():
+                for f, d in SOUNDS[kind]:
+                    _beep(f, d)
+            threading.Thread(target=go, daemon=True).start()
 
-    # ── Detection smoothing (majority vote over last 7 frames) ──────────────
-    DETECT_WINDOW   = 7
-    detect_history  = deque(maxlen=DETECT_WINDOW)
-    HOLD_FRAMES     = 0   # counts frames since last real detection
-    HOLD_MAX        = 15  # keep last result for 15 frames before resetting
-    _last_beep_type = None  # track last beeped class to avoid repeat beeps
+    def run(actions, now):
+        for a in actions:
+            if isinstance(a, SendSort):
+                if not sorter.send_sort(a.waste_type):
+                    run(flow.on_sorter_event(DeviceError("The sorter is not connected"), now), now)
+            elif isinstance(a, IssueToken):
+                _scan_event.clear()   # new QR: forget any scan signal left over from the previous one
 
-    qr_active      = False
-    qr_image       = None
-    qr_token       = None
-    qr_waste_type  = None
-    qr_points      = 0
-    qr_expires_at  = None
-    qr_total_secs  = QR_EXPIRY_MINUTES * 60
-    qr_claim_code  = "----"
-
-    show_success   = False
-    success_until  = None
-    success_waste  = ""
-    success_points = 0
-
-    show_receipt  = False
-    show_history  = False
-    scan_history  = []   # list of dicts: {waste_type, points, claim_code, ts}
-
-    cv2.namedWindow("ECOReward Bin", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("ECOReward Bin", WIN_W, WIN_H)
-
-    _cap_fail_count = 0          # (audit H-14) consecutive failed reads
-    _CAP_FAIL_MAX   = 30         # ~1 s at 30 fps before attempting re-open
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            _cap_fail_count += 1
-            if _cap_fail_count >= _CAP_FAIL_MAX:
-                print("[CAMERA] Lost feed — attempting re-open...")
-                cap.release()
-                cap = cv2.VideoCapture(0)
-                _cap_fail_count = 0
-                if not cap.isOpened():
-                    print("[CAMERA ERROR] Could not re-open webcam — exiting.")
-                    break
-                print("[CAMERA] Re-opened successfully.")
-            continue
-        _cap_fail_count = 0
-
-        # ── AI detection ──
-        cam_r = cv2.resize(frame, (CAM_W, WIN_H))
-        if not qr_active and not show_success:
-            # Run YOLO on native resolution for better accuracy
-            results  = model(frame, conf=0.15, verbose=False)
-            fh, fw   = frame.shape[:2]
-            sx, sy   = CAM_W / fw, WIN_H / fh   # scale factors to cam_r coords
-            detected = False
-            # (audit M-20) One vote per frame: only the most confident box counts. Voting once per
-            # box let several weak boxes of one class outvote a single confident box of another.
-            box, conf = None, 0.0
-            for r in results:
-                for b in r.boxes:
-                    c = float(b.conf[0])
-                    if c >= MIN_BOX_CONF and c > conf:
-                        box, conf = b, c
-            if box is not None:
-                lbl  = model.names[int(box.cls[0])].lower()
-                detected = True
-                detect_history.append((lbl, conf))
-                # majority vote from history
-                vote_lbl = Counter(h[0] for h in detect_history).most_common(1)[0][0]
-                vote_conf = max(h[1] for h in detect_history if h[0] == vote_lbl)
-                latest_label      = vote_lbl
-                latest_waste_type = WASTE_MAP.get(vote_lbl, 'Residual')
-                latest_conf       = vote_conf
-                HOLD_FRAMES       = 0
-                # beep once when a new class is first confirmed
-                if vote_lbl != _last_beep_type:
-                    _last_beep_type = vote_lbl
-                    threading.Thread(target=_beep, args=(880, 120), daemon=True).start()
-                # scale bbox from native frame → cam_r
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                x1, y1 = int(x1 * sx), int(y1 * sy)
-                x2, y2 = int(x2 * sx), int(y2 * sy)
-                ac  = WASTE_COLOR[latest_waste_type]
-                cv2.rectangle(cam_r, (x1, y1), (x2, y2), ac, 2, cv2.LINE_AA)
-                # label tag above box
-                tag = f"{latest_waste_type}  {vote_conf * 100:.0f}%"
-                (tw, th), _ = cv2.getTextSize(tag, F, 0.44, 1)
-                rrect(cam_r, x1, y1 - th - 10, x1 + tw + 10, y1, 4, ac)
-                cv2.putText(cam_r, tag, (x1 + 5, y1 - 3), F, 0.44, BG, 1, cv2.LINE_AA)
-                # confidence bar directly on bbox bottom edge
-                bar_w = x2 - x1
-                bar_y = y2 - 6
-                rrect(cam_r, x1, bar_y, x2, y2, 0, GRAY_DIM)
-                rrect(cam_r, x1, bar_y, x1 + int(bar_w * vote_conf), y2, 0, ac)
-            if not detected:
-                HOLD_FRAMES += 1
-                if HOLD_FRAMES > HOLD_MAX:
-                    detect_history.clear()
-                    latest_label      = "Unknown"
-                    latest_waste_type = "Residual"
-                    latest_conf       = 0.0
-                    _last_beep_type   = None  # reset so next detection beeps again
-
-        # ── build display ──
-        if show_history:
-            display = draw_history(cam_r, scan_history)
-
-        elif show_receipt and qr_token:
-            display = draw_receipt(cam_r, qr_waste_type, qr_points, qr_claim_code, qr_token or "")
-
-        elif show_success and success_until:
-            if _now() < success_until:
-                display = draw_success(cam_r, success_waste, success_points)
-            else:
-                show_success = False
-                display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                          latest_conf, fb_ok, scan_count)
-
-        elif qr_active and qr_expires_at:
-            secs_left = max(0, int((qr_expires_at - _now()).total_seconds()))
-
-            if _scan_event.is_set():
-                _scan_event.clear()
-                scan_count    += 1
-                print(f"[SCANNED] +{qr_points} pts | Total scans: {scan_count}")
-                show_success   = True
-                success_until  = _now() + timedelta(seconds=4)
-                success_waste  = qr_waste_type
-                success_points = qr_points
-                # record to session history
-                scan_history.append({
-                    'waste_type':  qr_waste_type,
-                    'points':      qr_points,
-                    'claim_code':  qr_claim_code,
-                    'ts':          datetime.now().strftime("%b %d  %I:%M %p"),
-                })
-                qr_active  = False
-                display = draw_success(cam_r, success_waste, success_points)
-
-            elif secs_left == 0:
-                print("[EXPIRED] QR expired.")
-                qr_active = False
-                display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                          latest_conf, fb_ok, scan_count)
-            else:
-                display = draw_qr_panel(cam_r, qr_image, qr_waste_type, qr_points,
-                                        secs_left, qr_claim_code, qr_total_secs)
-        else:
-            display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                      latest_conf, fb_ok, scan_count)
-
-        cv2.imshow("ECOReward Bin", display)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('r') and qr_active:
-            show_receipt = not show_receipt
-
-        if key == ord('h'):
-            show_history = not show_history
-            show_receipt = False
-
-        if key == 32 and not qr_active and not show_success:
-            if db is None:
-                # A QR for a token that was never stored could never be redeemed (audit C-03): refuse.
-                print("[BLOCKED] Firebase is offline - not issuing a QR code (it could never be redeemed).")
-            elif bad_labels:
-                print("[BLOCKED] The loaded model does not match config/waste_map.json - not issuing a QR code.")
-            elif latest_label == "Unknown":
-                # (audit H-03) No waste detected yet — refuse so pressing SPACE on an empty scene
-                # does not issue a +5 Residual QR.
-                print("[BLOCKED] No waste detected — hold an item in front of the camera for "
-                      "a moment until the label appears, then press SPACE.")
-            else:
-                token      = str(uuid.uuid4())
-                waste_type = latest_waste_type
-                points     = POINTS_MAP[waste_type]
-                expires_at = _now() + timedelta(minutes=QR_EXPIRY_MINUTES)
-                qr_data    = f"ECOBIN:{waste_type}:{token}"
-
-                print(f"\n[QR GENERATED] {waste_type} +{points}pts token={token[:8]}...")
-
-                _scan_event.clear()   # new QR: drop any scan signal left over from the previous one,
-                                      # even if the Firestore write below fails and no listener is started
-                try:
-                    claim_code = str(1000 + secrets.randbelow(9000))   # unpredictable manual-claim code
-                    db.collection("qr_tokens").document(token).set({
-                        "wasteType": waste_type,
-                        "expiresAt": expires_at,              # H-07: Admin SDK stores UTC datetime as Timestamp
-                        "usedBy":    [],
-                        "isUsed":    False,
-                        "createdAt": SERVER_TS,  # H-07
-                        "claimCode": claim_code,
-                    })
-                    qr_claim_code = claim_code
-                    print("[FIREBASE] Token saved — waiting for scan...\n")
-                    watch_token(token)   # also clears any scan flag left over from the previous QR
-                    # 3.4: log detection so admins can see kiosk activity history
+                def work(a=a):
                     try:
-                        db.collection("detections").add({
-                            "wasteType":  waste_type,
-                            "label":      latest_label,                # raw model class (audit M-21)
-                            "confidence": float(latest_conf),
-                            "modelFile":  MODEL_FILE,
-                            "modelSha256": MODEL_SHA256,
-                            "timestamp":  SERVER_TS,
-                            "token":      token,
-                            "kioskId":    KIOSK_ID,
-                        })
-                    except Exception:
-                        pass  # non-critical — never blocks QR flow
+                        results.put((a.tx_id, True, issue_token(a.waste_type, a.label, a.confidence)))
+                    except Exception as err:
+                        log(f"[FIREBASE ERROR] Could not store token — QR not shown: {err}\n")
+                        results.put((a.tx_id, False, str(err)))
+                run_in_background(work)
+            elif isinstance(a, WatchToken):
+                watch_token(a.token)
+            elif isinstance(a, StopWatching):
+                stop_watching()
+            elif isinstance(a, Sound):
+                play(a.kind)
+        for line in flow.notices:
+            log(line)
+        flow.notices.clear()
 
-                    # (audit H-14) Only activate the QR display after the token was successfully
-                    # stored.  Previously these ran even on a write failure, issuing a QR for a
-                    # token that Firestore never recorded (could never be redeemed).
-                    qr_image      = generate_qr(qr_data, size=220)
-                    qr_active     = True
-                    qr_token      = token
-                    qr_waste_type = waste_type
-                    qr_points     = points
-                    qr_expires_at = expires_at
-                    qr_total_secs = QR_EXPIRY_MINUTES * 60
-                    show_receipt  = False
-                except Exception as err:
-                    print(f"[FIREBASE ERROR] Could not store token — QR not shown: {err}\n")
+    def handle(action, now):
+        nonlocal overlay
+        renderer.ui.pressed = (action, now)
+        if action == "receipt" and flow.phase == Phase.QR:
+            overlay = "receipt"
+        elif action == "close":
+            overlay = None
+        elif action == "dismiss":
+            overlay = None
+            run(flow.dismiss(now), now)
 
-        if key == ord('q'):
-            break
+    try:
+        while True:
+            now, wall = time.monotonic(), _now()
+            try:
+                frame, fresh = camera.read(now)
+                flow.set_context(online=db is not None, model_ok=not bad_labels, sorter_ready=sorter.ready)
+                while True:                                   # token writes finished on the worker
+                    try:
+                        tx_id, ok, data = results.get_nowait()
+                    except queue.Empty:
+                        break
+                    if ok:
+                        run(flow.on_issue_ok(tx_id, data["token"], data["claim_code"], data["expires_at"],
+                                             data["payload"], now), now)
+                    else:
+                        run(flow.on_issue_failed(tx_id, data, now), now)
+                for ev in sorter.poll(now):
+                    if isinstance(ev, Fill):
+                        if not sorter.simulated:
+                            bins.offer(ev, now)
+                        continue
+                    run(flow.on_sorter_event(ev, now), now)
+                if flow.phase == Phase.QR and _scan_event.is_set():
+                    _scan_event.clear()
+                    run(flow.on_scanned(_active_token, now), now)
+                run(flow.tick(now, wall), now)
+                if fresh and flow.phase in (Phase.READY, Phase.DETECTED):
+                    t0 = time.perf_counter()
+                    try:
+                        det = detect(frame)
+                    except Exception as e:
+                        det = None
+                        _warn_once("inference", f"[AI ERROR] inference failed: {e}", every=60)
+                    infer_ms = 0.8 * infer_ms + 0.2 * (time.perf_counter() - t0) * 1000
+                    run(flow.observe(det, now), now)
+                if overlay == "receipt" and flow.phase != Phase.QR:
+                    overlay = None
 
-    cap.release()
-    cv2.destroyAllWindows()
-    print("\n[SYSTEM] Shut down.")
+                tx = flow.tx
+                if tx is not None and tx.payload and tx.token not in modules_cache:
+                    modules_cache.clear()
+                    modules_cache[tx.token] = qr_modules(tx.payload)
+                diag = (_diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, started, log_path,
+                                     bad_labels, renderer) if overlay == "diagnostics" else [])
+                v = _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, now, wall, diag)
+                t0 = time.perf_counter()
+                if flow.phase == Phase.QR:
+                    display = draw_qr_panel(frame, None, tx.waste_type, POINTS_MAP[tx.waste_type], v.secs_left,
+                                            tx.claim_code, v.total_secs, view=v, now=now)
+                elif flow.phase == Phase.COMPLETE:
+                    display = draw_success(frame, tx.waste_type, POINTS_MAP[tx.waste_type], view=v, now=now)
+                else:
+                    cur = flow.current
+                    display = draw_camera_hud(frame, cur.label if cur else "Unknown", cur.waste_type if cur else None,
+                                              cur.confidence if cur else 0.0, db is not None, flow.completed,
+                                              view=v, now=now)
+                render_ms = 0.9 * render_ms + 0.1 * (time.perf_counter() - t0) * 1000
+            except Exception as e:                             # one bad frame must not end the kiosk (K-09)
+                _warn_once(f"loop:{type(e).__name__}", f"[ERROR] {e}\n{traceback.format_exc()}", every=60)
+                if display is None:
+                    display = np.full((height, width, 3), 236, np.uint8)
+
+            cv2.imshow(WINDOW, display)
+            key = cv2.waitKey(1) & 0xFF                     # outside the guard: Ctrl+C and test limits still stop us
+
+            try:
+                while clicks:
+                    x, y = clicks.popleft()
+                    action = renderer.hit(x, y)
+                    if action:
+                        handle(action, now)
+                if key == 32:                                 # SPACE: staff confirm (or debug sort)
+                    run(flow.confirm(now), now)
+                elif key in (ord('r'), ord('R')) and flow.phase == Phase.QR:
+                    overlay = None if overlay == "receipt" else "receipt"
+                elif key in (ord('h'), ord('H')):
+                    overlay = None if overlay == "history" else "history"
+                elif key in (ord('d'), ord('D')):
+                    overlay = None if overlay == "diagnostics" else "diagnostics"
+                elif key == 27:
+                    overlay = None
+            except Exception as e:
+                _warn_once(f"keys:{type(e).__name__}", f"[ERROR] {e}\n{traceback.format_exc()}", every=60)
+
+            if key in (ord('q'), ord('Q')):
+                break
+            try:                                              # the window's close button ends the kiosk too
+                visible = cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE)
+                seen_window = seen_window or visible >= 1
+                if seen_window and visible < 1:
+                    break
+            except cv2.error:
+                pass
+    finally:
+        sorter.close()
+        camera.release()
+        stop_watching()
+        stop_heartbeat()
+        cv2.destroyAllWindows()
+        log("\n[SYSTEM] Shut down.")
 
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv[1:])

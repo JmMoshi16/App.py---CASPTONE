@@ -115,6 +115,9 @@ def _install_fakes():
     """Replace heavy / external modules BEFORE app.py is imported."""
     # Never pick up a real kiosk identity from this PC's ~/.ecoreward/kiosk.json during tests.
     os.environ["ECOREWARD_KIOSK_CONFIG"] = str(Path(tempfile.gettempdir()) / "ecoreward-tests-no-kiosk.json")
+    # Built-in defaults (1280x720 window, attendant mode) whatever config/kiosk_settings.json says; logs to temp.
+    os.environ["ECOREWARD_KIOSK_SETTINGS"] = str(Path(tempfile.gettempdir()) / "ecoreward-tests-no-settings.json")
+    os.environ["ECOREWARD_LOG_DIR"] = str(Path(tempfile.gettempdir()) / "ecoreward-tests-logs")
     class _NoCredential:
         def __init__(self, *a, **k):
             raise FileNotFoundError("fake: no credential at import time (tests inject app.db themselves)")
@@ -176,7 +179,8 @@ def run_main(keys, hooks=None, model=None):
             mock.patch.object(app.cv2, "waitKey", fake_wait_key), \
             mock.patch.object(app, "draw_splash_animation", lambda name: None), \
             mock.patch.object(app, "_beep", lambda *a, **k: None), \
-            mock.patch.object(app, "model", model if model is not None else FakeModel()):
+            mock.patch.object(app, "model", model if model is not None else FakeModel()), \
+            mock.patch.object(app, "run_in_background", lambda fn: fn()):   # token write inline: deterministic frames
         app.main()
     return out.getvalue(), frames
 

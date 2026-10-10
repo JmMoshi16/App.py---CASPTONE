@@ -17,6 +17,11 @@ dataset/*.cache
 
 # Training output
 runs/
+# OpenVINO export of best.pt (regenerate with the command in README)
+best_openvino_model/
+
+# Kiosk daily logs (logs/kiosk.log + 14 rotated days)
+logs/
 
 # Python
 __pycache__/

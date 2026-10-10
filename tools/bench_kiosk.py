@@ -56,9 +56,9 @@ def main():
     os.environ.setdefault("ECOREWARD_KIOSK_CONFIG", str(APP_DIR / "no-kiosk-config.json"))
     os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", str(APP_DIR / "no-key.json"))
     app = importlib.import_module("app")
-    def hud():
-        cam = cv2.resize(frame, (app.CAM_W, app.WIN_H))
-        app.draw_camera_hud(cam, "can", "Recyclable", 0.92, True, 3)
+    def hud():   # the full 1280x720 kiosk frame: camera viewport + "item detected" panel
+        app.draw_camera_hud(frame, "can", "Recyclable", 0.92, True, 3)
+    hud()        # warm the text/icon caches once, like the first frame of a session
     results["HUD resize + draw (per UI frame)"] = timeit(hud, args.frames)
 
     print(f"{'step':40} {'median ms':>10} {'p95 ms':>8}")

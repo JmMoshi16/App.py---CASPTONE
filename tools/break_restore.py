@@ -41,17 +41,21 @@ def mutate(text, old, new):
     return text.replace(old, new, 1)
 
 
-def kiosk_case(old, new, test_pattern):
+def kiosk_case(old, new, test_pattern, file="app.py", tests="test_kiosk_phase1.py"):
+    """Mutate one file of a temporary kiosk copy (app.py or a module under kiosk/) and run matching tests."""
     def go(broken=True):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            shutil.copytree(KIOSK / "config", d / "config")
+            for folder in ("config", "kiosk", "assets", "tests"):
+                shutil.copytree(KIOSK / folder, d / folder, ignore=shutil.ignore_patterns("__pycache__"))
             shutil.copy(KIOSK / "kiosk_firestore.py", d)
-            src = (KIOSK / "app.py").read_text(encoding="utf-8")
-            (d / "app.py").write_text(mutate(src, old, new) if broken else src, encoding="utf-8")
+            shutil.copy(KIOSK / "app.py", d)
+            target = d / file
+            src = target.read_text(encoding="utf-8")
+            target.write_text(mutate(src, old, new) if broken else src, encoding="utf-8")
             env = {**os.environ, "KIOSK_APP_DIR": str(d)}
-            return failed_tests(run([sys.executable, "-I", "-m", "unittest", "discover", "-s", str(KIOSK / "tests"),
-                                     "-p", "test_kiosk_phase1.py", "-k", test_pattern], env=env))
+            return failed_tests(run([sys.executable, "-I", "-m", "unittest", "discover", "-s", str(d / "tests"),
+                                     "-p", tests, "-k", test_pattern], env=env, cwd=d))
     return go
 
 
@@ -84,9 +88,8 @@ def web_hook_case(replacements):
 
 
 CASES = [
-    ("C-03", "kiosk issues a QR while Firebase is offline",
-     kiosk_case("            if db is None:\n                # A QR for a token", "            if False:\n                # A QR for a token",
-                "OfflineTests")),
+    ("C-03", "SPACE is not refused while Firebase is offline",
+     kiosk_case("flow.set_context(online=db is not None,", "flow.set_context(online=True,", "OfflineTests")),
     ("C-04", "kiosk never notices the phone's scan",
      kiosk_case("_scan_event.set()\n    _watcher", "pass\n    _watcher", "ScanDetectionTests")),
     ("C-05", "web page flips to 'Failed to load' after 15 s although data arrived",
@@ -96,6 +99,19 @@ CASES = [
                 "changedKeys().hasOnly(['role', 'username', 'points', 'lifetimePoints',")),
     ("C-02", "the kiosk identity can read customers' user documents",
      rules_case("allow get:  if isOwner(uid) || isAdmin();", "allow get:  if isOwner(uid) || isAdmin() || isKiosk();")),
+    ("K-01", "token dates written as ISO strings (rules reject / expiry unchecked)",
+     kiosk_case('"expiresAt": expires_at,', '"expiresAt": expires_at.isoformat(),', "TokenContractTests",
+                tests="test_kiosk_product.py")),
+    ("K-07", "the token write runs on the UI thread and freezes the screen",
+     kiosk_case('threading.Thread(target=fn, daemon=True, name="kiosk-worker").start()', "fn()",
+                "NonBlockingTests", tests="test_kiosk_product.py")),
+    ("K-10", "the scan watcher keeps polling after the QR ends",
+     kiosk_case("            _watcher.unsubscribe()\n        except Exception:\n            pass\n    _watcher, _active_token",
+                "            pass\n        except Exception:\n            pass\n    _watcher, _active_token",
+                "QrLifetimeInTheLoop", tests="test_kiosk_product.py")),
+    ("K-06", "a queued servo command is replayed after the ESP32 is plugged back in",
+     kiosk_case("            self._drain_tx()                                 # never replay stale commands",
+                "            pass", "unplug", file="kiosk/hardware.py", tests="test_kiosk_flow.py")),
     ("H-02", "a QR token can be claimed twice",
      rules_case("&& resource.data.get('isUsed', false) == false\n                        && resource.data.usedBy.size() == 0",
                 "&& true")),
