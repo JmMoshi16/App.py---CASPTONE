@@ -9,10 +9,16 @@
 //   ESP32 -> app   READY, W:<grams> every 200 ms, OK:<n>, DONE:<n>:<grams>, JAM:<n>, FILL:<b>,<r>,<s>, PONG, ERR:<text>
 // Staff-only (Arduino Serial Monitor, kiosk closed): "CAL <grams>" with a known weight on the tray prints the
 // calibration factor; "RAW" prints the raw HX711 value.
+// Test-only, while HAS_SCALE is false: "ITEM <grams>" pretends an item lies on the tray (kiosk staff key I).
 //
 // Libraries: ESP32Servo (Library Manager). The HX711 is read directly, no library needed.
 
 #include <ESP32Servo.h>
+
+// ── 0. what is connected (start with only the tray servo, add parts one by one) ──
+const bool HAS_SCALE        = false;  // true once the HX711 load cell is wired; false = fake weight via "ITEM <g>"
+const bool HAS_FILL_SENSORS = false;  // true once the three HC-SR04 are wired; false = FILL:0,0,0
+const unsigned long FAKE_DROP_MS = 800; // without a scale: how long the tray stays tipped before "it fell"
 
 // ── 1. pins (ASSUMED — match your wiring) ────────────────────────────────────
 const int PIN_CHUTE_SERVO = 19;     // MG996R, rotates the 45° chute over the 3 bins
@@ -41,6 +47,7 @@ const float BIN_FULL_CM  = 5.0;     // sensor -> top of the waste when the bin c
 Servo chute, tray;
 long tareOffset = 0;
 float grams = 0, lastSample = 0;
+float testItemGrams = 0;            // HAS_SCALE == false: the pretend item on the tray
 int fillPct[3] = {0, 0, 0};
 
 enum Step { IDLE, MOVING, TIPPING, RETURNING };
@@ -80,6 +87,7 @@ long hxAverage(int n) {
 }
 
 void updateWeight() {                  // non-blocking: only reads when the HX711 has a sample
+  if (!HAS_SCALE) { grams = testItemGrams; return; }
   if (!hxReady()) return;
   float g = (hxReadRaw() - tareOffset) / calibration;
   grams = (g + lastSample) / 2.0;      // light smoothing
@@ -88,6 +96,7 @@ void updateWeight() {                  // non-blocking: only reads when the HX71
 
 // ── HC-SR04 ──────────────────────────────────────────────────────────────────
 int measureFill(int i) {
+  if (!HAS_FILL_SENSORS) return 0;
   digitalWrite(PIN_TRIG[i], LOW);
   delayMicroseconds(2);
   digitalWrite(PIN_TRIG[i], HIGH);
@@ -108,7 +117,13 @@ void sendFill() {
 void handle(String c) {
   c.trim();
   if (c == "P") { Serial.println("PONG"); return; }
-  if (c == "T") { tareOffset = hxAverage(10); return; }
+  if (c == "T") { if (HAS_SCALE) tareOffset = hxAverage(10); return; }
+  if (c.startsWith("ITEM")) {            // test only: a pretend item while no load cell is wired
+    if (HAS_SCALE) { Serial.println("ERR:ITEM is only for HAS_SCALE = false"); return; }
+    float g = c.length() > 5 ? c.substring(5).toFloat() : 20.0;
+    if (step == IDLE) testItemGrams = g > 0 ? g : 20.0;
+    return;
+  }
   if (c == "1" || c == "2" || c == "3") {
     if (step != IDLE) return;          // one sort at a time; the kiosk never sends two
     binN = c.toInt();
@@ -142,6 +157,7 @@ void runSort() {
       }
       break;
     case TIPPING:
+      if (!HAS_SCALE && t >= FAKE_DROP_MS) testItemGrams = 0;   // the pretend item slid off
       if (grams < EMPTY_BELOW_G && t >= 300) {
         tray.write(TRAY_LEVEL);
         step = RETURNING;
@@ -185,7 +201,7 @@ void setup() {
   chute.write(CHUTE_HOME);
   tray.write(TRAY_LEVEL);
   delay(800);
-  tareOffset = hxAverage(10);          // the tray must be empty at power-up
+  if (HAS_SCALE) tareOffset = hxAverage(10);   // the tray must be empty at power-up
   for (int i = 0; i < 3; i++) fillPct[i] = measureFill(i);
   Serial.println("READY");
   sendFill();

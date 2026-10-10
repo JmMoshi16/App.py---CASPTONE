@@ -5,6 +5,18 @@ three things: PySerial on the PC, the ESP32 visible as a COM port, and firmware 
 (`ecoreward_bin/ecoreward_bin.ino` here). The sketch compiles for "ESP32 Dev Module" (ESP32 core 3.3.12 +
 ESP32Servo) but has **not been tested on the bin**: every pin, angle and calibration value is an assumption.
 
+## 0. First test with only the tray servo connected
+
+The sketch starts with `HAS_SCALE = false` and `HAS_FILL_SENSORS = false` (section 0 at the top), so it runs with
+just the micro servo on GPIO 18: the weight reads 0, fill levels read 0, and a pretend item can be put on the tray
+with `ITEM 20`. When tipped, the pretend item "falls" after 0.8 s and the ESP32 reports `DONE` as usual.
+Set each flag to `true` (and upload again) once that part is wired.
+
+- **Serial Monitor:** `P` → `PONG`; `3` → the servo tips and comes back, and you see `OK:3`, `DONE:3:0.0`, `FILL:0,0,0`.
+- **Kiosk with the real servo:** close the Serial Monitor, run `py -3.11 app.py --windowed`, wait for "Drop one item
+  into the slot", hold an item under the webcam and press **I**. The kiosk asks the ESP32 for a pretend 20 g item,
+  recognises what the camera sees, sends the bin code, and the servo tips.
+
 ## 1. Check the wiring against the sketch
 
 | Part | ESP32 pin in the sketch | Notes |

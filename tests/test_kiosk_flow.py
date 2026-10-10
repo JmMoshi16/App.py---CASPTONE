@@ -643,6 +643,15 @@ class SerialSorterTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: s.ready))
         self.assertEqual(s.port, "COM7")
 
+    def test_bench_test_item_only_when_connected(self):
+        port = FakePort(answer_ping=False)
+        s = self._sorter(port)
+        self.assertFalse(s.test_item(), "nothing is sent before the ESP32 answers PONG")
+        port.chunks.append(b"PONG\n")
+        self.assertTrue(wait_for(lambda: s.ready))
+        self.assertTrue(s.test_item(20))
+        self.assertTrue(wait_for(lambda: b"ITEM 20\n" in port.writes))
+
     def test_wait_for_helper(self):
         port = FakePort()
         s = self._sorter(port)

@@ -403,6 +403,13 @@ class SerialSorter(Sorter):
         self._tx.put(b"P\n")
         return True
 
+    def test_item(self, grams=20.0):
+        """Bench testing only: ask firmware built with HAS_SCALE = false to pretend an item lies on the tray."""
+        if not self.ready:
+            return False
+        self._tx.put(f"ITEM {grams:g}\n".encode())
+        return True
+
     def wait_for(self, prefix, timeout):
         """Block until a line starting with `prefix` arrives (after this call) or `timeout` passes.
         For tools and bench tests; the kiosk loop never blocks on the ESP32."""
