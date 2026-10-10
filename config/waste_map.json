@@ -13,7 +13,7 @@
     "bottle":        "Recyclable",
     "can":           "Recyclable",
     "metal":         "Recyclable",
-    "straw":         "Recyclable",
+    "straw":         "Residual",
     "paper-cup":     "Recyclable",
     "paper cup":     "Recyclable",
     "plastic-cup":   "Recyclable",
