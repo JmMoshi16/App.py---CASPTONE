@@ -36,6 +36,15 @@ Designed on a **1280 × 720 grid** and scaled by `s = min(W / 1280, H / 720)` to
 
 Full-screen moments (success, failure, receipt, history, diagnostics) use a centred card over a scrim.
 
+**The bin (modes esp32 / sim):** the customer drops the item into a slot and never faces a camera, so the left
+area is a **hero** instead of a camera feed: one large tinted card with a 168-unit icon tile, a display-size
+title and one line of support text, per state — Ready ("Drop one item into the slot", bouncing arrow),
+Checking (spinner), Sorting into <Category> (category colour + icon), Rejected (amber, the reason and "It went
+to Residual"), Sorted/no points (sage), Item stuck (error tint), Bin full (amber), Out of service (error tint,
+spinner). The right panel shows the weight, the category pill and the stepper; the QR keeps its layout.
+A "bin almost full" strip (amber tint, bin icon) sits under the top bar at 90 %. The camera preview with the
+`tray_roi` rectangle appears only in staff diagnostics.
+
 ## 3. Colour tokens
 
 | Token | Hex | Use | Contrast |
@@ -109,9 +118,9 @@ Minimum rendered size 13 px after scaling. Line height 1.25 (display 1.1).
 | **TopBar** | wordmark (leaf mark + "ECO" forest, "Reward" ink), status chips, local time. Height 64. |
 | **StatusChip** | dot + word, pill; states `ok` (forest), `busy` (amber, pulsing dot), `error` (error), `off` (ink_3), `sim` (amber outline + "SIMULATION"). Never shows "connected" until a real connection exists. |
 | **Card** | surface, radius 20, border, card shadow, padding 24. |
-| **Button** | min height 56, radius 14, label `body_lg` 600. Primary = forest/white; secondary = white/ink with border; ghost = text only. Pressed = darker fill for 120 ms. Every button has a keyboard equivalent for staff. |
+| **Button** | min height 80 px on every display (56 design units, never below 80 px), radius 14, label `body_lg` 600. Primary = forest/white; secondary = white/ink with border; ghost = text only. Pressed = darker fill for 120 ms. Every button has a keyboard equivalent for staff. |
 | **CategoryBadge** | tinted pill, icon + category word in the category colour; large variant 64 px icon tile. |
-| **Stepper** | vertical list of the stages the sorter mode supports (camera: Identify → Drop it into the bin → Code; ESP32: Identify → Sort → Confirm drop → Code; attendant: Identify → Staff confirms → Code): done (check, forest), active (spinner, ink, bold), pending (hollow circle, ink_3). |
+| **Stepper** | vertical list of the stages the sorter mode supports (bin/esp32: Weigh → Recognise → Sort → Code; camera: Identify → Drop it into the bin → Code; ESP32: Identify → Sort → Confirm drop → Code; attendant: Identify → Staff confirms → Code): done (check, forest), active (spinner, ink, bold), pending (hollow circle, ink_3). |
 | **ProgressBar / Meter** | 8 px track `sunken`, fill category or forest, rounded ends; label + value in text. |
 | **Spinner** | 270° arc, 3 px, 1.2 s per turn; static "…" in reduced motion. |
 | **CountdownRing** | ring 6 px; forest → amber (< 5 min) → error (< 1 min); time as text inside. |

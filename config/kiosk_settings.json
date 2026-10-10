@@ -1,26 +1,38 @@
 {
-  "_comment": "Kiosk settings (no secrets). Command-line flags override these; see README 'Running the kiosk'. sorter: camera = self-service, the camera sees the item go in (no hardware, no staff), attendant = staff confirm with SPACE, esp32 = servo + load cell over USB serial, sim = simulated ESP32 (labelled SIMULATION).",
-  "width": 1280,
-  "height": 720,
-  "fullscreen": false,
+  "_comment": "Kiosk settings (no secrets). Command-line flags override these (py -3.11 app.py --help). mode: esp32 = the bin (load cell + YOLO on the tray + ESP32 sorting), sim = the same flow with a simulated ESP32 (labelled SIMULATION, staff key I places an item), camera / attendant = testing without hardware. Missing keys fall back to defaults; the older names 'sorter' and 'serial_baud' are still read.",
+  "mode": "esp32",
+  "serial_port": "COM3",
+  "baud": 115200,
+
+  "min_item_g": 3,
+  "steady_ms": 500,
+  "steady_tolerance_g": 1,
+  "identify_timeout_s": 3,
+  "ok_timeout_s": 3,
+  "drop_timeout_s": 4,
+  "tray_roi": [0.0, 0.0, 1.0, 1.0],
+  "multi_item_frames": 3,
+  "jam_clear_s": 10,
+  "auto_tare_idle_s": 60,
+
+  "width": 1920,
+  "height": 1080,
+  "fullscreen": true,
   "reduce_motion": false,
   "sounds": true,
   "camera_index": 0,
-  "sorter": "camera",
-  "serial_port": "auto",
-  "serial_baud": 115200,
-  "sort_ack_timeout": 5.0,
-  "drop_confirm_timeout": 10.0,
+
   "issue_timeout": 20.0,
   "qr_display_seconds": 180.0,
   "success_seconds": 4.0,
   "failure_seconds": 7.0,
+
   "lock_votes": 5,
   "rearm_clear_frames": 10,
-  "min_drop_grams": 5.0,
   "drop_clear_frames": 8,
   "drop_timeout": 15.0,
   "cooldown_seconds": 15.0,
+
   "bins_min_interval": 60.0,
   "log_dir": "logs"
 }

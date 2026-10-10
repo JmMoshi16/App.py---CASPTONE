@@ -3,6 +3,7 @@
 
     py -3.11 -I -m unittest discover -s tests -v
 """
+import random
 import sys
 import threading
 import time
@@ -12,10 +13,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kiosk import config as cfgmod                                          # noqa: E402
-from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SendSort, Sound, StopWatching,  # noqa: E402
-                        TransactionFlow, WatchToken)
-from kiosk.hardware import (Ack, AttendantSorter, DeviceError, Fill, LinkState, SerialSorter,  # noqa: E402
-                            SimulatedSorter, Weight, parse_line)
+from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SendSort, Sound, StopWatching, Tare,  # noqa: E402
+                        TransactionFlow, TrayConfig, TrayFlow, WatchToken)
+from kiosk.hardware import (AttendantSorter, Booted, DeviceError, Done, Fill, Jam, LinkLost, LinkState,  # noqa: E402
+                            LinkUp, Ok, Pong, SerialSorter, SimulatedESP32, Weight, WeightTracker, make_sorter,
+                            parse_line)
 
 CAN = Detection("can", "Recyclable", 0.9, (1, 2, 3, 4))
 PEEL = Detection("banana peel", "Biodegradable", 0.8, (1, 2, 3, 4))
@@ -120,97 +122,6 @@ class AttendantFlowTests(unittest.TestCase):
         self.assertEqual(sum(isinstance(a, Sound) for a in sounds), 1)
 
 
-class AutomaticFlowTests(unittest.TestCase):
-    def test_full_sort_and_two_deposits_in_a_row(self):
-        f = flow("esp32")
-        for n in (1, 2):
-            a = see(f, CAN, 7, t0=n * 100)
-            sends = [x for x in a if isinstance(x, SendSort)]
-            self.assertEqual(len(sends), 1, f"deposit {n}: exactly one servo command")
-            self.assertEqual(sends[0].waste_type, "Recyclable")
-            self.assertEqual(f.phase, Phase.SORTING)
-            self.assertEqual(see(f, CAN, 3, t0=n * 100 + 1), [], "frames during sorting must not send again")
-            f.on_sorter_event(Ack(), n * 100 + 1)
-            self.assertEqual(f.phase, Phase.CONFIRMING)
-            a = f.on_sorter_event(Weight(40), n * 100 + 2)
-            self.assertEqual(kinds(a), ["IssueToken"])
-            self.assertTrue(f.tx.sorted)
-            f.on_issue_ok(a[0].tx_id, f"tok-{n}", "1234", UTC0 + timedelta(minutes=20), "p", n * 100 + 3)
-            f.on_scanned(f"tok-{n}", n * 100 + 4)
-            f.tick(n * 100 + 9, UTC0)
-            self.assertEqual(f.phase, Phase.READY)
-            see(f, None, 10, t0=n * 100 + 10)          # the item is gone: re-arm
-        self.assertEqual(f.completed, 2)
-
-    def test_same_item_still_in_view_does_not_sort_again(self):
-        f = flow("esp32")
-        see(f, CAN, 7)
-        f.tick(10, UTC0)                                 # sorter never answered
-        self.assertEqual(f.phase, Phase.FAILED)
-        f.tick(20, UTC0)
-        self.assertEqual(f.phase, Phase.READY)
-        self.assertFalse([a for a in see(f, CAN, 14, t0=21) if isinstance(a, SendSort)],
-                         "an item that never left the camera started a second sort")
-        self.assertFalse(f.armed)
-        see(f, None, 10, t0=30)
-        self.assertTrue(f.armed)
-
-    def test_no_sort_until_the_vote_is_stable(self):
-        f = flow("esp32", lock_votes=5)
-        a = []
-        for i, d in enumerate([CAN, PEEL, CAN, PEEL, CAN, PEEL, CAN]):
-            a += f.observe(d, i * 0.04)
-        self.assertFalse([x for x in a if isinstance(x, SendSort)], "4 of 7 frames is not a stable vote")
-
-    def test_no_sort_while_the_sorter_is_disconnected(self):
-        f = flow("esp32")
-        f.set_context(online=True, model_ok=True, sorter_ready=False)
-        self.assertFalse([x for x in see(f, CAN, 10) if isinstance(x, SendSort)])
-        f.set_context(online=True, model_ok=True, sorter_ready=True)
-        self.assertTrue([x for x in see(f, CAN, 1, t0=1) if isinstance(x, SendSort)], "sorts once it reconnects")
-
-    def test_light_drop_fails_and_repeated_lines_are_ignored(self):
-        f = flow("esp32", min_drop_grams=5)
-        see(f, CAN, 7)
-        f.on_sorter_event(Ack(), 1)
-        self.assertEqual(f.on_sorter_event(Ack(), 1.1), [], "a repeated OK changes nothing")
-        self.assertEqual(f.phase, Phase.CONFIRMING)
-        f.on_sorter_event(Weight(2), 2)
-        self.assertEqual((f.phase, f.failure.kind), (Phase.FAILED, "no_drop"))
-        self.assertEqual(f.on_sorter_event(Weight(50), 2.1), [], "a late weight cannot issue a code")
-        self.assertEqual([s for _, _, s in f.stages()], ["done", "done", "failed", "pending"])
-
-    def test_offline_still_sorts_but_says_no_code(self):
-        f = flow("esp32")
-        f.set_context(online=False, model_ok=True, sorter_ready=True)
-        see(f, CAN, 7)
-        self.assertEqual(f.phase, Phase.SORTING)
-        f.on_sorter_event(Ack(), 1)
-        self.assertNotIn("IssueToken", kinds(f.on_sorter_event(Weight(30), 2)))
-        self.assertEqual(f.failure.kind, "offline_after_sort")
-        self.assertIn("Recyclable bin", f.failure.message)
-
-    def test_device_error_and_ack_timeout(self):
-        f = flow("esp32", sort_ack_timeout=5)
-        see(f, CAN, 7)
-        f.on_sorter_event(DeviceError("jammed"), 1)
-        self.assertEqual(f.failure.kind, "device_error")
-        g = flow("esp32", sort_ack_timeout=5)
-        see(g, CAN, 7)
-        g.tick(4.9, UTC0)
-        self.assertEqual(g.phase, Phase.SORTING)
-        g.tick(5.3, UTC0)
-        self.assertEqual(g.failure.kind, "sorter_timeout")
-
-    def test_space_starts_a_sort_only_in_debug(self):
-        f = flow("esp32")
-        see(f, CAN, 2)
-        self.assertEqual(f.confirm(1), [])
-        g = flow("esp32", debug=True)
-        see(g, CAN, 2)
-        self.assertEqual(kinds(g.confirm(1)), ["SendSort"])
-
-
 class CameraSelfServiceTests(unittest.TestCase):
     """Camera mode: no staff, no sorting hardware; the item leaving the view counts as the drop."""
 
@@ -288,23 +199,326 @@ class QrLifetimeTests(unittest.TestCase):
         self.assertEqual(f.phase, Phase.READY)
 
 
+
+
+# ── the bin: TrayFlow with a fake ESP32 (events), a fake detector (Detection) and a fake token store ──
+PEEL_ITEM = Detection("banana peel", "Biodegradable", 0.82, (1, 2, 3, 4))
+FORK = Detection("fork", "Residual", 0.77, (1, 2, 3, 4))
+CUP = Detection("cup", "Recyclable", 0.88, (1, 2, 3, 4))
+PERSON = Detection("person", None, 0.95, (1, 2, 3, 4))
+
+
+def tray(online=True, **kw):
+    kw.setdefault("max_weight_g", {"default": 500, "can": 40, "cup": 60})
+    f = TrayFlow(TrayConfig(**kw))
+    f.set_context(online=online, model_ok=True, sorter_ready=True)
+    f.on_sorter_event(LinkUp(), 0.0)
+    return f
+
+
+def weigh(f, grams, t0, n=5, dt=0.2):
+    out = []
+    for i in range(n):
+        out += f.on_sorter_event(Weight(grams), t0 + i * dt)
+    return out
+
+
+def identify(f, det, t0, n=7, dt=0.05):
+    out = []
+    for i in range(n):
+        out += f.observe(det, t0 + i * dt)
+    return out
+
+
+def to_sorting(f, det, grams, t0=1.0):
+    acts = weigh(f, grams, t0)
+    assert f.phase == Phase.IDENTIFYING, f.phase
+    acts += identify(f, det, t0 + 1.0)
+    assert f.phase == Phase.SORTING, f.phase
+    return acts
+
+
+def finish_qr(f, now, token="tok"):
+    tx = f.tx.id
+    f.on_issue_ok(tx, token, "1234", UTC0 + timedelta(minutes=20), f"ECOBIN:{f.tx.waste_type}:{token}", now)
+
+
+class TrayHappyPathTests(unittest.TestCase):
+    def test_each_bin_end_to_end(self):
+        for det, code in ((PEEL_ITEM, "1"), (CAN, "2"), (FORK, "3")):
+            with self.subTest(item=det.label):
+                f = tray()
+                self.assertEqual(f.phase, Phase.READY)
+                acts = to_sorting(f, det, 15.0)
+                sorts = [a for a in acts if isinstance(a, SendSort)]
+                self.assertEqual([(s.code, s.waste_type) for s in sorts], [(code, det.waste_type)])
+                self.assertNotIn("IssueToken", kinds(acts))
+                self.assertEqual(f.on_sorter_event(Ok(int(code)), 3.0), [])
+                weigh(f, 0.0, 3.2, n=2)                              # the tray tipped
+                acts = f.on_sorter_event(Done(int(code), 15.0), 3.6)
+                self.assertEqual(kinds(acts), ["IssueToken"])
+                self.assertEqual(acts[0].waste_type, det.waste_type)
+                finish_qr(f, 4.0)
+                self.assertEqual(f.phase, Phase.QR)
+                self.assertEqual(kinds(f.on_scanned("tok", 5.0)), ["StopWatching", "Sound"])
+                f.tick(9.1, UTC0)
+                self.assertEqual(f.phase, Phase.READY)
+
+    def test_no_token_is_ever_created_before_done(self):
+        f = tray()
+        acts = to_sorting(f, CAN, 15.0)
+        acts += f.on_sorter_event(Ok(2), 3.0)
+        for i in range(15):                                         # weight stream, ticks, frames: no DONE yet
+            acts += f.on_sorter_event(Weight(15.0 if i < 5 else 0.0), 3.0 + i * 0.2)
+            acts += f.tick(3.0 + i * 0.2, UTC0)
+            acts += f.observe(CAN, 3.0 + i * 0.2)
+        self.assertNotIn("IssueToken", kinds(acts), "a reward code was created before DONE")
+        self.assertEqual(kinds(f.on_sorter_event(Done(2, 15.0), 6.1)), ["IssueToken"])
+        self.assertEqual(f.on_sorter_event(Done(2, 15.0), 6.2), [], "a repeated DONE must not issue a second code")
+
+    def test_unsteady_weight_keeps_waiting_and_an_empty_tray_goes_back(self):
+        f = tray()
+        for i, g in enumerate([12, 30, 8, 25, 11, 29, 9, 27]):
+            f.on_sorter_event(Weight(g), 1.0 + i * 0.2)
+        self.assertEqual(f.phase, Phase.WEIGHING, "a hand in the slot must not start identifying")
+        self.assertTrue(f.hint(1.0 + 6.0))
+        weigh(f, 18.0, 3.0)
+        self.assertEqual(f.phase, Phase.IDENTIFYING)
+        g = tray()
+        weigh(g, 9.0, 1.0, n=1)
+        weigh(g, 0.4, 1.2, n=1)
+        self.assertEqual(g.phase, Phase.WEIGHING, "one low reading while the item bounces is not an empty tray")
+        weigh(g, 0.4, 1.4, n=4)
+        self.assertEqual(g.phase, Phase.READY)
+
+    def test_identify_timeout_with_few_frames_still_votes(self):
+        f = tray()
+        weigh(f, 12.0, 1.0)
+        identify(f, CAN, 2.0, n=3)
+        self.assertEqual(f.phase, Phase.IDENTIFYING)
+        acts = f.tick(2.0 + 3.0, UTC0)
+        self.assertEqual([a.code for a in acts if isinstance(a, SendSort)], ["2"])
+
+
+class TrayRejectTests(unittest.TestCase):
+    def _rejected(self, f, code=3):
+        self.assertEqual(f.tx.bin_code, str(code))
+        acts = f.on_sorter_event(Ok(code), 3.0) + f.on_sorter_event(Done(code, f.tx.grams), 3.5)
+        self.assertNotIn("IssueToken", kinds(acts))
+        self.assertEqual(f.phase, Phase.REJECTED)
+        return f.notice[1]
+
+    def test_not_recognised(self):
+        f = tray()
+        weigh(f, 12.0, 1.0)
+        acts = identify(f, None, 2.0)
+        self.assertEqual([a.code for a in acts if isinstance(a, SendSort)], ["3"], "unknown items go to Residual")
+        self.assertEqual(self._rejected(f), "We couldn't recognise this item. It went to Residual.")
+        g = tray()
+        to_sorting(g, PERSON, 50.0)                              # a label that is not in the waste map
+        self.assertEqual(g.tx.reject[0], "unknown")
+
+    def test_too_heavy(self):
+        f = tray()
+        to_sorting(f, CUP, 120.0)                                # a cup that still has drink in it
+        self.assertEqual(f.tx.reject[0], "too_heavy")
+        self.assertIn("Cups must be empty", self._rejected(f))
+        g = tray()
+        to_sorting(g, CUP, 45.0)
+        self.assertIsNone(g.tx.reject)
+
+    def test_two_items(self):
+        f = tray()
+        weigh(f, 30.0, 1.0)
+        two = Detection("can", "Recyclable", 0.9, (1, 2, 3, 4), objects=2)
+        for i, d in enumerate([two, CAN, two, CAN, two, CAN, CAN]):
+            f.observe(d, 2.0 + i * 0.05)
+        self.assertEqual(f.tx.reject[0], "two_items")
+        self.assertEqual(self._rejected(f), "One item at a time, please. It went to Residual.")
+
+    def test_rejected_screen_ends_after_a_few_seconds(self):
+        f = tray(reject_seconds=4)
+        weigh(f, 12.0, 1.0)
+        identify(f, None, 2.0)
+        self._rejected(f)
+        weigh(f, 0.0, 3.6, n=2)
+        f.tick(3.5 + 4.1, UTC0)
+        self.assertEqual(f.phase, Phase.READY)
+
+
+class TrayFaultTests(unittest.TestCase):
+    def test_jam_message_then_staff_clear(self):
+        f = tray()
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(2), 3.0)
+        self.assertNotIn("IssueToken", kinds(f.on_sorter_event(Jam(2), 6.0)))
+        self.assertEqual(f.phase, Phase.JAM)
+        self.assertEqual([s for _, _, s in f.stages()], ["done", "done", "failed", "pending"])
+        weigh(f, 15.0, 6.2, n=2)                                 # still on the tray
+        self.assertEqual(f.staff_clear(7.0), [])
+        self.assertEqual(f.phase, Phase.WEIGHING, "an item still on the tray is weighed again, not dropped")
+
+    def test_jam_ends_after_the_scale_reads_empty_for_10_s(self):
+        f = tray()
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Jam(2), 3.0)
+        weigh(f, 0.5, 4.0, n=1)
+        f.tick(13.9, UTC0)
+        self.assertEqual(f.phase, Phase.JAM)
+        weigh(f, 0.5, 14.0, n=1)
+        f.tick(14.1, UTC0)
+        self.assertEqual(f.phase, Phase.READY)
+
+    def test_no_ok_and_no_done_are_jams(self):
+        f = tray(ok_timeout_s=3)
+        to_sorting(f, CAN, 15.0)
+        sent = f.since                                           # the sort command went out here
+        f.tick(sent + 2.9, UTC0)
+        self.assertEqual(f.phase, Phase.SORTING)
+        f.tick(sent + 3.1, UTC0)
+        self.assertEqual(f.phase, Phase.JAM)
+        g = tray(drop_timeout_s=4)
+        to_sorting(g, CAN, 15.0)
+        g.on_sorter_event(Ok(2), 3.0)
+        g.tick(7.1, UTC0)
+        self.assertEqual(g.phase, Phase.JAM)
+
+    def test_wrong_bin_reported_is_a_jam(self):
+        f = tray()
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(1), 3.0)
+        self.assertEqual(f.phase, Phase.JAM)
+
+    def test_esp32_disconnects_during_sorting(self):
+        f = tray()
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(2), 3.0)
+        f.on_sorter_event(LinkLost("unplugged"), 3.2)
+        self.assertEqual((f.phase, f.pause_reason), (Phase.PAUSED, "link"))
+        self.assertIsNone(f.tx)
+        self.assertEqual(f.on_sorter_event(Done(2, 15.0), 3.4), [], "a late DONE after the loss issues nothing")
+        weigh(f, 15.0, 5.0, n=1)                                  # the item never left the tray
+        f.on_sorter_event(LinkUp(), 6.0)
+        self.assertEqual(f.phase, Phase.WEIGHING, "back in service: the item is weighed and sorted again")
+
+    def test_out_of_service_until_the_esp32_answers(self):
+        f = TrayFlow(TrayConfig())
+        self.assertEqual((f.phase, f.pause_reason), (Phase.PAUSED, "link"))
+        weigh(f, 20.0, 1.0)
+        self.assertEqual(f.phase, Phase.PAUSED)
+        f.on_sorter_event(LinkUp(), 2.0)
+        self.assertEqual(f.phase, Phase.WEIGHING)
+
+    def test_bin_full_pauses_then_resumes(self):
+        f = tray()
+        f.on_sorter_event(Fill(92, 40, 10), 1.0)
+        self.assertEqual(f.bins_warn(), ["Biodegradable"])
+        self.assertEqual(f.phase, Phase.READY)
+        f.on_sorter_event(Fill(100, 40, 10), 2.0)
+        self.assertEqual((f.phase, f.pause_reason), (Phase.PAUSED, "bin_full"))
+        weigh(f, 20.0, 3.0)
+        self.assertEqual(f.phase, Phase.PAUSED, "no items are accepted while a bin is full")
+        weigh(f, 0.0, 4.0)
+        f.on_sorter_event(Fill(5, 40, 10), 5.0)
+        self.assertEqual(f.phase, Phase.READY)
+
+    def test_a_bin_filling_up_during_a_deposit_pauses_afterwards(self):
+        f = tray()
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(2), 3.0)
+        f.on_sorter_event(Done(2, 15.0), 3.5)
+        f.on_sorter_event(Fill(30, 100, 10), 3.6)
+        self.assertEqual(f.phase, Phase.ISSUING, "the customer still gets their code")
+        finish_qr(f, 4.0)
+        weigh(f, 0.0, 4.0, n=2)
+        f.dismiss(5.0)
+        self.assertEqual((f.phase, f.pause_reason), (Phase.PAUSED, "bin_full"))
+
+    def test_firebase_offline_sorts_but_shows_no_qr(self):
+        f = tray(online=False)
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(2), 3.0)
+        self.assertNotIn("IssueToken", kinds(f.on_sorter_event(Done(2, 15.0), 3.5)))
+        self.assertEqual((f.phase, f.notice), (Phase.NOTICE, ("Sorted!", "Reward codes are offline right now.")))
+        weigh(f, 0.0, 3.6, n=2)
+        f.tick(3.5 + 3.1, UTC0)
+        self.assertEqual(f.phase, Phase.READY)
+
+    def test_items_that_earn_no_points(self):
+        f = tray(points={"Biodegradable": 15, "Recyclable": 10, "Residual": 0})
+        to_sorting(f, FORK, 10.0)
+        f.on_sorter_event(Ok(3), 3.0)
+        f.on_sorter_event(Done(3, 10.0), 3.5)
+        self.assertEqual(f.notice, ("Thank you!", "This item doesn't earn points."))
+
+    def test_customer_walks_away_from_the_qr(self):
+        f = tray(qr_display_seconds=180)
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(2), 3.0)
+        f.on_sorter_event(Done(2, 15.0), 3.5)
+        weigh(f, 0.0, 3.6, n=2)
+        finish_qr(f, 4.0)
+        self.assertEqual(f.tick(4.0 + 179, UTC0), [])
+        self.assertEqual(f.tick(4.0 + 180, UTC0), [StopWatching()])
+        self.assertEqual(f.phase, Phase.READY)
+
+    def test_a_new_item_dropped_during_the_qr_is_weighed_afterwards(self):
+        f = tray()
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(2), 3.0)
+        f.on_sorter_event(Done(2, 15.0), 3.5)
+        finish_qr(f, 4.0)
+        weigh(f, 22.0, 5.0)                                      # the next customer drops an item
+        self.assertEqual(f.phase, Phase.QR, "the first customer's QR stays on screen")
+        f.dismiss(6.0)
+        self.assertEqual(f.phase, Phase.WEIGHING)
+
+    def test_auto_tare_only_when_idle_steady_and_near_zero(self):
+        f = tray(auto_tare_idle_s=60)
+        weigh(f, 1.2, 1.0)
+        self.assertEqual(f.tick(30.0, UTC0), [])
+        weigh(f, 1.2, 60.0)
+        self.assertEqual(f.tick(61.0, UTC0), [Tare()])
+        weigh(f, 1.2, 61.2)
+        self.assertEqual(f.tick(62.0, UTC0), [], "at most one tare per minute")
+        g = tray(auto_tare_idle_s=60)
+        for i, w in enumerate([0.5, 2.5, 0.3, 2.9, 0.4]):
+            g.on_sorter_event(Weight(w), 59.0 + i * 0.2)
+        self.assertEqual(g.tick(61.0, UTC0), [], "never tare a moving scale")
+
+
+# ── protocol, serial link, simulated ESP32 ──────────────────────────────────
 class ProtocolTests(unittest.TestCase):
     def test_parse_line(self):
-        self.assertEqual(parse_line("OK"), Ack())
-        self.assertEqual(parse_line(" ack\r"), Ack())
+        self.assertEqual(parse_line("READY"), Booted())
+        self.assertEqual(parse_line("PONG\r"), Pong())
         self.assertEqual(parse_line("W:42.5"), Weight(42.5))
-        self.assertEqual(parse_line("F:45,22,68"), Fill(45, 22, 68))
+        self.assertEqual(parse_line("W:-0.4"), Weight(-0.4))
+        self.assertEqual(parse_line("OK:2"), Ok(2))
+        self.assertEqual(parse_line("DONE:3:18.2"), Done(3, 18.2))
+        self.assertEqual(parse_line("JAM:1"), Jam(1))
+        self.assertEqual(parse_line("FILL:45,22,104"), Fill(45, 22, 100))
         self.assertEqual(parse_line("ERR:servo stalled"), DeviceError("servo stalled"))
-        for bad in ("", "W:", "W:abc", "W:-3", "F:1,2", "F:1,2,300", "F:a,b,c", "hello", "x" * 200):
+        for bad in ("", "OK", "OK:4", "DONE:2", "DONE:x:1", "JAM:", "W:", "W:abc", "FILL:1,2", "FILL:1,2,300",
+                    "hello", "x" * 200):
             self.assertIsNone(parse_line(bad), bad)
+
+    def test_weight_tracker_steady(self):
+        t = WeightTracker(steady_ms=500, tolerance_g=1.0)
+        for i, g in enumerate([10.0, 10.3, 9.8, 10.1]):
+            t.add(g, i * 0.2)
+        self.assertTrue(t.steady(0.6))
+        t.add(14.0, 0.8)
+        self.assertFalse(t.steady(0.8))
+        self.assertFalse(WeightTracker().steady(0.0))
 
 
 class FakePort:
     """A scripted serial port: chunks to return from read(), writes recorded, optional failure."""
 
-    def __init__(self, chunks=(), fail_after=None):
+    def __init__(self, chunks=(), fail_after=None, answer_ping=True):
         self.chunks, self.writes, self.closed = list(chunks), [], False
-        self.reads, self.fail_after = 0, fail_after
+        self.reads, self.fail_after, self.answer_ping = 0, fail_after, answer_ping
         self.in_waiting = 0
 
     def read(self, n):
@@ -316,6 +530,8 @@ class FakePort:
 
     def write(self, data):
         self.writes.append(data)
+        if data == b"P\n" and self.answer_ping:
+            self.chunks.append(b"PONG\n")
 
     def close(self):
         self.closed = True
@@ -330,30 +546,62 @@ def wait_for(cond, timeout=2.0):
     return cond()
 
 
-class SerialSorterTests(unittest.TestCase):
-    def _sorter(self, ports, **kw):
-        it = iter(ports)
-        logs = []
-        s = SerialSorter("COM9", 115200, opener=lambda p, b: next(it), list_ports=lambda: [],
-                         log=logs.append, backoff=(0.05,), **kw)
-        self.addCleanup(s.close)
-        return s, logs
+def drain(s, until, timeout=2.0):
+    got = []
+    wait_for(lambda: (got.extend(s.poll()) or until(got)), timeout)
+    return got
 
-    def test_connects_without_sending_and_parses_split_lines(self):
-        port = FakePort([b"O", b"K\nW:4", b"0\nhello\n", b"F:10,20,30\n"])
-        s, logs = self._sorter([port])
-        self.assertTrue(wait_for(lambda: s.ready))
-        self.assertEqual(port.writes, [], "nothing may be sent to the ESP32 on connect")
-        events = []
-        self.assertTrue(wait_for(lambda: (events.extend(s.poll()) or len(events) >= 3)))
-        self.assertEqual(events[:3], [Ack(), Weight(40.0), Fill(10, 20, 30)])
+
+class SerialSorterTests(unittest.TestCase):
+    def _sorter(self, port, **kw):
+        kw.setdefault("retry_s", 0.05)
+        s = SerialSorter("COM9", 115200, opener=lambda p, b: port, list_ports=lambda: [], log=lambda m: None, **kw)
+        self.addCleanup(s.close)
+        return s
+
+    def test_ready_only_after_pong_and_only_a_ping_on_connect(self):
+        port = FakePort(answer_ping=False)
+        s = self._sorter(port)
+        self.assertTrue(wait_for(lambda: port.writes))
+        time.sleep(0.1)
+        self.assertFalse(s.ready)
+        self.assertTrue(set(port.writes) <= {b"P\n"}, "only pings may be sent before the ESP32 answers")
+        self.assertFalse(s.sort("2"), "no sort command before PONG")
+        port.chunks.append(b"PONG\n")
+        events = drain(s, lambda g: LinkUp() in g)
+        self.assertIn(LinkUp(), events)
+        self.assertTrue(s.ready)
+
+    def test_lines_split_across_reads_and_commands(self):
+        port = FakePort([b"READY\nW:1", b"2.5\nOK", b":2\nDONE:2:12.5\nhello\nFILL:1,2,3\n"])
+        s = self._sorter(port)
+        events = drain(s, lambda g: any(isinstance(e, Fill) for e in g))
+        self.assertEqual([e for e in events if not isinstance(e, (LinkUp, Pong))],
+                         [Booted(), Weight(12.5), Ok(2), Done(2, 12.5), Fill(1, 2, 3)])
         self.assertEqual(s.unparsed, 1)
-        self.assertTrue(s.send_sort("Recyclable"))
-        self.assertTrue(wait_for(lambda: port.writes == [b"2\n"]))
-        self.assertFalse(s.send_sort("Plastic"), "unknown categories are never sent")
+        self.assertEqual(s.weight, 12.5)
+        self.assertTrue(wait_for(lambda: s.ready))
+        self.assertTrue(s.sort("2") and s.tare())
+        self.assertTrue(wait_for(lambda: b"2\n" in port.writes and b"T\n" in port.writes))
+        self.assertFalse(s.sort("4"))
+        self.assertTrue(all(not line.startswith("< W:") for line in s.recent_events))
+
+    def test_a_silent_esp32_is_lost_and_reconnected(self):
+        first = FakePort()
+        second = FakePort()
+        ports = iter([first, second])
+        s = SerialSorter("COM9", 115200, opener=lambda p, b: next(ports), list_ports=lambda: [], log=lambda m: None,
+                         retry_s=0.05, silence_s=0.3, ping_wait_s=0.2)
+        self.addCleanup(s.close)
+        first.answer_ping = True
+        self.assertTrue(wait_for(lambda: s.ready))
+        first.answer_ping = False                                # it stops talking
+        events = drain(s, lambda g: LinkLost in [type(e) for e in g], timeout=3)
+        self.assertIn(LinkLost, [type(e) for e in events])
+        self.assertTrue(wait_for(lambda: s.ready and second.reads > 0, timeout=3))
 
     def test_unplug_drops_queued_commands_and_reconnects_quietly(self):
-        first = FakePort(fail_after=3)
+        first = FakePort(fail_after=30)
         second = FakePort()
         plugged_back = threading.Event()
         ports = iter([first, second])
@@ -364,23 +612,15 @@ class SerialSorterTests(unittest.TestCase):
                 plugged_back.wait(2)           # stay "unplugged" until the stale command is queued
             return port
         logs = []
-        s = SerialSorter("COM9", 115200, opener=opener, list_ports=lambda: [], log=logs.append, backoff=(0.05,))
+        s = SerialSorter("COM9", 115200, opener=opener, list_ports=lambda: [], log=logs.append, retry_s=0.05)
         self.addCleanup(s.close)
         self.assertTrue(wait_for(lambda: s.state == LinkState.RECONNECTING))
         s._tx.put(b"1\n")                      # a command left behind while the port was down
         plugged_back.set()
         self.assertTrue(wait_for(lambda: s.ready and second.reads > 2))
         time.sleep(0.05)
-        self.assertEqual(second.writes, [], "a stale servo command was replayed after reconnecting")
+        self.assertNotIn(b"1\n", second.writes, "a stale servo command was replayed after reconnecting")
         self.assertLessEqual(sum("reconnecting" in m for m in logs), 2, "reconnect logged on every attempt")
-
-    def test_send_is_refused_while_disconnected(self):
-        def opener(p, b):
-            raise OSError("could not open port COM9")
-        s = SerialSorter("COM9", 115200, opener=opener, list_ports=lambda: [], log=lambda m: None, backoff=(0.05,))
-        self.addCleanup(s.close)
-        self.assertTrue(wait_for(lambda: s.state in (LinkState.CONNECTING, LinkState.RECONNECTING)))
-        self.assertFalse(s.send_sort("Residual"))
 
     def test_missing_pyserial_is_a_clear_error_without_retries(self):
         calls = []
@@ -388,7 +628,7 @@ class SerialSorterTests(unittest.TestCase):
         def opener(p, b):
             calls.append(1)
             raise ImportError("No module named 'serial'")
-        s = SerialSorter("COM9", 115200, opener=opener, list_ports=lambda: [], log=lambda m: None, backoff=(0.01,))
+        s = SerialSorter("COM9", 115200, opener=opener, list_ports=lambda: [], log=lambda m: None, retry_s=0.01)
         self.addCleanup(s.close)
         self.assertTrue(wait_for(lambda: s.state == LinkState.ERROR))
         time.sleep(0.1)
@@ -403,42 +643,101 @@ class SerialSorterTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: s.ready))
         self.assertEqual(s.port, "COM7")
 
+    def test_wait_for_helper(self):
+        port = FakePort()
+        s = self._sorter(port)
+        self.assertTrue(wait_for(lambda: s.ready))
+        threading.Timer(0.1, lambda: port.chunks.append(b"OK:3\n")).start()
+        self.assertEqual(s.wait_for("OK:", 2), "OK:3")
+        self.assertIsNone(s.wait_for("DONE:", 0.2))
+
+
+class SimulatedEsp32Tests(unittest.TestCase):
+    def _sim(self):
+        device = SimulatedESP32(speed=5.0, rng=random.Random(1))
+        s = SerialSorter("SIM", 115200, opener=lambda p, b: device, list_ports=lambda: [], log=lambda m: None,
+                         retry_s=0.05, simulated=True)
+        s.device = device
+        self.addCleanup(s.close)
+        self.assertTrue(wait_for(lambda: s.ready))
+        return s, device
+
+    def test_a_full_deposit_over_the_real_parser(self):
+        s, device = self._sim()
+        device.place_item(20.0)
+        self.assertTrue(wait_for(lambda: s.weight is not None and abs(s.weight - 20.0) < 1 and s.steady, timeout=3))
+        self.assertTrue(s.sort("2"))
+        events = drain(s, lambda g: any(isinstance(e, Fill) for e in g), timeout=3)
+        kinds_ = [type(e).__name__ for e in events if not isinstance(e, Weight)]
+        self.assertEqual([k for k in kinds_ if k in ("Ok", "Done", "Fill")], ["Ok", "Done", "Fill"])
+        done = [e for e in events if isinstance(e, Done)][0]
+        self.assertEqual(done.bin, 2)
+        self.assertAlmostEqual(done.grams, 20.0, delta=1.0)
+        self.assertTrue(wait_for(lambda: s.weight is not None and s.weight < 2, timeout=2))
+        self.assertTrue(s.simulated)
+
+    def test_jam(self):
+        s, device = self._sim()
+        device.place_item(15.0)
+        device.jam_next = True
+        s.sort("1")
+        events = drain(s, lambda g: any(isinstance(e, Jam) for e in g), timeout=3)
+        self.assertIn(Jam(1), events)
+
+    def test_make_sorter_sim_is_labelled_and_has_the_device(self):
+        s = make_sorter("sim", log=lambda m: None)
+        self.addCleanup(s.close)
+        self.assertTrue(s.simulated)
+        self.assertIsInstance(s.device, SimulatedESP32)
+
 
 class OtherSortersTests(unittest.TestCase):
-    def test_simulated_sorter_is_labelled_and_scripted(self):
-        clock = [0.0]
-        s = SimulatedSorter(ack_s=0.5, drop_s=1.0, clock=lambda: clock[0])
-        self.assertTrue(s.simulated and s.ready)
-        self.assertTrue(s.send_sort("Biodegradable"))
-        self.assertEqual(s.poll(0.4), [])
-        self.assertEqual(s.poll(0.6), [Ack()])
-        self.assertEqual(s.poll(1.2), [Weight(42.0)])
-
-    def test_attendant_mode_has_no_hardware(self):
-        s = AttendantSorter()
-        self.assertFalse(s.ready)
-        self.assertFalse(s.send_sort("Recyclable"))
+    def test_attendant_and_camera_modes_have_no_hardware(self):
+        for s in (AttendantSorter(), make_sorter("camera")):
+            self.assertFalse(s.ready)
+            self.assertFalse(s.sort("2"))
 
 
 class SettingsTests(unittest.TestCase):
-    def test_file_and_command_line(self):
+    def test_file_command_line_and_old_key_names(self):
         import json
         import tempfile
         d = Path(tempfile.mkdtemp())
         p = d / "s.json"
-        p.write_text(json.dumps({"sorter": "esp32", "width": "1024", "fullscreen": "yes", "bogus": 1}), "utf-8")
+        p.write_text(json.dumps({"sorter": "camera", "serial_baud": 9600, "width": "1024", "fullscreen": "yes",
+                                 "tray_roi": [0.1, 0.2, 0.9, 0.8], "bogus": 1}), "utf-8")
         s, problems = cfgmod.load_settings(p)
-        self.assertEqual((s.sorter, s.width, s.fullscreen), ("esp32", 1024, False))
+        self.assertEqual((s.mode, s.sorter, s.baud, s.width, s.fullscreen), ("camera", "camera", 9600, 1024, False))
+        self.assertEqual(s.tray_roi, [0.1, 0.2, 0.9, 0.8])
         self.assertTrue(any("bogus" in x for x in problems) and any("fullscreen" in x for x in problems))
-        s, _ = cfgmod.load_settings(p, ["--no-hardware", "--port", "COM4", "--fullscreen", "--reduce-motion"])
-        self.assertEqual((s.sorter, s.serial_port, s.fullscreen, s.reduce_motion), ("sim", "COM4", True, True))
+        p.write_text(json.dumps({"tray_roi": [0.5, 0.0, 0.2, 1.0]}), "utf-8")
+        s, problems = cfgmod.load_settings(p)
+        self.assertEqual(s.tray_roi, [0.0, 0.0, 1.0, 1.0])
+        self.assertTrue(any("tray_roi" in x for x in problems))
+        s, _ = cfgmod.load_settings(p, ["--no-hardware", "--port", "COM4", "--windowed", "--reduce-motion"])
+        self.assertEqual((s.mode, s.serial_port, s.fullscreen, s.reduce_motion), ("sim", "COM4", False, True))
+        s, _ = cfgmod.load_settings(p, ["--mode", "attendant"])
+        self.assertEqual(s.mode, "attendant")
         s, _ = cfgmod.load_settings(d / "missing.json", None)
-        self.assertEqual(s.sorter, "camera", "without a settings file the kiosk is self-service (no staff, no hardware)")
+        self.assertEqual((s.mode, s.serial_port, s.baud), ("esp32", "COM3", 115200))
 
     def test_committed_settings_file_is_valid(self):
         s, problems = cfgmod.load_settings(Path(__file__).resolve().parents[1] / "config" / "kiosk_settings.json")
         self.assertEqual(problems, [])
-        self.assertEqual(s.sorter, "camera")
+        self.assertEqual((s.mode, s.serial_port, s.baud, s.min_item_g, s.steady_ms, s.identify_timeout_s),
+                         ("esp32", "COM3", 115200, 3.0, 500, 3.0))
+
+    def test_rules_have_a_weight_limit_for_every_label(self):
+        import json
+        root = Path(__file__).resolve().parents[1]
+        rules = json.loads((root / "config" / "rules.json").read_text(encoding="utf-8"))
+        labels = json.loads((root / "config" / "waste_map.json").read_text(encoding="utf-8"))["map"]
+        self.assertEqual(sorted(set(labels) - set(rules["max_weight_g"])), [])
+        self.assertEqual(rules["bin_codes"], {"Biodegradable": "1", "Recyclable": "2", "Residual": "3"})
+        self.assertEqual((rules["unknown_policy"], rules["bin_warn_pct"], rules["bin_full_pct"]),
+                         ("residual_no_code", 90, 100))
+        self.assertEqual(rules["points"], {"Biodegradable": 15, "Recyclable": 10, "Residual": 5})
+        self.assertEqual(rules["qrExpiryMinutes"], 20)
 
 
 if __name__ == "__main__":

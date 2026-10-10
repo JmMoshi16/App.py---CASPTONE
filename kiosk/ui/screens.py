@@ -59,6 +59,18 @@ class View:
     debug: bool = False
     clock: str = ""
     seconds_to_ready: float = 0.0
+    # tray mode (esp32 / sim): the customer drops the item into a slot; there is no camera to face
+    tray: bool = False
+    weight: object = None                   # grams on the tray (live)
+    steady: bool = False
+    fill: object = None                     # (bio, rec, res) percent
+    bins_warn: list = field(default_factory=list)
+    pause_reason: object = None             # "bin_full" | "link"
+    notice: object = None                   # (title, message) for rejected / notice
+    weighing_hint: bool = False
+    serial_lines: list = field(default_factory=list)
+    tray_roi: list = field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
+    preview: object = None                  # camera frame for the diagnostics preview
     cooldown_left: float = 0.0              # camera mode: seconds until the next deposit may start
     drop_left: float = 0.0                  # camera mode: seconds left to drop the item
     drop_timeout: float = 15.0
@@ -101,6 +113,11 @@ class Renderer:
     def buttons(self):
         return self.ui.buttons
 
+    @property
+    def btn_h(self):
+        """Touch buttons are at least 80 px tall on every display."""
+        return max(self.m.px(56), 80)
+
     def hit(self, x, y):
         for x1, y1, x2, y2, action in reversed(self.ui.buttons):
             if x1 <= x <= x2 and y1 <= y <= y2:
@@ -127,6 +144,10 @@ class Renderer:
             return (("Reward codes are paused — the kiosk is offline. You can still recycle."
                      if v.automatic else "Reward codes are paused — the kiosk is offline. Please ask staff."),
                     "warning")
+        if v.tray and v.bins_warn and v.phase != "paused":
+            names = " and ".join(v.bins_warn)
+            return (f"The {names} bin{'s are' if len(v.bins_warn) > 1 else ' is'} almost full — staff, please empty "
+                    f"{'them' if len(v.bins_warn) > 1 else 'it'} soon.", "bin")
         return None
 
     # ── entry point ────────────────────────────────────────────────────────
@@ -140,7 +161,13 @@ class Renderer:
         L = self.layout(banner is not None)
         img = self._base(L, banner).copy()
         self._top_bar(img, v, L)
-        if v.phase in ("complete", "failed"):
+        if v.tray:
+            self._tray_hero(img, v, L, now)
+            if v.phase in ("complete", "failed"):
+                self._result(img, v, L, now)
+            else:
+                {"ready": self._ready, "qr": self._qr}.get(v.phase, self._tray_panel)(img, v, L, now)
+        elif v.phase in ("complete", "failed"):
             self._viewport(img, cam, v, L, dim=0.55)
             self._panel_card(img, L)
             self._result(img, v, L, now)
@@ -322,7 +349,9 @@ class Renderer:
         w = x2 - x1
         y = ui.overline(img, "Ready", x1, y) + px(10)
         y = ui.para(img, "Recycle your cup, earn points", x1, y, w, "title", C.ink, max_lines=2) + px(10)
-        body = ("Hold your item up to the camera, then drop it into the bin we show you."
+        body = ("Drop one item at a time into the slot. Cups must be empty to earn points."
+                if v.tray else
+                "Hold your item up to the camera, then drop it into the bin we show you."
                 if v.camera_only else
                 "Hold your item up to the camera. We'll sort it and give you a reward code."
                 if v.automatic else "Hold your item up to the camera. A staff member will confirm your deposit.")
@@ -434,7 +463,7 @@ class Renderer:
         pts = v.points.get(v.tx.waste_type, 0) if v.tx else 0
         y = ui.overline(img, "Your reward code", x1, y) + px(8)
         y = ui.para(img, f"Scan to collect +{pts} points", x1, y, w, "title_sm", C.ink, max_lines=2) + px(14)
-        buttons_h = px(56)
+        buttons_h = self.btn_h
         timer_h = px(52)
         fr = px(6)
         avail = (y2 - buttons_h - px(16) - timer_h - px(16)) - y - 2 * fr
@@ -466,6 +495,109 @@ class Renderer:
         done_w = px(120)
         ui.button(img, x1, by, x2 - done_w - px(12), y2, "No phone? Claim code", "receipt", "secondary", icon="receipt")
         ui.button(img, x2 - done_w, by, x2, y2, "Done", "dismiss", "ghost")
+
+    # ── tray mode (esp32 / sim): no camera to face; big state on the left, details on the right ──
+    def _tray_hero(self, img, v, L, now):
+        ui, px = self.ui, self.m.px
+        x1, y1, x2, y2 = L["view"]
+        cx, w = (x1 + x2) / 2, x2 - x1
+        tx = v.tx
+        waste = tx.waste_type if tx else None
+        cat = category(waste)
+        tone = {"ready": C.sage, "jam": C.error_tint, "paused": C.amber_tint if v.pause_reason == "bin_full"
+                else C.error_tint, "rejected": C.amber_tint}.get(v.phase, C.surface)
+        D.fill_rr(img, x1, y1, x2, y2, px(28), tone)
+        if v.phase == "qr":
+            self._qr_instructions(img, v, L)
+            return
+        if v.phase in ("complete", "failed"):
+            return
+        icon, fg, bg, title, sub = "arrow_down", C.forest, C.surface, "", ""
+        spin = False
+        if v.phase == "ready":
+            title, sub = "Drop one item into the slot", "We'll weigh it, recognise it and sort it for you."
+        elif v.phase in ("weighing", "identifying"):
+            spin = True
+            title = "Checking your item…"
+            sub = ("Please let go of the item." if v.weighing_hint else
+                   "Recognising it…" if v.phase == "identifying" else "Weighing it…")
+        elif v.phase == "sorting":
+            icon, fg, bg = cat["icon"], cat["color"], cat["tint"]
+            title = f"Sorting into {waste}…"
+            sub = ("This item won't earn points." if tx and tx.reject else
+                   f"+{v.points.get(waste, 0)} base points")
+        elif v.phase == "issuing":
+            icon, spin = "qr", True
+            title, sub = "Creating your reward code…", "Almost done."
+        elif v.phase == "rejected":
+            icon, fg, bg = "alert", C.amber_ink, C.surface
+            title = v.notice[1] if v.notice else "It went to Residual."
+            sub = "Thank you for recycling."
+        elif v.phase == "notice":
+            icon, fg, bg = ("check", C.forest, C.sage)
+            title = v.notice[0] if v.notice else "Thank you!"
+            sub = v.notice[1] if v.notice else ""
+        elif v.phase == "jam":
+            icon, fg, bg = "alert", C.error, C.surface
+            title, sub = "Item stuck. Please call staff.", "No code was issued for this item."
+        elif v.phase == "paused" and v.pause_reason == "bin_full":
+            icon, fg, bg = "bin", C.amber_ink, C.surface
+            title, sub = "A bin is full. Please call staff.", "The kiosk starts again once the bin is emptied."
+        elif v.phase == "paused":
+            icon, fg, bg, spin = "plug", C.error, C.surface, True
+            title, sub = "Out of service", "Reconnecting to the sorter…"
+        tile = px(168)
+        content_h = tile + px(36) + self.ts.line_height("display") * 2 + px(16) + self.ts.line_height("body_lg") * 2
+        y = y1 + max(px(32), ((y2 - y1) - content_h) / 2)
+        bounce = 0 if (self.m.reduce_motion or v.phase != "ready") else int(px(10) * math.sin(now * 2 * math.pi / 1.4))
+        D.fill_rr(img, cx - tile / 2, y, cx + tile / 2, y + tile, px(40), bg)
+        if spin:
+            ui.spinner(img, cx, y + tile / 2, tile * 0.32, fg, 8)
+            if icon != "arrow_down":
+                draw_icon_centered(img, icon, cx, y + tile / 2, int(tile * 0.34), fg)
+        else:
+            draw_icon_centered(img, icon, cx, y + tile / 2 + bounce, int(tile * 0.5), fg)
+        y += tile + px(36)
+        role = "display" if len(title) <= 34 else "title"
+        y = ui.para(img, title, cx, y, w - px(96), role, C.ink, max_lines=3, align="m") + px(16)
+        if sub:
+            ui.para(img, sub, cx, y, w - px(96), "body_lg", C.ink_2, max_lines=2, align="m")
+        if v.phase == "identifying":
+            ui.meter(img, cx - px(160), y2 - px(72), cx + px(160), v.lock_progress, C.forest, height=8)
+        if v.phase == "jam":
+            ui.text(img, "Staff: clear the tray, then press C", cx, y2 - px(48), "body", C.error_ink, "mt")
+
+    def _tray_panel(self, img, v, L, now):
+        ui, px = self.ui, self.m.px
+        x1, y, x2, y2 = self._inner(L)
+        w = x2 - x1
+        tx = v.tx
+        over = {"weighing": "Checking", "identifying": "Checking", "sorting": "Sorting", "issuing": "Your reward",
+                "rejected": "No reward for this item", "notice": "Sorted", "jam": "Item stuck",
+                "paused": "Paused"}.get(v.phase, "")
+        y = ui.overline(img, over, x1, y, C.error_ink if v.phase == "jam" else C.forest) + px(16)
+        grams = tx.grams if tx and tx.grams is not None else v.weight
+        if grams is not None and v.phase not in ("paused",):
+            ui.text(img, "Weight", x1, y, "body", C.ink_2)
+            ui.text(img, f"{max(0.0, grams):.0f} g", x2, y, "heading", C.ink, "rt")
+            y += px(40)
+        if tx and tx.waste_type and v.phase in ("sorting", "issuing", "notice", "rejected"):
+            suffix = "no points" if tx.reject or v.phase == "rejected" else f"+{v.points.get(tx.waste_type, 0)} base points"
+            ui.category_pill(img, x1, y, tx.waste_type, suffix)
+            y += px(56)
+        if tx and tx.label and v.phase in ("sorting", "issuing", "notice"):
+            ui.text(img, f"Recognised as “{tx.label}” · {tx.confidence * 100:.0f}%", x1, y, "caption", C.ink_2,
+                    max_w=w)
+            y += px(32)
+        if v.phase == "paused" and v.fill:
+            for name, pct in zip(("Biodegradable", "Recyclable", "Residual"), v.fill):
+                ui.text(img, name, x1, y, "body", C.ink)
+                ui.text(img, f"{pct} %", x2, y, "body_strong", C.error_ink if pct >= 100 else C.ink, "rt")
+                y = ui.meter(img, x1, y + px(30), x2, pct / 100, C.error if pct >= 100 else category(name)["color"]) \
+                    + px(16)
+        y += px(8)
+        if v.stages and v.phase != "paused":
+            ui.stepper(img, x1, max(y, y2 - len(v.stages) * px(52)), w, v.stages)
 
     # ── result moments ─────────────────────────────────────────────────────
     def _result(self, img, v, L, now):
@@ -527,7 +659,7 @@ class Renderer:
         if v.stages:
             ui.stepper(img, x, y, cw - pad * 2, v.stages, compact=True)
         bw = px(160)
-        ui.button(img, cx1 + cw - pad - bw, cy1 + ch - pad - px(56), cx1 + cw - pad, cy1 + ch - pad, "OK", "dismiss",
+        ui.button(img, cx1 + cw - pad - bw, cy1 + ch - pad - self.btn_h, cx1 + cw - pad, cy1 + ch - pad, "OK", "dismiss",
                   "primary")
         self._auto_return(img, v, cx1, cy1, cw, ch, pad, None, leave=bw + px(16))
 
@@ -567,7 +699,8 @@ class Renderer:
         ui.text(img, title, x1 + pad + px(64), y1 + pad - px(2), "heading", C.ink, max_w=w - pad * 2 - px(140))
         if subtitle:
             ui.text(img, subtitle, x1 + pad + px(64), y1 + pad + px(28), "caption", C.ink_2, max_w=w - pad * 2 - px(140))
-        ui.icon_button(img, x1 + w - pad - px(28), y1 + pad + px(24), "cross", "close")
+        size = max(56, 80 / self.m.s)                      # design units; at least 80 px on screen
+        ui.icon_button(img, x1 + w - pad - px(size / 2), y1 + pad + px(24), "cross", "close", size=size)
         return x1, y1, w, h, pad
 
     def _receipt(self, img, v):
@@ -591,7 +724,7 @@ class Renderer:
                          "Staff credit your points from the ECOReward admin site.", x, y, xr - x, "body", C.ink_2,
                     max_lines=3) + px(6)
         ui.text(img, f"Ref {str(v.tx.token)[:8].upper()} · single use", x, y, "caption", C.ink_3)
-        ui.button(img, x, y1 + h - pad - px(56), xr, y1 + h - pad, "Back to the QR code", "close", "secondary",
+        ui.button(img, x, y1 + h - pad - self.btn_h, xr, y1 + h - pad, "Back to the QR code", "close", "secondary",
                   icon="qr")
 
     def _history(self, img, v):
@@ -627,20 +760,58 @@ class Renderer:
 
     def _diagnostics(self, img, v):
         ui, px = self.ui, self.m.px
-        x1, y1, w, h, pad = self._modal_card(img, px(900), px(620), "info", "Diagnostics", "Staff view · press D to close")
-        col_w = (w - pad * 3) / 2
-        x = [x1 + pad, x1 + pad * 2 + col_w]
-        y = [y1 + pad + px(80)] * 2
-        for i, (section, rows) in enumerate(v.diagnostics):
-            c = 0 if y[0] <= y[1] else 1
-            yy = y[c]
-            ui.text(img, section.upper(), x[c], yy, "label", C.forest)
-            yy += px(26)
+        W, H = self.size
+        x1, y1, w, h, pad = self._modal_card(img, W - px(48), H - px(48), "info", "Diagnostics",
+                                             "Staff view · press D to close")
+        gap = px(24)
+        col_w = (w - pad * 2 - gap * 2) / 3
+        x = [x1 + pad, x1 + pad + col_w + gap, x1 + pad + 2 * (col_w + gap)]
+        top = y1 + pad + px(80)
+        # column 1: camera preview with the tray_roi rectangle, then live state
+        yy = top
+        ui.text(img, "CAMERA · TRAY_ROI", x[0], yy, "label", C.forest)
+        yy += px(26)
+        if v.preview is not None:
+            ph, pw = v.preview.shape[:2]
+            tw = int(col_w)
+            th = int(tw * ph / pw)
+            thumb = cv2.resize(v.preview, (tw, th), interpolation=cv2.INTER_AREA)
+            r = v.tray_roi
+            cv2.rectangle(thumb, (int(r[0] * tw), int(r[1] * th)), (int(r[2] * tw) - 1, int(r[3] * th) - 1),
+                          C.amber, max(2, px(3)))
+            D.paste_rr(img, thumb, int(x[0]), int(yy), px(12))
+            yy += th + px(14)
+        else:
+            ui.text(img, "No camera frame", x[0], yy, "caption", C.ink_2)
+            yy += px(30)
+        live = [("State", v.phase), ("Weight", f"{v.weight:.1f} g" if v.weight is not None else "—"),
+                ("Steady", "yes" if v.steady else "no"),
+                ("Fill bio / rec / res", " / ".join(f"{f} %" for f in v.fill) if v.fill else "—")]
+        for k, val in live:
+            ui.text(img, k, x[0], yy, "body", C.ink_2)
+            ui.text(img, str(val), x[0] + col_w, yy, "body_strong", C.ink, "rt")
+            yy += px(28)
+        # column 3: the last serial lines (without the 5-per-second weight stream)
+        yy = top
+        ui.text(img, "SERIAL · LAST 20", x[2], yy, "label", C.forest)
+        yy += px(26)
+        for line in (v.serial_lines[-20:] or ["No serial device in this mode"]):
+            ui.text(img, line, x[2], yy, "caption", C.ink if line.startswith("<") else C.ink_2, max_w=col_w)
+            yy += px(20)
+        # column 2: kiosk, model, camera, sorter, transaction (stops at the bottom of the card)
+        yy, bottom = top, y1 + h - pad
+        for section, rows in v.diagnostics:
+            if yy + px(48) > bottom:
+                break
+            ui.text(img, section.upper(), x[1], yy, "label", C.forest)
+            yy += px(24)
             for k, val in rows:
-                ui.text(img, k, x[c], yy, "caption", C.ink_2, max_w=col_w * 0.42)
-                ui.text(img, str(val), x[c] + col_w, yy, "caption", C.ink, "rt", max_w=col_w * 0.56)
-                yy += px(22)
-            y[c] = yy + px(14)
+                if yy + px(20) > bottom:
+                    break
+                ui.text(img, k, x[1], yy, "caption", C.ink_2, max_w=col_w * 0.42)
+                ui.text(img, str(val), x[1] + col_w, yy, "caption", C.ink, "rt", max_w=col_w * 0.56)
+                yy += px(20)
+            yy += px(10)
 
     # ── splash ─────────────────────────────────────────────────────────────
     def splash(self, progress):

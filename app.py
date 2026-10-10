@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""ECOReward Bin kiosk: camera -> YOLOv8 -> deposit confirmation -> Firestore token -> QR -> phone claim.
+"""ECOReward Bin kiosk: tray load cell -> YOLOv8 -> ESP32 sorts -> DONE -> Firestore token -> QR -> phone claim.
 
-    py -3.11 app.py                        self-service: the camera sees the item go in (no hardware, no staff)
-    py -3.11 app.py --sorter attendant     a staff member confirms each deposit with SPACE
-    py -3.11 app.py --sorter esp32         ESP32 servo + load cell over USB serial (README "ESP32 protocol")
-    py -3.11 app.py --no-hardware          simulated ESP32 for demos (labelled SIMULATION on screen)
-    py -3.11 app.py --fullscreen           fill the kiosk display
-    py -3.11 app.py --help                 every option; defaults live in config/kiosk_settings.json
+    py -3.11 app.py                        the bin (mode esp32 in config/kiosk_settings.json, COM3, full screen)
+    py -3.11 app.py --no-hardware          the same flow with a simulated ESP32 (SIMULATION; staff key I = item)
+    py -3.11 app.py --mode camera          testing without hardware: the camera sees the item leave
+    py -3.11 app.py --mode attendant       testing without hardware: staff confirm with SPACE
+    py -3.11 app.py --windowed --help      every option
 
-Staff keys (none are needed in normal use): SPACE confirm deposit (attendant mode) · R claim-code receipt · H history · D diagnostics ·
-Esc close · Q quit. Customers only need the touch screen (or nothing at all in ESP32 mode).
+Staff keys (never needed in normal use): D diagnostics · H history · R claim-code receipt · C clear a jam ·
+I place a simulated item (sim) · SPACE confirm (attendant) · Esc close · Q quit.
 
 Layout of the code: this file wires Firestore, the model and the camera to the pieces in kiosk/
 (config, hardware, flow, ui). The token contract with the phone app and the Firestore rules is in
@@ -44,9 +43,9 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kiosk_firestore import KioskFirestore, SERVER_TIMESTAMP as KIOSK_SERVER_TIMESTAMP  # noqa: E402
 from kiosk.config import load_settings  # noqa: E402
-from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SendSort, Sound, StopWatching,  # noqa: E402
-                        TransactionFlow, WatchToken)
-from kiosk.hardware import DeviceError, Fill, make_sorter  # noqa: E402
+from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SendSort, Sound, StopWatching, Tare,  # noqa: E402
+                        TransactionFlow, TrayConfig, TrayFlow, WatchToken)
+from kiosk.hardware import DEFAULT_BIN_CODES, Fill, LinkLost, make_sorter  # noqa: E402
 from kiosk.ui.screens import Renderer, View  # noqa: E402
 
 # ── Platform-safe beep ────────────────────────────────────────────────────────
@@ -214,6 +213,17 @@ POINTS_MAP = _RULES.get("points", {'Biodegradable': 15, 'Recyclable': 10, 'Resid
 # Model label (lower-cased) -> waste category; reviewed list lives in config/waste_map.json (audit M-22)
 WASTE_MAP = json.loads((_APP_DIR / "config" / "waste_map.json").read_text(encoding="utf-8"))["map"]
 MIN_BOX_CONF = 0.30
+# Bin machine rules (kiosk only; rules.json): ESP32 bin codes, weight limits per label, bin thresholds.
+BIN_CODES = {k: str(v) for k, v in _RULES.get("bin_codes", DEFAULT_BIN_CODES).items()}
+if set(BIN_CODES) != set(POINTS_MAP) or sorted(BIN_CODES.values()) != ["1", "2", "3"]:
+    print(f"[CONFIG] rules.json bin_codes {BIN_CODES} is not one code 1-3 per category; using the defaults")
+    BIN_CODES = dict(DEFAULT_BIN_CODES)
+MAX_WEIGHT_G = {str(k).lower(): float(v) for k, v in _RULES.get("max_weight_g", {"default": 500}).items()}
+UNKNOWN_POLICY = _RULES.get("unknown_policy", "residual_no_code")
+if UNKNOWN_POLICY != "residual_no_code":
+    print(f"[CONFIG] unknown_policy '{UNKNOWN_POLICY}' is not supported; using residual_no_code")
+BIN_WARN_PCT = int(_RULES.get("bin_warn_pct", 90))
+BIN_FULL_PCT = int(_RULES.get("bin_full_pct", 100))
 
 
 def unmapped_labels(m):
@@ -436,20 +446,40 @@ class BinsReporter:
 
 
 # ── Detection ─────────────────────────────────────────────────────────────────
-def detect(frame):
+def _iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def roi_box(frame, roi):
+    """Pixel box (x0, y0, x1, y1) of tray_roi (fractions) in this frame."""
+    h, w = frame.shape[:2]
+    return int(roi[0] * w), int(roi[1] * h), max(int(roi[0] * w) + 1, int(roi[2] * w)), \
+        max(int(roi[1] * h) + 1, int(roi[3] * h))
+
+
+def detect(frame, roi=None):
     """The most confident box at or above MIN_BOX_CONF in this frame, or None (audit M-20: one vote per
-    frame, so several weak boxes of one class cannot outvote a confident box of another)."""
+    frame, so several weak boxes of one class cannot outvote a confident box of another).
+    With `roi` (tray mode) only that part of the frame is analysed; `objects` counts boxes that do not overlap
+    the top box (IoU < 0.3), so one item seen as two classes is still one object."""
+    ox = oy = 0
+    if roi is not None:
+        ox, oy, x1, y1 = roi_box(frame, roi)
+        frame = frame[oy:y1, ox:x1]
     results = model(frame, conf=0.15, verbose=False)
-    box, conf = None, 0.0
-    for r in results:
-        for b in r.boxes:
-            c = float(b.conf[0])
-            if c >= MIN_BOX_CONF and c > conf:
-                box, conf = b, c
-    if box is None:
+    boxes = [b for r in results for b in r.boxes if float(b.conf[0]) >= MIN_BOX_CONF]
+    if not boxes:
         return None
+    box = max(boxes, key=lambda b: float(b.conf[0]))
+    xyxy = tuple(float(v) for v in box.xyxy[0])
+    objects = 1 + sum(1 for b in boxes if b is not box and _iou(xyxy, tuple(float(v) for v in b.xyxy[0])) < 0.3)
     label = str(model.names[int(box.cls[0])]).lower()
-    return Detection(label, WASTE_MAP.get(label), conf, tuple(float(v) for v in box.xyxy[0]))
+    full = (xyxy[0] + ox, xyxy[1] + oy, xyxy[2] + ox, xyxy[3] + oy)
+    return Detection(label, WASTE_MAP.get(label), float(box.conf[0]), full, objects)
 
 
 # ── Camera (reconnects instead of exiting — audit K-08) ───────────────────────
@@ -604,12 +634,18 @@ def _diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, star
         ("Transaction", [("Phase", flow.phase.value), ("Claimed this session", flow.completed),
                          ("Fonts", renderer.ts.source), ("Screen", f"{renderer.size[0]}×{renderer.size[1]}")]),
     ]
+    if settings.tray:
+        w = sorter.weight
+        rows.insert(0, ("Scale", [("Weight", f"{w:.1f} g" if w is not None else "—"),
+                                  ("Steady", "yes" if sorter.steady else "no"),
+                                  ("Item threshold", f"{settings.min_item_g:g} g"),
+                                  ("Fill (bio/rec/res)", " / ".join(f"{v} %" for v in flow.fill) if flow.fill else "—")]))
     if bins.latest:
         rows.append(("Fill levels (ESP32)", [(n, f"{v} %") for (_, n), v in zip(BinsReporter.KEYS, bins.latest)]))
     return rows
 
 
-def _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, now, wall, diagnostics):
+def _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, now, wall, diagnostics, frame=None):
     tx = flow.tx
     age = now - flow.since
     expires = tx.expires_at if tx else None
@@ -632,6 +668,17 @@ def _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, no
         cooldown_left=flow.cooldown_left(now),
         drop_left=max(0.0, settings.drop_timeout - age) if flow.phase == Phase.DROPPING else 0.0,
         drop_timeout=settings.drop_timeout,
+        tray=settings.tray,
+        weight=sorter.weight if settings.tray else None,
+        steady=sorter.steady if settings.tray else False,
+        fill=getattr(flow, "fill", None),
+        bins_warn=flow.bins_warn() if settings.tray else [],
+        pause_reason=getattr(flow, "pause_reason", None),
+        notice=getattr(flow, "notice", None),
+        weighing_hint=settings.tray and flow.hint(now),
+        serial_lines=list(sorter.recent_events),
+        tray_roi=settings.tray_roi,
+        preview=frame if overlay == "diagnostics" else None,
     )
 
 
@@ -643,24 +690,35 @@ def main(argv=None):
         log(f"[CONFIG] {p}")
     width, height = _screen_size() if settings.fullscreen else (settings.width, settings.height)
     renderer = _get_renderer(width, height, settings.reduce_motion)
-    sorter = make_sorter(settings.sorter, settings.serial_port, settings.serial_baud, log=log)
-    flow = TransactionFlow(FlowConfig(
-        mode=settings.sorter, points=POINTS_MAP, sort_ack_timeout=settings.sort_ack_timeout,
-        drop_confirm_timeout=settings.drop_confirm_timeout, issue_timeout=settings.issue_timeout,
-        qr_display_seconds=settings.qr_display_seconds, success_seconds=settings.success_seconds,
-        failure_seconds=settings.failure_seconds, lock_votes=settings.lock_votes,
-        rearm_clear_frames=settings.rearm_clear_frames, min_drop_grams=settings.min_drop_grams,
-        drop_clear_frames=settings.drop_clear_frames, drop_timeout=settings.drop_timeout,
-        cooldown_seconds=settings.cooldown_seconds, debug=settings.debug))
+    sorter = make_sorter(settings.mode, settings.serial_port, settings.baud, log=log,
+                         steady_ms=settings.steady_ms, tolerance_g=settings.steady_tolerance_g)
+    if settings.tray:
+        flow = TrayFlow(TrayConfig(
+            points=POINTS_MAP, bin_codes=BIN_CODES, max_weight_g=MAX_WEIGHT_G, min_item_g=settings.min_item_g,
+            steady_ms=settings.steady_ms, steady_tolerance_g=settings.steady_tolerance_g,
+            identify_timeout_s=settings.identify_timeout_s, ok_timeout_s=settings.ok_timeout_s,
+            drop_timeout_s=settings.drop_timeout_s, multi_item_frames=settings.multi_item_frames,
+            jam_clear_s=settings.jam_clear_s, auto_tare_idle_s=settings.auto_tare_idle_s,
+            bin_warn_pct=BIN_WARN_PCT, bin_full_pct=BIN_FULL_PCT, issue_timeout=settings.issue_timeout,
+            qr_display_seconds=settings.qr_display_seconds, success_seconds=settings.success_seconds,
+            failure_seconds=settings.failure_seconds))
+    else:
+        flow = TransactionFlow(FlowConfig(
+            mode=settings.mode, points=POINTS_MAP, issue_timeout=settings.issue_timeout,
+            qr_display_seconds=settings.qr_display_seconds, success_seconds=settings.success_seconds,
+            failure_seconds=settings.failure_seconds, lock_votes=settings.lock_votes,
+            rearm_clear_frames=settings.rearm_clear_frames, drop_clear_frames=settings.drop_clear_frames,
+            drop_timeout=settings.drop_timeout, cooldown_seconds=settings.cooldown_seconds, debug=settings.debug))
     camera = Camera(settings.camera_index)
     bins = BinsReporter(settings.bins_min_interval)
     results = queue.Queue()
     clicks = deque(maxlen=8)
 
     log("\n------------------------------------------")
-    log(f"  ECOReward Bin  |  {width}x{height}  |  sorter: {settings.sorter}"
-        f"{' (SIMULATED)' if sorter.simulated else ''}")
-    log("  SPACE confirm (staff)   R receipt   H history   D diagnostics   Q quit")
+    log(f"  ECOReward Bin  |  {width}x{height}  |  mode: {settings.mode}"
+        f"{' (SIMULATED)' if sorter.simulated else ''}"
+        f"{f'  |  {settings.serial_port} @ {settings.baud}' if settings.mode == 'esp32' else ''}")
+    log("  D diagnostics   H history   R receipt   C clear jam   I sim item   SPACE attendant   Q quit")
     log("------------------------------------------\n")
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
@@ -704,10 +762,15 @@ def main(argv=None):
             threading.Thread(target=go, daemon=True).start()
 
     def run(actions, now):
+        for line in flow.notices:            # what the flow decided, logged before its consequences
+            log(line)
+        flow.notices.clear()
         for a in actions:
             if isinstance(a, SendSort):
-                if not sorter.send_sort(a.waste_type):
-                    run(flow.on_sorter_event(DeviceError("The sorter is not connected"), now), now)
+                if not sorter.sort(a.code):
+                    run(flow.on_sorter_event(LinkLost("the ESP32 is not connected"), now), now)
+            elif isinstance(a, Tare):
+                sorter.tare()
             elif isinstance(a, IssueToken):
                 _scan_event.clear()   # new QR: forget any scan signal left over from the previous one
 
@@ -756,19 +819,17 @@ def main(argv=None):
                     else:
                         run(flow.on_issue_failed(tx_id, data, now), now)
                 for ev in sorter.poll(now):
-                    if isinstance(ev, Fill):
-                        if not sorter.simulated:
-                            bins.offer(ev, now)
-                        continue
+                    if isinstance(ev, Fill) and not sorter.simulated:
+                        bins.offer(ev, now)                   # Firestore bins/{kioskId}-bio|rec|res
                     run(flow.on_sorter_event(ev, now), now)
                 if flow.phase == Phase.QR and _scan_event.is_set():
                     _scan_event.clear()
                     run(flow.on_scanned(_active_token, now), now)
                 run(flow.tick(now, wall), now)
-                if fresh and flow.phase in (Phase.READY, Phase.DETECTED, Phase.DROPPING):
+                if fresh and flow.wants_frames:               # tray mode: only while IDENTIFYING
                     t0 = time.perf_counter()
                     try:
-                        det = detect(frame)
+                        det = detect(frame, settings.tray_roi if settings.tray else None)
                     except Exception as e:
                         det = None
                         _warn_once("inference", f"[AI ERROR] inference failed: {e}", every=60)
@@ -783,7 +844,7 @@ def main(argv=None):
                     modules_cache[tx.token] = qr_modules(tx.payload)
                 diag = (_diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, started, log_path,
                                      bad_labels, renderer) if overlay == "diagnostics" else [])
-                v = _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, now, wall, diag)
+                v = _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, now, wall, diag, frame)
                 t0 = time.perf_counter()
                 if flow.phase == Phase.QR:
                     display = draw_qr_panel(frame, None, tx.waste_type, POINTS_MAP[tx.waste_type], v.secs_left,
@@ -820,6 +881,10 @@ def main(argv=None):
                     overlay = None if overlay == "diagnostics" else "diagnostics"
                 elif key == 27:
                     overlay = None
+                elif key in (ord('c'), ord('C')):            # staff cleared a jammed tray by hand
+                    run(flow.staff_clear(now), now)
+                elif key in (ord('i'), ord('I')) and sorter.device is not None:
+                    log(f"[SIM] item placed on the tray: {sorter.device.place_item()} g")
             except Exception as e:
                 _warn_once(f"keys:{type(e).__name__}", f"[ERROR] {e}\n{traceback.format_exc()}", every=60)
 

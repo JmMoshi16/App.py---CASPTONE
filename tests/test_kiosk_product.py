@@ -106,38 +106,86 @@ def claim(db, token):
     db.deliver_snapshot("qr_tokens", token, {"usedBy": ["customer-1"]})
 
 
-class SimulatedSorterEndToEnd(unittest.TestCase):
-    def test_two_deposits_in_a_row_each_sorted_confirmed_issued_and_claimed(self):
+def fast_sim():
+    """make_sorter replacement: the real SerialSorter over a SimulatedESP32 running 4x faster."""
+    from kiosk.hardware import SerialSorter, SimulatedESP32
+    holder = {}
+
+    def make(*a, **k):
+        device = SimulatedESP32(speed=4.0)
+        s = SerialSorter("SIM", 115200, opener=lambda p, b: device, list_ports=lambda: [], log=k.get("log", print),
+                         retry_s=0.05, simulated=True)
+        s.device = holder["device"] = device
+        return s
+    return make, holder
+
+
+class TrayEndToEnd(unittest.TestCase):
+    """The bin flow through the real main(): load cell -> YOLO on the tray -> ESP32 sort -> DONE -> QR."""
+
+    def test_two_items_in_a_row_without_any_key(self):
         db = FakeFirestore()
-        present = [True]
-        state = {"done": 0, "away_since": None}
+        make, holder = fast_sim()
+        state = {"placed": 0, "claimed": 0}
+
+        def controller(n, seen):                       # never presses a key except Q to end the test
+            ph = phase(seen)
+            if ph == "ready" and state["placed"] == state["claimed"] and state["placed"] < 2:
+                holder["device"].place_item(15.0)      # a customer drops an empty can
+                state["placed"] += 1
+            if ph == "qr" and len(tokens(db)) > state["claimed"]:
+                claim(db, tokens(db)[state["claimed"]])
+                state["claimed"] += 1
+            if state["claimed"] == 2 and ph == "ready":
+                return ord("q")
+
+        out, seen, _ = drive(controller, db=db, settings={"mode": "sim", "success_seconds": 0.3},
+                             extra=[mock.patch.object(app, "make_sorter", make)], max_frames=3000)
+        self.assertEqual(len(tokens(db)), 2, out[-2000:])
+        order = [p for i, (p, _) in enumerate(seen) if i == 0 or seen[i - 1][0] != p]
+        one = ["ready", "weighing", "identifying", "sorting", "issuing", "qr", "complete"]
+        self.assertEqual(order[0], "paused", "out of service until the ESP32 answers PONG")
+        self.assertEqual(order[1:15], one + one, order)
+        self.assertLess(out.index("[DONE] #1"), out.index("[QR GENERATED]"), "a token was created before DONE")
+        self.assertIn("[ITEM] #1 on the tray: ", out)
+        self.assertIn("(SIMULATED)", out)
+        self.assertEqual([doc for _, doc in db.unsubscribed], tokens(db))
+
+    def test_staff_key_i_places_a_simulated_item(self):
+        make, holder = fast_sim()
+        state = {}
 
         def controller(n, seen):
             ph = phase(seen)
-            if ph == "qr" and len(tokens(db)) > state["done"]:
-                claim(db, tokens(db)[state["done"]])
-                state["done"] += 1
-            if ph == "complete":
-                present[0] = False                      # the customer leaves; the next one arrives later
-                state["away_since"] = n
-            if state["away_since"] is not None and n - state["away_since"] > 15 and ph == "ready":
-                present[0] = True
-                state["away_since"] = None
-            if state["done"] == 2 and ph == "ready":
+            if ph == "ready" and "pressed" not in state:
+                state["pressed"] = n
+                return ord("i")
+            if ph == "sorting":
                 return ord("q")
 
-        from kiosk.hardware import SimulatedSorter
-        fast = mock.patch.object(app, "make_sorter", lambda *a, **k: SimulatedSorter(ack_s=0.05, drop_s=0.12))
-        out, seen, _ = drive(controller, db=db, model=ScriptedModel(present), settings={"sorter": "sim"}, extra=[fast])
-        self.assertEqual(len(tokens(db)), 2, out)
-        self.assertEqual(out.count("[SCANNED]"), 2)
-        self.assertIn("[SCANNED] +10 pts | Total scans: 2", out)
-        order = [p for i, (p, _) in enumerate(seen) if i == 0 or seen[i - 1][0] != p]
-        one = ["detected", "sorting", "confirming", "issuing", "qr", "complete", "ready"]
-        self.assertEqual(order[:14], one + one, order)   # detection runs before the first frame is drawn
-        unsubscribed = [doc for _, doc in db.unsubscribed]
-        self.assertEqual(unsubscribed, tokens(db), "each QR's watcher must stop when it is claimed (K-10)")
-        self.assertIn("(SIMULATED)", out)
+        out, seen, _ = drive(controller, settings={"mode": "sim"}, extra=[mock.patch.object(app, "make_sorter", make)],
+                             max_frames=2000)
+        self.assertIn("[SIM] item placed on the tray:", out)
+        self.assertIn("sorting", [p for p, _ in seen])
+
+    def test_an_unrecognised_item_goes_to_residual_without_a_code(self):
+        db = FakeFirestore()
+        make, holder = fast_sim()
+        state = {}
+
+        def controller(n, seen):
+            ph = phase(seen)
+            if ph == "ready" and "placed" not in state:
+                state["placed"] = holder["device"].place_item(30.0)
+            if ph == "rejected":
+                return ord("q")
+
+        out, seen, _ = drive(controller, db=db, model=ScriptedModel([False]), settings={"mode": "sim"},
+                             extra=[mock.patch.object(app, "make_sorter", make)], max_frames=2000)
+        self.assertIn("[REJECT] #1 unknown", out)
+        self.assertIn("[DONE] #1 bin 3 (Residual)", out)
+        self.assertEqual(tokens(db), [])
+        self.assertNotIn("[QR GENERATED]", out)
 
 
 class CameraSelfServiceEndToEnd(unittest.TestCase):
@@ -348,7 +396,8 @@ class BinsTests(unittest.TestCase):
     def _sorter(self, simulated):
         from kiosk.hardware import Fill, LinkState
         s = types.SimpleNamespace(mode="esp32", simulated=simulated, state=LinkState.CONNECTED, detail="", port="COM3",
-                                  unparsed=0, recent=[], ready=True, send_sort=lambda w: True, close=lambda: None)
+                                  unparsed=0, recent=[], recent_events=[], ready=True, sort=lambda c: True,
+                                  tare=lambda: True, weight=None, steady=False, device=None, close=lambda: None)
         sent = {"done": False}
 
         def poll(now=None):
@@ -402,6 +451,16 @@ def _views():
         f.phase, f.failure = Phase(ph), failure
         return f.stages()
     fail = Failure("sorter_timeout", "The sorter didn't respond", "Please take your item and try again.")
+    from kiosk.flow import TrayConfig, TrayFlow
+
+    def tray_st(ph):
+        f = TrayFlow(TrayConfig())
+        f.phase = Phase(ph)
+        return f.stages()
+    tray_tx = types.SimpleNamespace(waste_type="Recyclable", grams=15.0, reject=None, label="can", confidence=0.91,
+                                    claim_code="4821", token=tx.token)
+    tray_reject = types.SimpleNamespace(waste_type="Residual", grams=120.0, label="cup", confidence=0.88,
+                                        reject=("too_heavy", "Cups must be empty to earn points. It went to Residual."))
     base = dict(points=pts, clock="10:42 AM")
     qr = dict(tx=tx, qr_modules=app.qr_modules(payload), secs_left=1080, total_secs=1200,
               expires_local="11:02 AM", issued_local="10:42 AM", issued_date="Oct 10, 2026", phase_age=5)
@@ -429,6 +488,34 @@ def _views():
         "history-empty": View(phase="ready", overlay="history", **base),
         "diagnostics": View(phase="ready", overlay="diagnostics", diagnostics=[("Kiosk", [("Name", "x")])], **base),
         "no-camera": View(phase="ready", camera_ok=False, toast=Toast("No item detected yet", "info", 2.0), **base),
+        "tray-ready": View(phase="ready", mode="esp32", tray=True, sorter_state="connected", stages=tray_st("ready"),
+                           **base),
+        "tray-weighing": View(phase="weighing", mode="esp32", tray=True, weight=14.2, weighing_hint=True,
+                              stages=tray_st("weighing"), **base),
+        "tray-identifying": View(phase="identifying", mode="sim", tray=True, weight=14.2, lock_progress=0.4,
+                                 tx=types.SimpleNamespace(waste_type=None, grams=14.2, reject=None, label=None,
+                                                          confidence=0.0), stages=tray_st("identifying"), **base),
+        "tray-sorting": View(phase="sorting", mode="esp32", tray=True, tx=tray_tx, stages=tray_st("sorting"), **base),
+        "tray-sorting-reject": View(phase="sorting", mode="esp32", tray=True, tx=tray_reject,
+                                    stages=tray_st("sorting"), **base),
+        "tray-rejected": View(phase="rejected", mode="esp32", tray=True, tx=tray_reject,
+                              notice=("Sorted into Residual", "Cups must be empty to earn points. It went to Residual."),
+                              stages=tray_st("rejected"), **base),
+        "tray-notice": View(phase="notice", mode="esp32", tray=True, tx=tray_tx, online=False,
+                            notice=("Sorted!", "Reward codes are offline right now."), stages=tray_st("notice"), **base),
+        "tray-jam": View(phase="jam", mode="esp32", tray=True, weight=15.0, stages=tray_st("jam"), **base),
+        "tray-bin-full": View(phase="paused", mode="esp32", tray=True, pause_reason="bin_full", fill=(100, 62, 30),
+                              **base),
+        "tray-out-of-service": View(phase="paused", mode="esp32", tray=True, pause_reason="link",
+                                    sorter_state="reconnecting", **base),
+        "tray-bin-warn": View(phase="ready", mode="esp32", tray=True, bins_warn=["Recyclable"], fill=(40, 93, 10),
+                              stages=tray_st("ready"), **base),
+        "tray-qr": View(phase="qr", mode="esp32", tray=True, stages=tray_st("qr"), **qr, **base),
+        "tray-complete": View(phase="complete", mode="esp32", tray=True, tx=tx, phase_age=5, seconds_to_ready=3, **base),
+        "tray-diagnostics": View(phase="ready", mode="sim", tray=True, overlay="diagnostics", weight=0.3, steady=True,
+                                 fill=(35, 50, 20), serial_lines=["> P", "< PONG", "> 2", "< OK:2", "< DONE:2:15.0"],
+                                 preview=np.full((480, 640, 3), 120, np.uint8), tray_roi=[0.2, 0.1, 0.8, 0.9],
+                                 diagnostics=[("Kiosk", [("Name", "x")])], **base),
         "model-mismatch": View(phase="detected", model_ok=False, detection=Detection("person", None, 0.9),
                                latest=Detection("person", None, 0.9, (10, 10, 600, 470)), **base),
     }
@@ -459,13 +546,15 @@ class ScreenTests(unittest.TestCase):
                 text, _, _ = detector.detectAndDecode(img)
                 self.assertEqual(text, payload)
 
-    def test_touch_targets_are_at_least_44_px_on_the_7_inch_screen(self):
+    def test_touch_buttons_are_at_least_80_px_tall_at_every_size(self):
         _, views = _views()
-        r = Renderer(1024, 600)
-        for name in ("qr", "receipt", "failed", "history"):
-            r.render(self.cam, views[name], 1.0, transition=False)
-            for x1, y1, x2, y2, action in r.buttons:
-                self.assertGreaterEqual(min(x2 - x1, y2 - y1), 44, f"{name}/{action} button is too small")
+        for w, h in self.SIZES:
+            r = Renderer(w, h)
+            for name in ("qr", "receipt", "failed", "history", "tray-qr", "diagnostics"):
+                r.render(self.cam, views[name], 1.0, transition=False)
+                self.assertTrue(r.buttons, name)
+                for x1, y1, x2, y2, action in r.buttons:
+                    self.assertGreaterEqual(y2 - y1, 80, f"{w}x{h} {name}/{action} button is too small")
 
     def test_text_colours_meet_wcag_aa(self):
         from kiosk.ui.theme import C

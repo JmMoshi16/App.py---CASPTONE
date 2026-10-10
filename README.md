@@ -21,11 +21,10 @@ The ECOReward system has 3 parts that share the same Firebase backend:
 
 ## What This Does
 
-1. Webcam feed runs through YOLOv8 (`best.pt`) to detect waste items (confidence ≥ 0.30, 7-frame majority vote)
+1. A webcam inside the chamber looks down at the tray; YOLOv8 (`best.pt`) recognises the item (confidence ≥ 0.30, 7-frame majority vote)
 2. Detected item is classified as **Biodegradable**, **Recyclable**, or **Residual** (`config/waste_map.json`)
-3. The deposit is confirmed without anyone pressing a key: the screen names the bin and the kiosk waits until
-   the item has left the camera's view (camera mode, the default); with the ESP32 sorter, the **servo
-   acknowledges and the load cell registers the drop**. (Attendant mode, where staff press SPACE, still exists.)
+3. The customer drops one item onto a tray that sits on a load cell; once the weight is steady, YOLO identifies it
+   on the tray crop and the ESP32 sorts it into the right bin and reports `DONE` (see "How a deposit works")
 4. Only then a UUID token is written to Firestore `qr_tokens`; the QR (`ECOBIN:{wasteType}:{token}`) is shown
    only after that write succeeded
 5. User scans the QR with the Flutter app → the app credits points → the kiosk sees the claim and shows "Claimed!"
@@ -154,73 +153,128 @@ copy runs\detect\ecoreward_cafe-2\weights\best.pt best.pt
 
 ### 7. Run the kiosk
 ```bash
-py -3.11 app.py                              # self-service (camera mode), 1280x720 window
-py -3.11 app.py --fullscreen                 # fill the kiosk display (1024x600 panel, laptop, monitor)
-py -3.11 app.py --sorter esp32 --fullscreen  # ESP32 servo + load cell (see "ESP32 protocol")
-py -3.11 app.py --no-hardware                # simulated ESP32 for demos — labelled SIMULATION on screen
-py -3.11 app.py --help                       # every option
+py -3.11 app.py                                  # the bin: mode esp32 on COM3, full screen (config/kiosk_settings.json)
+py -3.11 app.py --no-hardware --windowed         # the same flow with a simulated ESP32 (SIMULATION on screen)
+py -3.11 app.py --mode camera --windowed         # testing without hardware: the camera sees the item leave
+py -3.11 app.py --mode attendant --windowed      # testing without hardware: staff press SPACE
+py -3.11 app.py --help                           # every option
 ```
 
-| Sorter mode | Who confirms the deposit | Use it when |
+| Mode | What confirms a deposit | Use it for |
 |---|---|---|
-| `camera` (default) | nobody: the screen says which bin; the item leaving the camera's view counts as the drop | the kiosk runs alone and the ESP32 is not ready yet |
-| `esp32` | the ESP32: servo `OK`, then the load-cell weight | the firmware speaks the protocol below |
-| `sim` | a scripted ESP32 (OK after 0.6 s, 42 g after 1.6 s) | demos and tests; never writes sensor data to Firestore |
-| `attendant` | a staff member presses **SPACE** | a staff member stands at the kiosk |
+| `esp32` (default) | the ESP32: `DONE:<n>:<grams>` after the tray tipped the item into bin n | the real bin |
+| `sim` | a simulated ESP32 that speaks the same protocol over the same parser | demos, the defense, development |
+| `camera` | the camera sees the item leave its view (cannot prove it went in; 15 s cool-down) | testing without hardware |
+| `attendant` | a staff member presses **SPACE** | testing without hardware |
 
-**Camera mode cannot prove the item went into the bin** — someone could show a cup and pull it back out of view.
-It therefore needs the item to stay out of view for `drop_clear_frames` (8) frames in a row, gives up after
-`drop_timeout` (15 s), waits `cooldown_seconds` (15 s) between codes, and starts only while the kiosk is online.
-The ESP32 load cell is what makes deposits trustworthy; switch to `"sorter": "esp32"` once the firmware is confirmed.
+Defaults live in `config/kiosk_settings.json` and the bin rules in `config/rules.json`; command-line flags
+override the settings. Older settings files still work (missing keys get defaults; `sorter` and `serial_baud`
+are read as `mode` and `baud`).
 
-Defaults live in `config/kiosk_settings.json` (display size, camera index, sorter mode, serial port, timeouts,
-reduced motion, sounds); command-line flags override them. If the internet drops, the ESP32 still sorts and the
-kiosk explains that no reward code could be created; camera mode does not start a deposit while offline, and in
-attendant mode SPACE is refused.
-
-### 8. Run the tests (no camera, no Firebase, no model needed)
+### 8. Run the tests (no camera, no Firebase, no model, no ESP32 needed)
 ```bash
 py -3.11 -I -m unittest discover -s tests -v
 ```
-They replace Firebase, the YOLO model and the camera window with fakes and exercise the real main loop.
+They replace Firebase, the YOLO model, the camera window and the ESP32 with fakes and exercise the real main loop.
+
+---
+
+## How a deposit works (modes `esp32` and `sim`)
+
+The customer drops **one** item through the slot onto the tray. Everything after that is automatic, and no
+reward code can exist before the ESP32 reports that the item left the tray (`DONE`).
+
+1. **Ready** — "Drop one item into the slot". YOLO does **not** run; the kiosk watches the weight (`W:` every 200 ms).
+2. **Weighing** — an item is present when the weight is above `min_item_g` (3 g) and stays within
+   `steady_tolerance_g` (1 g) for `steady_ms` (500 ms). A hand in the slot keeps it waiting ("Checking your item…").
+3. **Identifying** — YOLO runs on the `tray_roi` crop: confidence ≥ 0.30, majority of 7 frames, at most
+   `identify_timeout_s` (3 s). The label maps to a category through `config/waste_map.json`.
+4. **Decide** — the customer cannot reach the tray, so rejected items still go to **Residual**, without a code:
+   - not recognised (no majority, timeout, or a label not in the map) → "We couldn't recognise this item. It went to Residual."
+   - heavier than `max_weight_g` for that label (`rules.json`, e.g. a cup with drink left) → "Cups must be empty to earn points."
+   - two or more separate objects in 3 of the 7 frames → "One item at a time, please."
+5. **Sorting** — the kiosk sends the bin code (`rules.json` `bin_codes`: 1 Biodegradable, 2 Recyclable,
+   3 Residual) and shows "Sorting into <Category>…". It needs `OK:<n>` within `ok_timeout_s` (3 s), then
+   `DONE:<n>:<grams>` within `drop_timeout_s` (4 s). `JAM:<n>`, a wrong bin number or a timeout → **Item stuck**.
+6. **Reward** (only after `DONE`):
+   - earns points and Firebase is online → the token is saved in the background; the QR appears only after the
+     save succeeded (20-minute expiry; leaves the screen after 3 minutes; "No phone? Claim code"; "Done"; "Claimed!").
+   - earns no points → "Thank you! This item doesn't earn points." (3 s).
+   - Firebase offline → "Sorted! Reward codes are offline right now." (3 s).
+7. **Back to Ready** only when the scale reads below `min_item_g`; a heavier reading is a new item and is weighed.
+
+**Item stuck** shows "Please call staff" and issues nothing; it ends when staff press **C** after clearing the
+tray, or when the scale reads empty for 10 s. **Fill levels** (`FILL:` after each drop) go to Firestore
+`bins/{kioskId}-bio|rec|res`; at `bin_warn_pct` (90 %) a small "bin almost full" banner appears, at
+`bin_full_pct` (100 %) the kiosk **pauses** ("A bin is full. Please call staff.") until every bin reads below
+100 %. If the ESP32 stops answering (unplugged, or silent for 3 s and no answer to a ping) the kiosk shows
+**Out of service**, retries every 2 s, and resumes when it answers `PONG`; a deposit in progress issues no code.
+**Auto-tare:** in Ready, with a steady scale reading under 5 g and nothing placed for 60 s, the kiosk sends `T`.
+Weights and reject reasons go to `logs/kiosk.log` only (never to Firestore).
+
+### Testing the whole flow in sim mode
+```bash
+py -3.11 app.py --no-hardware --windowed
+```
+1. Wait for "Drop one item into the slot" (the simulated ESP32 answers `PONG` within a second).
+2. Hold an item (or a photo of one) under the webcam, then press **I**: a random 8–45 g item lands on the tray.
+   With nothing recognisable under the camera you will see the "couldn't recognise → Residual" path instead.
+3. Watch Checking → Sorting into <Category> → (with Firebase) the QR; scan it with the app, or tap **Done**.
+4. Press **D** for diagnostics: live weight, steady flag, state, the last serial lines, fill levels and the
+   camera preview with the `tray_roi` rectangle (adjust `tray_roi` in `config/kiosk_settings.json` until it
+   frames the tray). The simulated fill levels rise by 1–4 % per drop; they are never written to Firestore.
 
 ---
 
 ## Controls
 
-Customers only use the touch screen (**No phone? Claim code**, **Done**, **OK**, **Back to the QR code**).
-Staff keys:
+Customers only use the touch screen (**No phone? Claim code**, **Done**, **OK**, **Back to the QR code**);
+buttons are at least 80 px tall. Staff keys:
 
 | Key | Action |
 |-----|--------|
-| `SPACE` | Confirm the deposit (attendant mode only). In camera/`esp32`/`sim` mode only with `--debug` (manual start) |
-| `R` | Show / hide the claim-code receipt (while a QR is shown) |
+| `D` | Diagnostics: weight, steady, state, last 20 serial lines, fill %, camera preview with `tray_roi`, model, Firestore |
 | `H` | Session history (codes claimed since the kiosk started) |
-| `D` | Diagnostics: Firestore mode, model + SHA-256, camera FPS, inference ms, sorter port/state/last lines, fill levels |
+| `R` | Show / hide the claim-code receipt (while a QR is shown) |
+| `C` | After clearing a jammed tray by hand: back to Ready |
+| `I` | Sim mode: place a simulated item on the tray |
+| `SPACE` | Attendant mode: confirm the deposit (camera mode with `--debug`: manual start) |
 | `Esc` | Close the overlay |
-| `Q` | Quit (closing the window also quits cleanly) |
+| `Q` | Quit (closing the window also quits; the camera and serial port are released and the kiosk is marked offline) |
 
-A QR stays up until it is scanned, **Done** is tapped, it expires, or 3 minutes pass without a scan
-(`qr_display_seconds`) — the code itself stays valid for the full 20 minutes.
+## ESP32 protocol (modes `esp32` and `sim`)
 
-## ESP32 protocol (sorter mode `esp32`)
-
-> **Assumption — confirm against the firmware.** No sketch is in this repository; this is the protocol the kiosk
-> implements (`kiosk/hardware.py`). Lines are ASCII, newline-terminated, 115200 baud by default.
+> **Assumption — no ESP32 sketch is in this repository.** This is the protocol the kiosk implements
+> (`kiosk/hardware.py`); the firmware must match it. ASCII, one message per line ending in `\n`, 115200 baud.
 
 | Direction | Line | Meaning |
 |---|---|---|
-| kiosk → ESP32 | `1` / `2` / `3` | move the chute to Biodegradable / Recyclable / Residual |
-| ESP32 → kiosk | `OK` (or `ACK`) | the servo reached the chute (kiosk waits ≤ 5 s) |
-| ESP32 → kiosk | `W:<grams>` e.g. `W:42.5` | HX711 reading after the drop (kiosk waits ≤ 10 s; < 5 g = nothing dropped) |
-| ESP32 → kiosk | `F:<bio>,<rec>,<res>` e.g. `F:45,22,68` | HC-SR04 fill levels in % — written to `bins/{kioskId}-bio/rec/res` for the web dashboard |
-| ESP32 → kiosk | `ERR:<text>` | a fault; the customer sees "The sorter reported a problem" |
+| app → ESP32 | `1` / `2` / `3` | sort into Biodegradable / Recyclable / Residual (`rules.json` `bin_codes`) |
+| app → ESP32 | `T` | tare the scale |
+| app → ESP32 | `P` | ping |
+| ESP32 → app | `READY` | booted, chute at its home position |
+| ESP32 → app | `W:<grams>` | weight, about every 200 ms (negative values after a tare are fine) |
+| ESP32 → app | `OK:<n>` | the chute points at bin n |
+| ESP32 → app | `DONE:<n>:<grams>` | the item left the tray into bin n (grams = weight before tipping) |
+| ESP32 → app | `JAM:<n>` | the tray tipped but the weight did not drop |
+| ESP32 → app | `FILL:<b>,<r>,<s>` | fill percent of bins 1, 2, 3 |
+| ESP32 → app | `PONG` / `ERR:<text>` | answer to `P` / a fault |
 
-Firmware checklist: print `OK` once the servo is in place; print one `W:` line after the weight settles;
-send `F:` every ~10 s; never move the servo without a command. The kiosk never sends a command when it
-connects or reconnects, drops commands queued while the ESP32 was unplugged, and finds the port automatically
-(CP210x, CH340, FTDI or ESP32-S native USB) unless `serial_port` / `--port COM3` is set. PySerial is required:
-`py -3.11 -m pip install pyserial`. The `bins` writes need the rules in `firebase/firestore.rules` to be deployed.
+**Firmware checklist**
+1. On boot: home the chute, then send `READY`.
+2. Stream `W:<grams>` about every 200 ms, always — also while sorting.
+3. Answer `P` with `PONG` immediately; on `T`, tare the HX711.
+4. On `n` (1, 2 or 3): move the MG996R chute to bin n's angle and wait 500 ms → send `OK:n` → tip the tray servo
+   → wait until the weight is below 2 g (if that takes more than 3 s: send `JAM:n` and stop) → return the tray →
+   send `DONE:n:<weight before tipping>` → measure bin n's HC-SR04 and send `FILL:<b>,<r>,<s>`.
+5. Ignore a new `n` while a sort is running. Never move a servo without a command.
+6. Wiring: the servos on their own 5 V supply with grounds tied to the ESP32 GND; each HC-SR04 echo pin through a
+   voltage divider to 3.3 V.
+7. Confirm the bin mapping **1 = Biodegradable, 2 = Recyclable, 3 = Residual** (or change `bin_codes` in `config/rules.json`).
+
+The kiosk only marks the ESP32 ready after `PONG`, sends nothing but `P` when it (re)connects, drops commands
+queued while it was unplugged, and logs the link state only when it changes. PySerial is required on the kiosk
+PC: `py -3.11 -m pip install pyserial`. The `bins` writes need the rules in `firebase/firestore.rules` deployed.
 
 ## Faster inference (OpenVINO, optional)
 

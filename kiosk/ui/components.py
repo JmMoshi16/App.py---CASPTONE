@@ -192,7 +192,7 @@ class UI:
     # ── messages ───────────────────────────────────────────────────────────
     def banner(self, img, x1, y1, x2, y2, text, kind):
         bg, fg, icon = {"warning": (C.amber, C.ink, "wifi_off"), "error": (C.error, C.white, "alert"),
-                        "info": (C.sage, C.ink, "info")}[kind]
+                        "info": (C.sage, C.ink, "info"), "bin": (C.amber_tint, C.amber_ink, "bin")}[kind]
         D.blend_rect(img, x1, y1, x2, y2, bg, 1)
         ic = self.px(20)
         tw = self.t.measure(text, "body_strong")
