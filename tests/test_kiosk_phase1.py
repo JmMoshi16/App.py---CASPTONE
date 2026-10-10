@@ -115,8 +115,11 @@ def _install_fakes():
     """Replace heavy / external modules BEFORE app.py is imported."""
     # Never pick up a real kiosk identity from this PC's ~/.ecoreward/kiosk.json during tests.
     os.environ["ECOREWARD_KIOSK_CONFIG"] = str(Path(tempfile.gettempdir()) / "ecoreward-tests-no-kiosk.json")
-    # Built-in defaults (1280x720 window, attendant mode) whatever config/kiosk_settings.json says; logs to temp.
-    os.environ["ECOREWARD_KIOSK_SETTINGS"] = str(Path(tempfile.gettempdir()) / "ecoreward-tests-no-settings.json")
+    # These tests drive the staff-confirm (attendant) flow with SPACE, whatever config/kiosk_settings.json says;
+    # otherwise built-in defaults (1280x720 window). Logs go to temp.
+    settings = Path(tempfile.mkdtemp()) / "ecoreward-tests-settings.json"
+    settings.write_text('{"sorter": "attendant", "sounds": false}', encoding="utf-8")
+    os.environ["ECOREWARD_KIOSK_SETTINGS"] = str(settings)
     os.environ["ECOREWARD_LOG_DIR"] = str(Path(tempfile.gettempdir()) / "ecoreward-tests-logs")
     class _NoCredential:
         def __init__(self, *a, **k):

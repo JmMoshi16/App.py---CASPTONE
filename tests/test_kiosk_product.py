@@ -53,7 +53,8 @@ def drive(controller, *, model=None, db=None, settings=None, max_frames=900, inl
     Returns (stdout, seen, mouse_callback_holder)."""
     seen, mouse = [], {}
     calls = {"n": 0}
-    s = {"width": 1280, "height": 720, "sounds": False, "success_seconds": 0.3, "failure_seconds": 0.3}
+    s = {"width": 1280, "height": 720, "sounds": False, "success_seconds": 0.3, "failure_seconds": 0.3,
+         "sorter": "attendant"}
     s.update(settings or {})
     tmp = Path(tempfile.mkdtemp()) / "settings.json"
     tmp.write_text(json.dumps(s), encoding="utf-8")
@@ -137,6 +138,27 @@ class SimulatedSorterEndToEnd(unittest.TestCase):
         unsubscribed = [doc for _, doc in db.unsubscribed]
         self.assertEqual(unsubscribed, tokens(db), "each QR's watcher must stop when it is claimed (K-10)")
         self.assertIn("(SIMULATED)", out)
+
+
+class CameraSelfServiceEndToEnd(unittest.TestCase):
+    def test_a_customer_alone_gets_a_code_without_any_key(self):
+        db = FakeFirestore()
+        present = [True]
+
+        def controller(n, seen):                       # never presses a key except Q to end the test
+            ph = phase(seen)
+            if ph == "dropping" and n > 12:
+                present[0] = False                      # the customer drops the cup into the bin
+            if ph == "qr" and not db.unsubscribed:
+                claim(db, tokens(db)[0])
+            if ph == "ready" and any(p == "complete" for p, _ in seen):
+                return ord("q")
+
+        out, seen, _ = drive(controller, db=db, model=ScriptedModel(present), settings={"sorter": "camera"})
+        order = [p for i, (p, _) in enumerate(seen) if i == 0 or seen[i - 1][0] != p]
+        self.assertEqual(order[:6], ["detected", "dropping", "issuing", "qr", "complete", "ready"], order)
+        self.assertEqual(len(tokens(db)), 1)
+        self.assertIn("[SCANNED] +10 pts | Total scans: 1", out)
 
 
 class TokenContractTests(unittest.TestCase):
@@ -393,6 +415,10 @@ def _views():
         "sorting-sim": View(phase="sorting", mode="sim", sorter_state="connected", tx=tx,
                             stages=stages("sim", "sorting"), **base),
         "issuing": View(phase="issuing", tx=tx, stages=stages("attendant", "issuing"), **base),
+        "dropping-camera": View(phase="dropping", mode="camera", tx=tx, drop_left=11.0, drop_timeout=15.0,
+                                stages=stages("camera", "dropping"), **base),
+        "detected-cooldown": View(phase="detected", mode="camera", detection=det, latest=det, cooldown_left=9.0,
+                                  stages=stages("camera", "detected"), **base),
         "qr": View(phase="qr", stages=stages("attendant", "qr"), **qr, **base),
         "receipt": View(phase="qr", overlay="receipt", stages=stages("attendant", "qr"), **qr, **base),
         "complete": View(phase="complete", tx=tx, phase_age=5, seconds_to_ready=3, **base),

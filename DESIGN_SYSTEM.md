@@ -111,7 +111,7 @@ Minimum rendered size 13 px after scaling. Line height 1.25 (display 1.1).
 | **Card** | surface, radius 20, border, card shadow, padding 24. |
 | **Button** | min height 56, radius 14, label `body_lg` 600. Primary = forest/white; secondary = white/ink with border; ghost = text only. Pressed = darker fill for 120 ms. Every button has a keyboard equivalent for staff. |
 | **CategoryBadge** | tinted pill, icon + category word in the category colour; large variant 64 px icon tile. |
-| **Stepper** | vertical list of the stages the sorter mode supports: done (check, forest), active (spinner, ink, bold), pending (hollow circle, ink_3). |
+| **Stepper** | vertical list of the stages the sorter mode supports (camera: Identify → Drop it into the bin → Code; ESP32: Identify → Sort → Confirm drop → Code; attendant: Identify → Staff confirms → Code): done (check, forest), active (spinner, ink, bold), pending (hollow circle, ink_3). |
 | **ProgressBar / Meter** | 8 px track `sunken`, fill category or forest, rounded ends; label + value in text. |
 | **Spinner** | 270° arc, 3 px, 1.2 s per turn; static "…" in reduced motion. |
 | **CountdownRing** | ring 6 px; forest → amber (< 5 min) → error (< 1 min); time as text inside. |
@@ -138,7 +138,7 @@ All motion is computed from `time.monotonic()` inside the frame — nothing slee
 
 ## 8. Interaction
 
-- Customers never need a key. Touch targets ≥ 56 px; taps are handled through the OpenCV mouse callback.
+- Customers never need a key; in the default camera mode nobody does. Touch targets ≥ 56 px; taps are handled through the OpenCV mouse callback.
 - Staff keys: **SPACE** confirm deposit (attendant mode), **R** receipt, **H** history, **D** diagnostics,
   **Esc** close overlay, **Q** quit.
 - Every action gets feedback within one frame (pressed state, toast or stage change).

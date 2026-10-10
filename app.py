@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """ECOReward Bin kiosk: camera -> YOLOv8 -> deposit confirmation -> Firestore token -> QR -> phone claim.
 
-    py -3.11 app.py                        staff confirm deposits with SPACE (no sorter hardware)
+    py -3.11 app.py                        self-service: the camera sees the item go in (no hardware, no staff)
+    py -3.11 app.py --sorter attendant     a staff member confirms each deposit with SPACE
     py -3.11 app.py --sorter esp32         ESP32 servo + load cell over USB serial (README "ESP32 protocol")
     py -3.11 app.py --no-hardware          simulated ESP32 for demos (labelled SIMULATION on screen)
     py -3.11 app.py --fullscreen           fill the kiosk display
     py -3.11 app.py --help                 every option; defaults live in config/kiosk_settings.json
 
-Staff keys: SPACE confirm deposit (attendant mode) · R claim-code receipt · H history · D diagnostics ·
+Staff keys (none are needed in normal use): SPACE confirm deposit (attendant mode) · R claim-code receipt · H history · D diagnostics ·
 Esc close · Q quit. Customers only need the touch screen (or nothing at all in ESP32 mode).
 
 Layout of the code: this file wires Firestore, the model and the camera to the pieces in kiosk/
@@ -628,6 +629,9 @@ def _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, no
         seconds_to_ready=max(0.0, (settings.success_seconds if flow.phase == Phase.COMPLETE
                                    else settings.failure_seconds) - age),
         diagnostics=diagnostics,
+        cooldown_left=flow.cooldown_left(now),
+        drop_left=max(0.0, settings.drop_timeout - age) if flow.phase == Phase.DROPPING else 0.0,
+        drop_timeout=settings.drop_timeout,
     )
 
 
@@ -646,7 +650,8 @@ def main(argv=None):
         qr_display_seconds=settings.qr_display_seconds, success_seconds=settings.success_seconds,
         failure_seconds=settings.failure_seconds, lock_votes=settings.lock_votes,
         rearm_clear_frames=settings.rearm_clear_frames, min_drop_grams=settings.min_drop_grams,
-        debug=settings.debug))
+        drop_clear_frames=settings.drop_clear_frames, drop_timeout=settings.drop_timeout,
+        cooldown_seconds=settings.cooldown_seconds, debug=settings.debug))
     camera = Camera(settings.camera_index)
     bins = BinsReporter(settings.bins_min_interval)
     results = queue.Queue()
@@ -760,7 +765,7 @@ def main(argv=None):
                     _scan_event.clear()
                     run(flow.on_scanned(_active_token, now), now)
                 run(flow.tick(now, wall), now)
-                if fresh and flow.phase in (Phase.READY, Phase.DETECTED):
+                if fresh and flow.phase in (Phase.READY, Phase.DETECTED, Phase.DROPPING):
                     t0 = time.perf_counter()
                     try:
                         det = detect(frame)

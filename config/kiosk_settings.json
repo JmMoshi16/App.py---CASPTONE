@@ -1,12 +1,12 @@
 {
-  "_comment": "Kiosk settings (no secrets). Command-line flags override these; see README 'Running the kiosk'. sorter: attendant = staff confirm with SPACE (no hardware), esp32 = servo + load cell over USB serial, sim = simulated ESP32 (labelled SIMULATION).",
+  "_comment": "Kiosk settings (no secrets). Command-line flags override these; see README 'Running the kiosk'. sorter: camera = self-service, the camera sees the item go in (no hardware, no staff), attendant = staff confirm with SPACE, esp32 = servo + load cell over USB serial, sim = simulated ESP32 (labelled SIMULATION).",
   "width": 1280,
   "height": 720,
   "fullscreen": false,
   "reduce_motion": false,
   "sounds": true,
   "camera_index": 0,
-  "sorter": "attendant",
+  "sorter": "camera",
   "serial_port": "auto",
   "serial_baud": 115200,
   "sort_ack_timeout": 5.0,
@@ -18,6 +18,9 @@
   "lock_votes": 5,
   "rearm_clear_frames": 10,
   "min_drop_grams": 5.0,
+  "drop_clear_frames": 8,
+  "drop_timeout": 15.0,
+  "cooldown_seconds": 15.0,
   "bins_min_interval": 60.0,
   "log_dir": "logs"
 }

@@ -23,8 +23,9 @@ The ECOReward system has 3 parts that share the same Firebase backend:
 
 1. Webcam feed runs through YOLOv8 (`best.pt`) to detect waste items (confidence ≥ 0.30, 7-frame majority vote)
 2. Detected item is classified as **Biodegradable**, **Recyclable**, or **Residual** (`config/waste_map.json`)
-3. The deposit is confirmed — by a **staff member pressing SPACE** (attendant mode, the default) or, with the
-   ESP32 sorter, by the **servo acknowledging and the load cell registering the drop**
+3. The deposit is confirmed without anyone pressing a key: the screen names the bin and the kiosk waits until
+   the item has left the camera's view (camera mode, the default); with the ESP32 sorter, the **servo
+   acknowledges and the load cell registers the drop**. (Attendant mode, where staff press SPACE, still exists.)
 4. Only then a UUID token is written to Firestore `qr_tokens`; the QR (`ECOBIN:{wasteType}:{token}`) is shown
    only after that write succeeded
 5. User scans the QR with the Flutter app → the app credits points → the kiosk sees the claim and shows "Claimed!"
@@ -130,8 +131,8 @@ If there is **no** `kiosk.json`, the scanner still falls back to this key (legac
 Lookup order: `ECOREWARD_KIOSK_CONFIG` / `~/.ecoreward/kiosk.json` (kiosk identity) → `GOOGLE_APPLICATION_CREDENTIALS`
 → `~/.ecoreward/kiosk-sa.json` → *(legacy, deprecated)* `serviceAccountKey.json[.json]` next to `app.py`.
 
-If no credential is found the scanner runs **OFFLINE**: a red banner is shown and SPACE will **not** issue
-QR codes, because a QR for a token that was never stored can never be redeemed.
+If no credential is found the scanner runs **OFFLINE**: a banner is shown and **no** QR codes are issued,
+because a QR for a token that was never stored can never be redeemed.
 
 > ⚠️ Never commit, zip, e-mail or chat the key. If it was ever in a shared folder, create a new key and
 > **delete the old key ID** (Google Cloud Console → IAM & Admin → Service Accounts → Keys). Deleting the
@@ -153,7 +154,7 @@ copy runs\detect\ecoreward_cafe-2\weights\best.pt best.pt
 
 ### 7. Run the kiosk
 ```bash
-py -3.11 app.py                              # attendant mode, 1280x720 window
+py -3.11 app.py                              # self-service (camera mode), 1280x720 window
 py -3.11 app.py --fullscreen                 # fill the kiosk display (1024x600 panel, laptop, monitor)
 py -3.11 app.py --sorter esp32 --fullscreen  # ESP32 servo + load cell (see "ESP32 protocol")
 py -3.11 app.py --no-hardware                # simulated ESP32 for demos — labelled SIMULATION on screen
@@ -162,13 +163,20 @@ py -3.11 app.py --help                       # every option
 
 | Sorter mode | Who confirms the deposit | Use it when |
 |---|---|---|
-| `attendant` (default) | a staff member presses **SPACE** | no sorting hardware connected; the original kiosk flow |
+| `camera` (default) | nobody: the screen says which bin; the item leaving the camera's view counts as the drop | the kiosk runs alone and the ESP32 is not ready yet |
 | `esp32` | the ESP32: servo `OK`, then the load-cell weight | the firmware speaks the protocol below |
 | `sim` | a scripted ESP32 (OK after 0.6 s, 42 g after 1.6 s) | demos and tests; never writes sensor data to Firestore |
+| `attendant` | a staff member presses **SPACE** | a staff member stands at the kiosk |
+
+**Camera mode cannot prove the item went into the bin** — someone could show a cup and pull it back out of view.
+It therefore needs the item to stay out of view for `drop_clear_frames` (8) frames in a row, gives up after
+`drop_timeout` (15 s), waits `cooldown_seconds` (15 s) between codes, and starts only while the kiosk is online.
+The ESP32 load cell is what makes deposits trustworthy; switch to `"sorter": "esp32"` once the firmware is confirmed.
 
 Defaults live in `config/kiosk_settings.json` (display size, camera index, sorter mode, serial port, timeouts,
 reduced motion, sounds); command-line flags override them. If the internet drops, the ESP32 still sorts and the
-kiosk explains that no reward code could be created; in attendant mode SPACE is refused while offline.
+kiosk explains that no reward code could be created; camera mode does not start a deposit while offline, and in
+attendant mode SPACE is refused.
 
 ### 8. Run the tests (no camera, no Firebase, no model needed)
 ```bash
@@ -185,7 +193,7 @@ Staff keys:
 
 | Key | Action |
 |-----|--------|
-| `SPACE` | Confirm the deposit (attendant mode). In `esp32`/`sim` mode only with `--debug` (manual sort) |
+| `SPACE` | Confirm the deposit (attendant mode only). In camera/`esp32`/`sim` mode only with `--debug` (manual start) |
 | `R` | Show / hide the claim-code receipt (while a QR is shown) |
 | `H` | Session history (codes claimed since the kiosk started) |
 | `D` | Diagnostics: Firestore mode, model + SHA-256, camera FPS, inference ms, sorter port/state/last lines, fill levels |

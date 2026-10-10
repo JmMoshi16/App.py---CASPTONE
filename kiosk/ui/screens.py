@@ -19,6 +19,7 @@ PHASE_CAPTION = {
     "ready": ("camera", "Looking for an item…"),
     "detected": ("check", "Item recognised"),
     "sorting": ("arrow_down", "Sorting…"),
+    "dropping": ("arrow_down", "Waiting for the drop…"),
     "confirming": ("scale", "Checking the drop…"),
     "issuing": ("qr", "Creating your code…"),
 }
@@ -27,7 +28,7 @@ PHASE_CAPTION = {
 @dataclass
 class View:
     phase: str = "ready"
-    mode: str = "attendant"                 # attendant | esp32 | sim
+    mode: str = "attendant"                 # attendant | camera | esp32 | sim
     online: bool = True
     model_ok: bool = True
     camera_ok: bool = True
@@ -58,6 +59,9 @@ class View:
     debug: bool = False
     clock: str = ""
     seconds_to_ready: float = 0.0
+    cooldown_left: float = 0.0              # camera mode: seconds until the next deposit may start
+    drop_left: float = 0.0                  # camera mode: seconds left to drop the item
+    drop_timeout: float = 15.0
 
     @property
     def simulated(self):
@@ -65,7 +69,12 @@ class View:
 
     @property
     def automatic(self):
-        return self.mode in ("esp32", "sim")
+        """Self-service: no staff key starts the deposit."""
+        return self.mode in ("esp32", "sim", "camera")
+
+    @property
+    def camera_only(self):
+        return self.mode == "camera"
 
 
 def _ease(t):
@@ -138,7 +147,8 @@ class Renderer:
         else:
             self._viewport(img, cam, v, L, dim=0.45 if v.phase == "qr" else 0.0)
             self._panel_card(img, L)
-            {"ready": self._ready, "detected": self._detected, "qr": self._qr}.get(v.phase, self._working)(img, v, L, now)
+            {"ready": self._ready, "detected": self._detected, "qr": self._qr,
+             "dropping": self._dropping}.get(v.phase, self._working)(img, v, L, now)
         if v.overlay:
             self._modal(img, v, now)
         if v.toast:
@@ -209,6 +219,8 @@ class Renderer:
                   "reconnecting": ("Sorter reconnecting", "busy", True), "error": ("Sorter error", "error", False)}
             label, style, pulse = st.get(v.sorter_state, ("Sorter offline", "error", False))
             x = ui.chip(img, x, y, label, style, pulse=pulse) - px(8)
+        elif v.mode == "camera":
+            x = ui.chip(img, x, y, "Self-service", "ok", icon="cup") - px(8)
         else:
             x = ui.chip(img, x, y, "Staff confirm", "off") - px(8)
         ui.chip(img, x, y, "Online" if v.online else "Offline", "ok" if v.online else "error",
@@ -243,6 +255,8 @@ class Renderer:
         if v.phase in ("complete", "failed"):
             return
         icon, label = PHASE_CAPTION.get(v.phase, ("camera", ""))
+        if v.phase == "dropping" and v.tx is not None:
+            label = f"Drop it into the {v.tx.waste_type} bin"
         if v.phase == "detected" and v.detection is not None:
             label = f"Recognised: {v.detection.waste_type or 'not a known item'}"
             icon = "check" if v.detection.waste_type else "alert"
@@ -286,7 +300,7 @@ class Renderer:
         ui.card(img, cx1, cy1, cx1 + w, cy1 + h)
         pad = px(28)
         y = cy1 + pad
-        ok = "Sorted" if v.automatic else "Deposit confirmed"
+        ok = "Dropped" if v.camera_only else "Sorted" if v.automatic else "Deposit confirmed"
         ui.category_pill(img, cx1 + pad, y, v.tx.waste_type if v.tx else None, ok)
         y += px(56)
         for n, text in ((1, "Open the ECOReward app"), (2, "Tap Scan"), (3, "Point your phone at the code")):
@@ -308,7 +322,9 @@ class Renderer:
         w = x2 - x1
         y = ui.overline(img, "Ready", x1, y) + px(10)
         y = ui.para(img, "Recycle your cup, earn points", x1, y, w, "title", C.ink, max_lines=2) + px(10)
-        body = ("Hold your item up to the camera. We'll sort it and give you a reward code."
+        body = ("Hold your item up to the camera, then drop it into the bin we show you."
+                if v.camera_only else
+                "Hold your item up to the camera. We'll sort it and give you a reward code."
                 if v.automatic else "Hold your item up to the camera. A staff member will confirm your deposit.")
         y = ui.para(img, body, x1, y, w, "body_lg", C.ink_2, max_lines=3) + px(22)
         ui.text(img, "WHAT YOU EARN", x1, y, "label", C.ink_2)
@@ -351,18 +367,49 @@ class Renderer:
             y = ui.note(img, x1, y, x2, "Reward codes are paused", "The recognition model needs attention. Please ask staff.", "error")
         elif not waste:
             y = ui.note(img, x1, y, x2, "We don't know this item", "Please ask staff where it goes.", "warning")
-        elif v.automatic and not v.sorter_ready:
+        elif v.camera_only and not v.online:
+            y = ui.note(img, x1, y, x2, "Reward codes are paused", "The kiosk is offline. You can still recycle.",
+                        "warning")
+        elif v.camera_only and v.cooldown_left > 0:
+            y = ui.note(img, x1, y, x2, "Just a moment",
+                        f"The next deposit can start in {int(math.ceil(v.cooldown_left))} s.", "info", icon="clock")
+        elif v.automatic and not v.camera_only and not v.sorter_ready:
             y = ui.note(img, x1, y, x2, "The sorter is reconnecting", "Please wait a moment.", "warning")
         elif v.automatic and not v.armed:
             y = ui.note(img, x1, y, x2, "Move the item away first",
                         "Take it out of view, then show it again to start a new deposit.", "info")
         elif v.automatic:
-            y = ui.note(img, x1, y, x2, "Hold still", "Sorting starts in a moment.", "ok", icon="clock")
+            y = ui.note(img, x1, y, x2, "Hold still", "Checking what it is…" if v.camera_only
+                        else "Sorting starts in a moment.", "ok", icon="clock")
             ui.meter(img, x1, y + px(12), x2, v.lock_progress, C.forest, height=6)
         else:
             y = ui.note(img, x1, y, x2, "Waiting for staff", "A staff member will confirm your deposit.", "info",
                         icon="list")
             ui.text(img, "Staff: press SPACE to confirm", x1, y + px(12), "caption", C.ink_3)
+        ui.stepper(img, x1, y2 - len(v.stages) * px(40), w, v.stages, compact=True)
+
+    def _dropping(self, img, v, L, now):
+        """Camera mode: tell the customer which bin, and wait for the item to leave the camera's view."""
+        ui, px = self.ui, self.m.px
+        x1, y, x2, y2 = self._inner(L)
+        w = x2 - x1
+        waste = v.tx.waste_type if v.tx else None
+        cat = category(waste)
+        y = ui.overline(img, "Drop it in", x1, y) + px(10)
+        y = ui.para(img, f"Drop it into the {waste} bin", x1, y, w, "title", C.ink, max_lines=2) + px(14)
+        ui.category_pill(img, x1, y, waste, f"+{v.points.get(waste, 0)} base points")
+        y += px(64)
+        tile = px(96)
+        bounce = 0 if self.m.reduce_motion else int(px(6) * math.sin(now * 2 * math.pi / 1.2))
+        D.fill_rr(img, x1, y, x1 + tile, y + tile, px(24), cat["tint"])
+        draw_icon_centered(img, "arrow_down", x1 + tile / 2, y + tile / 2 + bounce, px(54), cat["color"])
+        ty = ui.para(img, f"Use the {waste.lower() if waste else ''} bin, marked with this colour and icon.",
+                     x1 + tile + px(20), y + px(4), w - tile - px(20), "body_lg", C.ink, max_lines=3)
+        ui.para(img, "Your code appears as soon as the item is out of view.", x1 + tile + px(20), ty + px(6),
+                w - tile - px(20), "body", C.ink_2, max_lines=2)
+        y += tile + px(24)
+        ui.text(img, f"{int(math.ceil(v.drop_left))} s left", x1, y, "caption", C.ink_2)
+        ui.meter(img, x1, y + px(26), x2, v.drop_left / max(0.1, v.drop_timeout), cat["color"], height=6)
         ui.stepper(img, x1, y2 - len(v.stages) * px(40), w, v.stages, compact=True)
 
     def _working(self, img, v, L, now):

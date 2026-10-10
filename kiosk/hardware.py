@@ -122,6 +122,15 @@ class AttendantSorter(Sorter):
         self.detail = "staff confirm with SPACE"
 
 
+class CameraOnlySorter(Sorter):
+    """No sorting hardware; the camera sees the item leave (self-service, see kiosk/flow.py DROPPING)."""
+    mode = "camera"
+
+    def __init__(self):
+        super().__init__()
+        self.detail = "camera confirms the drop"
+
+
 class SimulatedSorter(Sorter):
     """Replies like a healthy ESP32: OK after `ack_s`, then a weight after `drop_s`. Never real data."""
     mode = "sim"
@@ -279,4 +288,6 @@ def make_sorter(mode, port="auto", baud=115200, log=print):
         return SerialSorter(port, baud, log=log)
     if mode == "sim":
         return SimulatedSorter()
+    if mode == "camera":
+        return CameraOnlySorter()
     return AttendantSorter()

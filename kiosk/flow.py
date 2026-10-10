@@ -1,8 +1,13 @@
 """The deposit transaction as a pure state machine (no camera, Firestore, OpenCV or threads).
 
     READY ─item seen─▶ DETECTED ─SPACE (attendant)───────────────────────────▶ ISSUING ─▶ QR ─scan─▶ COMPLETE
-                               └─stable vote (esp32/sim)─▶ SORTING ─OK─▶ CONFIRMING ─weight─┘      │
+                               ├─stable vote (esp32/sim)─▶ SORTING ─OK─▶ CONFIRMING ─weight─┤      │
+                               └─stable vote (camera)───▶ DROPPING ─item left the view──────┘      │
     any timeout / fault ─▶ FAILED ─(a few seconds or "OK")─▶ READY ◀── expiry / walk-away / Done ──┘
+
+Camera mode is self-service without sorting hardware: the screen names the bin, and the item disappearing
+from view counts as the drop. It cannot prove the item went into the bin (the ESP32 load cell can), so it
+adds a cool-down between codes.
 
 app.py feeds it inputs with the current time and executes the actions it returns (send a servo command,
 start the token write, watch/stop watching the token, play a sound). Every transaction has an id; results
@@ -24,6 +29,7 @@ class Phase(Enum):
     READY = "ready"
     DETECTED = "detected"
     SORTING = "sorting"
+    DROPPING = "dropping"       # camera mode: waiting for the item to leave the camera's view
     CONFIRMING = "confirming"
     ISSUING = "issuing"
     QR = "qr"
@@ -31,7 +37,7 @@ class Phase(Enum):
     FAILED = "failed"
 
 
-ACTIVE_PHASES = (Phase.SORTING, Phase.CONFIRMING, Phase.ISSUING)
+ACTIVE_PHASES = (Phase.SORTING, Phase.CONFIRMING, Phase.DROPPING, Phase.ISSUING)
 
 
 @dataclass(frozen=True)
@@ -112,7 +118,7 @@ BLOCK_SORTER = "[BLOCKED] The sorter is not connected - not starting a sort."
 
 @dataclass
 class FlowConfig:
-    mode: str = "attendant"     # attendant | esp32 | sim
+    mode: str = "attendant"     # attendant | camera | esp32 | sim
     points: dict = field(default_factory=lambda: {"Biodegradable": 15, "Recyclable": 10, "Residual": 5})
     sort_ack_timeout: float = 5.0
     drop_confirm_timeout: float = 10.0
@@ -123,6 +129,9 @@ class FlowConfig:
     lock_votes: int = 5
     rearm_clear_frames: int = 10
     min_drop_grams: float = 5.0
+    drop_clear_frames: int = 8      # camera mode: consecutive empty frames that count as "dropped"
+    drop_timeout: float = 15.0      # camera mode: seconds to drop the item before giving up
+    cooldown_seconds: float = 15.0  # camera mode: minimum time between two codes
     debug: bool = False
 
 
@@ -142,11 +151,21 @@ class TransactionFlow:
         self.completed = 0
         self.history = deque(maxlen=200)
         self.online = self.model_ok = self.sorter_ready = True
+        self.cooldown_until = 0.0
+        self._gone = 0
 
     # ── helpers ────────────────────────────────────────────────────────────
     @property
     def automatic(self):
-        return self.cfg.mode in ("esp32", "sim")
+        """No staff key needed: the kiosk starts the deposit by itself."""
+        return self.cfg.mode in ("esp32", "sim", "camera")
+
+    @property
+    def camera_only(self):
+        return self.cfg.mode == "camera"
+
+    def cooldown_left(self, now):
+        return max(0.0, self.cooldown_until - now) if self.camera_only else 0.0
 
     def points_for(self, waste_type):
         return int(self.cfg.points.get(waste_type, 0))
@@ -195,6 +214,8 @@ class TransactionFlow:
     # ── camera ─────────────────────────────────────────────────────────────
     def observe(self, det, now):
         """One analysed camera frame: the most confident detection, or None."""
+        if self.phase == Phase.DROPPING:
+            return self._watch_drop(det, now)
         if self.phase not in (Phase.READY, Phase.DETECTED):
             return []
         if det is None:
@@ -220,12 +241,41 @@ class TransactionFlow:
         if self.phase == Phase.READY:
             self._go(Phase.DETECTED, now)
         if (self.automatic and self.armed and len(self._votes) == VOTE_WINDOW and count >= self.cfg.lock_votes
-                and self.current.waste_type and self.model_ok and self.sorter_ready):
+                and self.current.waste_type and self.model_ok and self._can_start(now)):
             actions += self._begin_sort(now)
         return actions
 
+    def _can_start(self, now):
+        if self.camera_only:      # no hardware to wait for; a code is the only outcome, so it must be possible
+            return self.online and now >= self.cooldown_until
+        return self.sorter_ready
+
+    def _watch_drop(self, det, now):
+        """Camera mode: the item leaving the view for `drop_clear_frames` frames in a row counts as the drop."""
+        if det is not None:
+            self.latest = det
+            self._gone = 0
+            return []
+        self.latest = None
+        self._gone += 1
+        if self._gone < self.cfg.drop_clear_frames:
+            return []
+        self.tx.sorted = True
+        self._say(f"[DROP] #{self.tx.id} item left the camera view")
+        if not self.online:
+            return self._fail(Failure("offline_after_sort", "Dropped, but no reward code",
+                                      "The kiosk went offline before your code could be created. Please try "
+                                      "again later."), now)
+        return self._begin_issue(now)
+
     def _begin_sort(self, now):
         self._start(now)
+        if self.camera_only:
+            self._gone = 0
+            self._go(Phase.DROPPING, now)
+            self._say(f"[DROP?] #{self.tx.id} {self.tx.waste_type} ({self.tx.label}, {self.tx.confidence:.0%}) - "
+                      "waiting for the item to go in")
+            return []
         self._go(Phase.SORTING, now)
         self._say(f"[SORT] #{self.tx.id} {self.tx.waste_type} ({self.tx.label}, {self.tx.confidence:.0%})")
         return [SendSort(self.tx.id, self.tx.waste_type)]
@@ -253,7 +303,11 @@ class TransactionFlow:
             self._toast("No item detected yet", "info", now)
             return []
         if self.automatic:
-            if not self.sorter_ready:
+            if self.camera_only and not self.online:
+                self._say(BLOCK_OFFLINE)
+                self._toast("Can't issue a code: the kiosk is offline", "warning", now)
+                return []
+            if not self.camera_only and not self.sorter_ready:
                 self._say(BLOCK_SORTER)
                 self._toast("The sorter is not connected", "warning", now)
                 return []
@@ -293,6 +347,8 @@ class TransactionFlow:
             return []
         self.tx.token, self.tx.claim_code, self.tx.expires_at, self.tx.payload = token, claim_code, expires_at, payload
         self.tx.qr_shown_at = now
+        if self.camera_only:
+            self.cooldown_until = now + self.cfg.cooldown_seconds
         self._go(Phase.QR, now)
         return [WatchToken(token)]
 
@@ -339,6 +395,10 @@ class TransactionFlow:
         if p == Phase.SORTING and dt >= self.cfg.sort_ack_timeout:
             return self._fail(Failure("sorter_timeout", "The sorter didn't respond",
                                       "Please take your item and try again. If this keeps happening, ask staff."), now)
+        if p == Phase.DROPPING and dt >= self.cfg.drop_timeout:
+            return self._fail(Failure("no_drop_seen", "We didn't see it go in",
+                                      f"Drop the item into the {self.tx.waste_type} bin, then show the next one."),
+                              now)
         if p == Phase.CONFIRMING and dt >= self.cfg.drop_confirm_timeout:
             return self._fail(Failure("no_confirm", "We couldn't confirm the drop",
                                       "The bin didn't register your item. Please try again or ask staff."), now)
@@ -366,7 +426,12 @@ class TransactionFlow:
     # ── for the UI ─────────────────────────────────────────────────────────
     def stages(self):
         """[(key, label, status)] for the stepper; status in done/active/pending/failed."""
-        if self.automatic:
+        if self.camera_only:
+            steps = [("identify", "Identify the item"), ("drop", "Drop it into the bin"),
+                     ("code", "Create your reward code")]
+            active = {Phase.READY: 0, Phase.DETECTED: 0, Phase.DROPPING: 1, Phase.ISSUING: 2, Phase.QR: 3,
+                      Phase.COMPLETE: 3}
+        elif self.automatic:
             steps = [("identify", "Identify the item"), ("sort", "Sort it into the bin"),
                      ("confirm", "Confirm the drop"), ("code", "Create your reward code")]
             active = {Phase.READY: 0, Phase.DETECTED: 0, Phase.SORTING: 1, Phase.CONFIRMING: 2,
@@ -376,8 +441,8 @@ class TransactionFlow:
                      ("code", "Create your reward code")]
             active = {Phase.READY: 0, Phase.DETECTED: 1, Phase.ISSUING: 2, Phase.QR: 3, Phase.COMPLETE: 3}
         if self.phase == Phase.FAILED:
-            failed_at = {"sorter_timeout": 1, "device_error": 1, "no_drop": 2, "no_confirm": 2,
-                         "offline_after_sort": 3, "issue_failed": len(steps) - 1, "issue_timeout": len(steps) - 1}
+            failed_at = {"sorter_timeout": 1, "device_error": 1, "no_drop": 2, "no_confirm": 2, "no_drop_seen": 1,
+                         "offline_after_sort": len(steps) - 1, "issue_failed": len(steps) - 1, "issue_timeout": len(steps) - 1}
             idx = failed_at.get(self.failure.kind if self.failure else "", len(steps) - 1)
             return [(k, lbl, "done" if i < idx else "failed" if i == idx else "pending")
                     for i, (k, lbl) in enumerate(steps)]

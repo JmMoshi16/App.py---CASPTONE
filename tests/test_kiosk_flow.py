@@ -211,6 +211,58 @@ class AutomaticFlowTests(unittest.TestCase):
         self.assertEqual(kinds(g.confirm(1)), ["SendSort"])
 
 
+class CameraSelfServiceTests(unittest.TestCase):
+    """Camera mode: no staff, no sorting hardware; the item leaving the view counts as the drop."""
+
+    def test_hold_then_drop_issues_a_code_without_any_key(self):
+        f = flow("camera")
+        self.assertEqual(see(f, CAN, 7), [Sound("detect")], "no servo command in camera mode")
+        self.assertEqual(f.phase, Phase.DROPPING)
+        self.assertEqual(see(f, None, 7, t0=1), [], "7 empty frames is not yet a drop")
+        a = see(f, None, 1, t0=2)
+        self.assertEqual(kinds(a), ["IssueToken"])
+        self.assertTrue(f.tx.sorted)
+
+    def test_a_brief_flicker_is_not_a_drop(self):
+        f = flow("camera")
+        see(f, CAN, 7)
+        a = see(f, None, 5, t0=1) + see(f, CAN, 1, t0=2) + see(f, None, 5, t0=3)
+        self.assertNotIn("IssueToken", kinds(a))
+        self.assertEqual(f.phase, Phase.DROPPING)
+
+    def test_an_item_that_never_leaves_times_out(self):
+        f = flow("camera", drop_timeout=15)
+        see(f, CAN, 7)
+        see(f, CAN, 100, t0=1, dt=0.1)
+        f.tick(16, UTC0)
+        self.assertEqual((f.phase, f.failure.kind), (Phase.FAILED, "no_drop_seen"))
+        self.assertEqual([s for _, _, s in f.stages()], ["done", "failed", "pending"])
+
+    def test_cool_down_between_codes(self):
+        f = flow("camera", cooldown_seconds=15)
+        see(f, CAN, 7)
+        tx = see(f, None, 8, t0=1)[-1].tx_id
+        f.on_issue_ok(tx, "tok", "1234", UTC0 + timedelta(minutes=20), "p", 2.0)
+        f.dismiss(3.0)                                  # "Done" straight away
+        see(f, None, 10, t0=3.1)                        # re-armed
+        self.assertNotIn("SendSort", kinds(see(f, CAN, 7, t0=5)))
+        self.assertEqual(f.phase, Phase.DETECTED, "a second code within 15 s must wait")
+        self.assertAlmostEqual(f.cooldown_left(5.3), 11.7, delta=0.1)
+        see(f, CAN, 1, t0=17.1)
+        self.assertEqual(f.phase, Phase.DROPPING)
+
+    def test_offline_does_not_start_a_deposit(self):
+        f = flow("camera")
+        f.set_context(online=False, model_ok=True, sorter_ready=False)
+        see(f, CAN, 10)
+        self.assertEqual(f.phase, Phase.DETECTED)
+
+    def test_space_is_not_needed_and_does_nothing(self):
+        f = flow("camera")
+        see(f, CAN, 3)
+        self.assertEqual(f.confirm(1), [])
+
+
 class QrLifetimeTests(unittest.TestCase):
     def _qr(self, **kw):
         f = flow(**kw)
@@ -381,12 +433,12 @@ class SettingsTests(unittest.TestCase):
         s, _ = cfgmod.load_settings(p, ["--no-hardware", "--port", "COM4", "--fullscreen", "--reduce-motion"])
         self.assertEqual((s.sorter, s.serial_port, s.fullscreen, s.reduce_motion), ("sim", "COM4", True, True))
         s, _ = cfgmod.load_settings(d / "missing.json", None)
-        self.assertEqual(s.sorter, "attendant", "tests and first runs default to the original flow")
+        self.assertEqual(s.sorter, "camera", "without a settings file the kiosk is self-service (no staff, no hardware)")
 
     def test_committed_settings_file_is_valid(self):
         s, problems = cfgmod.load_settings(Path(__file__).resolve().parents[1] / "config" / "kiosk_settings.json")
         self.assertEqual(problems, [])
-        self.assertEqual(s.sorter, "attendant")
+        self.assertEqual(s.sorter, "camera")
 
 
 if __name__ == "__main__":

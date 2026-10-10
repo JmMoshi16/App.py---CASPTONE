@@ -8,7 +8,7 @@ import json
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-SORTER_MODES = ("attendant", "esp32", "sim")
+SORTER_MODES = ("camera", "attendant", "esp32", "sim")
 
 
 @dataclass
@@ -21,10 +21,12 @@ class Settings:
     sounds: bool = True
     # camera
     camera_index: int = 0
-    # sorter: "attendant" = staff presses SPACE to confirm a deposit (no hardware),
+    # sorter: "camera"    = self-service, no hardware: the screen names the bin and the item leaving the
+    #                       view counts as the drop (cannot prove it went in, hence the cool-down)
+    #         "attendant" = staff presses SPACE to confirm a deposit (no hardware),
     #         "esp32"     = servo + load cell over USB serial (protocol: README "ESP32 protocol"),
     #         "sim"       = simulated ESP32 for demos/tests, labelled SIMULATION on screen
-    sorter: str = "attendant"
+    sorter: str = "camera"
     serial_port: str = "auto"
     serial_baud: int = 115200
     # transaction timing (seconds)
@@ -38,6 +40,9 @@ class Settings:
     lock_votes: int = 5          # of the last 7 frames, needed before the ESP32 sorts automatically
     rearm_clear_frames: int = 10  # empty frames needed before the next automatic sort
     min_drop_grams: float = 5.0
+    drop_clear_frames: int = 8
+    drop_timeout: float = 15.0
+    cooldown_seconds: float = 15.0
     # telemetry
     bins_min_interval: float = 60.0
     log_dir: str = "logs"
@@ -78,8 +83,8 @@ def load_file(path):
         except (TypeError, ValueError) as e:
             problems.append(f"{path.name}: '{key}' = {value!r} ignored ({e})")
     if s.sorter not in SORTER_MODES:
-        problems.append(f"{path.name}: sorter '{s.sorter}' unknown; using 'attendant'")
-        s.sorter = "attendant"
+        problems.append(f"{path.name}: sorter '{s.sorter}' unknown; using 'camera'")
+        s.sorter = "camera"
     return s, problems
 
 
