@@ -357,7 +357,7 @@ def _drain_rx() -> list:
     return lines
 
 # ── Camera HUD ─────────────────────────────────────────────────────────────────
-def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count, state, status_msg=""):
+def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count, state, status_msg="", write_in_flight=False):
     h, w = cam.shape[:2]
     out  = cam.copy()
     acc  = WASTE_COLOR.get(waste_type, ACCENT)
@@ -401,10 +401,9 @@ def draw_camera_hud(cam, label, waste_type, confidence, fb_ok, scan_count, state
         blend(out, 0, 86, w, 118, (20, 60, 80), 0.90)
         putc(out, "Confirming drop…  Please wait",
              w // 2, 108, F, 0.44, AMBER, 1)
-    elif state == KioskState.WRITING:
+    elif write_in_flight:
         blend(out, 0, 86, w, 118, (20, 20, 80), 0.90)
-        putc(out, "Saving token…",
-             w // 2, 108, F, 0.44, WHITE, 1)
+        putc(out, "Saving token to server…", w // 2, 108, F, 0.44, WHITE, 1)
     elif status_msg:
         blend(out, 0, 86, w, 118, RED_SOFT, 0.75)
         putc(out, status_msg, w // 2, 108, F, 0.40, WHITE, 1)
@@ -869,10 +868,8 @@ def main():
     print("  H = History    Q = Quit")
     print("------------------------------------------\n")
 
-    cv2.namedWindow("ECOReward Bin", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("ECOReward Bin", cv2.WINDOW_FULLSCREEN)   # FIX-L-01
     cv2.resizeWindow("ECOReward Bin", WIN_W, WIN_H)
-    # FIX-L-01: fullscreen on the kiosk display
-    cv2.setWindowProperty("ECOReward Bin", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     draw_splash_animation("ECOReward Bin")
     _start_heartbeat()
@@ -897,10 +894,13 @@ def main():
     status_msg        = ""
 
     # ── Kiosk state machine  # FIX-H-01 ──
-    state          = KioskState.IDLE
-    sort_waste     = None
-    sort_deadline  = None   # SORTING: timeout waiting for servo OK
-    weigh_deadline = None   # WEIGHING: timeout waiting for W:<g>
+    state           = KioskState.IDLE
+    sort_waste      = None
+    sort_label      = "Unknown"   # label captured at sort time (avoids race with detection loop)
+    sort_conf       = 0.0
+    sort_deadline   = None        # SORTING: timeout waiting for servo OK
+    weigh_deadline  = None        # WEIGHING: timeout waiting for W:<g>
+    _write_in_flight = False      # True while Firestore write thread is running
 
     # ── QR state ──
     qr_active      = False
@@ -991,48 +991,52 @@ def main():
                 status_msg = "Load-cell timeout — item not detected. Please try again."
                 print("[STATE] WEIGHING → IDLE (timeout)")
 
-        elif state == KioskState.WRITING:
-            # Run Firestore write off the main thread so the UI doesn't freeze  # FIX-C-03
-            _wt = sort_waste
-            state = KioskState.IDLE   # optimistically; thread sets qr_active on success
+        elif state == KioskState.WRITING and not _write_in_flight:
+            # Freeze the values we need before handing off to the thread — avoids the race
+            # condition where the detection loop overwrites latest_label/conf mid-write.
+            _wt, _wlabel, _wconf = sort_waste, sort_label, sort_conf
+            state            = KioskState.IDLE
+            _write_in_flight = True
 
-            def _do_write(waste_type=_wt):
+            def _do_write(waste_type=_wt, det_label=_wlabel, det_conf=_wconf):
                 global qr_image, qr_active, qr_token, qr_waste_type, qr_points
                 global qr_expires_at, qr_total_secs, qr_claim_code, show_receipt
-                if db is None:
-                    print("[BLOCKED] Firebase offline — QR not issued.")
-                    return
-                if bad_labels:
-                    print("[BLOCKED] Model/map mismatch — QR not issued.")
-                    return
+                global status_msg, _write_in_flight
                 try:
+                    if db is None:
+                        status_msg = "Firebase offline — QR not issued."
+                        print("[BLOCKED] Firebase offline — QR not issued.")
+                        return
+                    if bad_labels:
+                        status_msg = "Model/map mismatch — QR not issued."
+                        print("[BLOCKED] Model/map mismatch — QR not issued.")
+                        return
                     token      = str(uuid.uuid4())
                     points     = POINTS_MAP[waste_type]
-                    # FIX-C-03 / FIX-H-03: store dates as ISO-8601 strings with UTC offset
-                    # so Dart's DateTime.parse reads them correctly.
-                    now_dt     = _now()
-                    expires_dt = now_dt + timedelta(minutes=QR_EXPIRY_MINUTES)
-                    created_str  = now_dt.isoformat()       # "2026-10-10T12:34:56.789012+00:00"
-                    expires_str  = expires_dt.isoformat()   # same format
-                    qr_data    = f"ECOBIN:{waste_type}:{token}"
-                    claim_code = str(1000 + secrets.randbelow(9000))
+                    # FIX-C-03: store dates as ISO-8601 strings with explicit UTC offset
+                    # so Dart's DateTime.parse reads them correctly (not Firestore Timestamps).
+                    now_dt       = _now()
+                    expires_dt   = now_dt + timedelta(minutes=QR_EXPIRY_MINUTES)
+                    created_str  = now_dt.isoformat()
+                    expires_str  = expires_dt.isoformat()
+                    qr_data      = f"ECOBIN:{waste_type}:{token}"
+                    claim_code   = str(1000 + secrets.randbelow(9000))
 
                     db.collection("qr_tokens").document(token).set({
                         "wasteType": waste_type,
-                        "createdAt": created_str,   # FIX-C-03: ISO string
-                        "expiresAt": expires_str,   # FIX-C-03: ISO string
+                        "createdAt": created_str,
+                        "expiresAt": expires_str,
                         "usedBy":    [],
                         "isUsed":    False,
                         "claimCode": claim_code,
                     })
                     print(f"[FIREBASE] Token saved ({token[:8]}…) — waiting for scan.")
 
-                    # non-critical detection log
                     try:
                         db.collection("detections").add({
                             "wasteType":   waste_type,
-                            "label":       latest_label,
-                            "confidence":  float(latest_conf),
+                            "label":       det_label,    # frozen at sort time
+                            "confidence":  float(det_conf),
                             "modelFile":   MODEL_FILE,
                             "modelSha256": MODEL_SHA256,
                             "timestamp":   created_str,
@@ -1044,7 +1048,6 @@ def main():
 
                     watch_token(token)
 
-                    # Update UI state (GIL protects individual assignments)
                     qr_image      = generate_qr(qr_data, size=220)
                     qr_token      = token
                     qr_waste_type = waste_type
@@ -1054,9 +1057,13 @@ def main():
                     qr_claim_code = claim_code
                     show_receipt  = False
                     qr_active     = True
+                    status_msg    = ""
                     print(f"[QR] Active — {waste_type} +{points}pts")
                 except Exception as err:
+                    status_msg = "Could not save token — check Firebase."
                     print(f"[FIREBASE ERROR] Could not store token: {err}")
+                finally:
+                    _write_in_flight = False
 
             threading.Thread(target=_do_write, daemon=True).start()
 
@@ -1098,12 +1105,17 @@ def main():
                 rrect(cam_r, x1, bar_y, x2, y2, 0, GRAY_DIM)
                 rrect(cam_r, x1, bar_y, x1 + int(bar_w * vote_conf), y2, 0, ac)
 
+                status_msg = ""   # clear any previous error once a new item is detected
+
                 # Auto-trigger sort when stable label locks in (not in debug/no-hardware)
                 if (len(detect_history) == DETECT_WINDOW
                         and not ARGS.debug and not ARGS.no_hardware):
-                    state         = KioskState.SORTING
-                    sort_waste    = latest_waste_type
-                    sort_deadline = _now() + timedelta(seconds=5)
+                    state           = KioskState.SORTING
+                    sort_waste      = latest_waste_type
+                    sort_label      = latest_label       # freeze for _do_write (race fix)
+                    sort_conf       = latest_conf
+                    sort_deadline   = _now() + timedelta(seconds=5)
+                    HOLD_FRAMES     = 0
                     _send_servo(latest_waste_type)
                     detect_history.clear()
                     _last_beep_type = None
@@ -1128,7 +1140,7 @@ def main():
             else:
                 show_success = False
                 display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                          latest_conf, fb_ok, scan_count, state, status_msg)
+                                          latest_conf, fb_ok, scan_count, state, status_msg, _write_in_flight)
         elif qr_active and qr_expires_at:
             secs_left = max(0, int((qr_expires_at - now).total_seconds()))
             if _scan_event.is_set():
@@ -1150,13 +1162,13 @@ def main():
                 print("[EXPIRED] QR expired.")
                 qr_active = False
                 display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                          latest_conf, fb_ok, scan_count, state, status_msg)
+                                          latest_conf, fb_ok, scan_count, state, status_msg, _write_in_flight)
             else:
                 display = draw_qr_panel(cam_r, qr_image, qr_waste_type, qr_points,
                                         secs_left, qr_claim_code, qr_total_secs)
         else:
             display = draw_camera_hud(cam_r, latest_label, latest_waste_type,
-                                      latest_conf, fb_ok, scan_count, state, status_msg)
+                                      latest_conf, fb_ok, scan_count, state, status_msg, _write_in_flight)
 
         cv2.imshow("ECOReward Bin", display)
         key = cv2.waitKey(1) & 0xFF
@@ -1177,16 +1189,19 @@ def main():
                 elif latest_label == "Unknown":
                     print("[BLOCKED] No waste detected yet.")
                 else:
-                    state         = KioskState.SORTING
-                    sort_waste    = latest_waste_type
-                    sort_deadline = _now() + timedelta(seconds=5)
+                    state           = KioskState.SORTING
+                    sort_waste      = latest_waste_type
+                    sort_label      = latest_label
+                    sort_conf       = latest_conf
+                    sort_deadline   = _now() + timedelta(seconds=5)
+                    HOLD_FRAMES     = 0
                     if ARGS.no_hardware:
                         _mock_sort_sequence(latest_waste_type)
                     else:
                         _send_servo(latest_waste_type)
                     detect_history.clear()
                     _last_beep_type = None
-                    status_msg = ""
+                    status_msg      = ""
                     print(f"[DEBUG] Manual trigger → SORTING ({latest_waste_type})")
 
         if key == ord("q"):
