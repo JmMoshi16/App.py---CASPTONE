@@ -1,5 +1,33 @@
 # Test report — ECOReward Bin
 
+## 2026-10-10 — kiosk redesign and reliability pass (kiosk repository only)
+
+**Machine:** the same development PC (Windows 11, Python 3.11, OpenCV 5.0.0, Node 24, Java 25 from Android Studio's
+JBR). **Method:** one run in the development checkout (not a fresh clone). Commits: `c16eca0` … `9f2361a`.
+
+| Suite | Result |
+|---|---|
+| Kiosk unit + product tests (fakes, no Firebase) | 94 run, OK (5 skipped: emulator-only) |
+| Kiosk tests inside the Firestore emulator (golden path with the real rules, kiosk client, `bins`) | 94 run, OK, 0 skipped |
+| Firestore rules + races (emulator) | 84 / 84 pass (2 new: kiosk `bins` writes; ISO-string token dates rejected) |
+| Break-and-restore (`tools/break_restore.py`) | 10 / 10 caught (new: K-01 ISO dates, K-06 stale servo command, K-07 UI-thread write, K-10 leaking poller) |
+| `tools/bench_kiosk.py` (real `best.pt`) | inference 38.8 ms + full-frame UI 6.9 ms → 21.8 FPS (budget ≥ 10) |
+| Real OpenCV window, offline, synthetic camera, real `best.pt`, simulated sorter | 140 frames / 10.7 s incl. start-up, window visible throughout, staff keys and clean shutdown OK |
+
+What the new tests cover: two simulated ESP32 deposits in a row through the real `main()`; a 0.6 s token write
+while the screen keeps drawing (≥ 10 frames); the watcher stopping after a claim and after a walk-away; camera
+loss and re-open; inference and drawing exceptions; a touch tap opening and closing the claim-code receipt; fill
+levels written in the web's `BinStatus` shape (never from the simulator); every screen at 1024×600, 1280×720 and
+1920×1080; the on-screen QR decoded by OpenCV to the exact payload at all three sizes; WCAG AA contrast of every
+text/background pair; touch targets ≥ 44 px on the 7" display; the token document contract.
+
+**Not verified here (needs hardware or the live project):** the real webcam, an ESP32 running the assumed
+protocol, a touch display, the window in fullscreen on the kiosk PC, a phone scan against the deployed rules.
+
+---
+
+## 2026-10-09 — Phase 8 (all three repositories)
+
 **Date:** 2026-10-09 · **Machine:** Windows 11, Python 3.11, Node 24.20, Java 21 (Android Studio JBR), Flutter 3.47.2
 **Method:** fresh `git clone` of all three repositories, every suite run **twice** in a row (audit Phase 8).
 Commits tested: kiosk `28ed742`, web `af2b3ce`, app `15cfc94`. How to run each suite: `docs/test-plan.md`.

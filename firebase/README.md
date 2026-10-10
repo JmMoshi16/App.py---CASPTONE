@@ -4,7 +4,7 @@
 |---|---|
 | `firestore.rules` | Draft rules, written from what the Flutter app, the Next.js admin and the QR flow actually do. **Not deployed.** |
 | `firebase.json` | Points the Firebase CLI / emulator at the rules (no project is bound on purpose — see below). |
-| `tests/rules.test.mjs` | 54 checks that replay the real app operations as *anonymous*, *customer*, *another customer* and *admin*. |
+| `tests/rules.test.mjs` | 84 checks that replay the real app operations as *anonymous*, *customer*, *another customer*, *admin* and the *kiosk identity* (tokens, heartbeat, detections, `bins` fill levels). |
 
 ## Run the tests (local emulator only — never touches your real Firebase project)
 

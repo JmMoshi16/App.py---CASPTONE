@@ -21,14 +21,15 @@ The ECOReward system has 3 parts that share the same Firebase backend:
 
 ## What This Does
 
-1. Webcam feed runs through YOLOv8 (`best.pt`) to detect waste items
-2. Detected item is classified as **Biodegradable**, **Recyclable**, or **Residual**
-3. Press **SPACEBAR** → UUID token generated → written to Firestore `qr_tokens` collection
-4. QR code displayed on screen (format: `ECOBIN:{wasteType}:{token}`)
-5. User scans QR with Flutter app → points awarded → Firestore `usedBy` field updated
-6. Firestore listener in `app.py` detects the scan → QR panel auto-dismisses
-7. Press **R** during QR display → shows receipt with manual claim code (for users without phone)
-8. Users without phone can tell staff their **Gmail + claim code** → staff enters it in Admin Web → points credited
+1. Webcam feed runs through YOLOv8 (`best.pt`) to detect waste items (confidence ≥ 0.30, 7-frame majority vote)
+2. Detected item is classified as **Biodegradable**, **Recyclable**, or **Residual** (`config/waste_map.json`)
+3. The deposit is confirmed — by a **staff member pressing SPACE** (attendant mode, the default) or, with the
+   ESP32 sorter, by the **servo acknowledging and the load cell registering the drop**
+4. Only then a UUID token is written to Firestore `qr_tokens`; the QR (`ECOBIN:{wasteType}:{token}`) is shown
+   only after that write succeeded
+5. User scans the QR with the Flutter app → the app credits points → the kiosk sees the claim and shows "Claimed!"
+6. No phone? Tap **"No phone? Claim code"** (or staff press **R**) → receipt with a manual claim code
+7. Staff enter **Gmail + claim code** in the Admin Web → points credited
 
 ---
 
@@ -150,10 +151,24 @@ copy runs\detect\ecoreward_cafe-2\weights\best.pt best.pt
 
 > ⚠️ `best.pt` and `dataset/` are in `.gitignore` and will NOT be in the repo (too large for GitHub).
 
-### 7. Run the scanner
+### 7. Run the kiosk
 ```bash
-py -3.11 app.py
+py -3.11 app.py                              # attendant mode, 1280x720 window
+py -3.11 app.py --fullscreen                 # fill the kiosk display (1024x600 panel, laptop, monitor)
+py -3.11 app.py --sorter esp32 --fullscreen  # ESP32 servo + load cell (see "ESP32 protocol")
+py -3.11 app.py --no-hardware                # simulated ESP32 for demos — labelled SIMULATION on screen
+py -3.11 app.py --help                       # every option
 ```
+
+| Sorter mode | Who confirms the deposit | Use it when |
+|---|---|---|
+| `attendant` (default) | a staff member presses **SPACE** | no sorting hardware connected; the original kiosk flow |
+| `esp32` | the ESP32: servo `OK`, then the load-cell weight | the firmware speaks the protocol below |
+| `sim` | a scripted ESP32 (OK after 0.6 s, 42 g after 1.6 s) | demos and tests; never writes sensor data to Firestore |
+
+Defaults live in `config/kiosk_settings.json` (display size, camera index, sorter mode, serial port, timeouts,
+reduced motion, sounds); command-line flags override them. If the internet drops, the ESP32 still sorts and the
+kiosk explains that no reward code could be created; in attendant mode SPACE is refused while offline.
 
 ### 8. Run the tests (no camera, no Firebase, no model needed)
 ```bash
@@ -165,11 +180,53 @@ They replace Firebase, the YOLO model and the camera window with fakes and exerc
 
 ## Controls
 
+Customers only use the touch screen (**No phone? Claim code**, **Done**, **OK**, **Back to the QR code**).
+Staff keys:
+
 | Key | Action |
 |-----|--------|
-| `SPACE` | Generate QR for detected item |
-| `R` | Toggle receipt screen (while QR is active) |
-| `Q` | Quit |
+| `SPACE` | Confirm the deposit (attendant mode). In `esp32`/`sim` mode only with `--debug` (manual sort) |
+| `R` | Show / hide the claim-code receipt (while a QR is shown) |
+| `H` | Session history (codes claimed since the kiosk started) |
+| `D` | Diagnostics: Firestore mode, model + SHA-256, camera FPS, inference ms, sorter port/state/last lines, fill levels |
+| `Esc` | Close the overlay |
+| `Q` | Quit (closing the window also quits cleanly) |
+
+A QR stays up until it is scanned, **Done** is tapped, it expires, or 3 minutes pass without a scan
+(`qr_display_seconds`) — the code itself stays valid for the full 20 minutes.
+
+## ESP32 protocol (sorter mode `esp32`)
+
+> **Assumption — confirm against the firmware.** No sketch is in this repository; this is the protocol the kiosk
+> implements (`kiosk/hardware.py`). Lines are ASCII, newline-terminated, 115200 baud by default.
+
+| Direction | Line | Meaning |
+|---|---|---|
+| kiosk → ESP32 | `1` / `2` / `3` | move the chute to Biodegradable / Recyclable / Residual |
+| ESP32 → kiosk | `OK` (or `ACK`) | the servo reached the chute (kiosk waits ≤ 5 s) |
+| ESP32 → kiosk | `W:<grams>` e.g. `W:42.5` | HX711 reading after the drop (kiosk waits ≤ 10 s; < 5 g = nothing dropped) |
+| ESP32 → kiosk | `F:<bio>,<rec>,<res>` e.g. `F:45,22,68` | HC-SR04 fill levels in % — written to `bins/{kioskId}-bio/rec/res` for the web dashboard |
+| ESP32 → kiosk | `ERR:<text>` | a fault; the customer sees "The sorter reported a problem" |
+
+Firmware checklist: print `OK` once the servo is in place; print one `W:` line after the weight settles;
+send `F:` every ~10 s; never move the servo without a command. The kiosk never sends a command when it
+connects or reconnects, drops commands queued while the ESP32 was unplugged, and finds the port automatically
+(CP210x, CH340, FTDI or ESP32-S native USB) unless `serial_port` / `--port COM3` is set. PySerial is required:
+`py -3.11 -m pip install pyserial`. The `bins` writes need the rules in `firebase/firestore.rules` to be deployed.
+
+## Faster inference (OpenVINO, optional)
+
+```bash
+py -3.11 -m pip install openvino
+py -3.11 -c "from ultralytics import YOLO; YOLO('best.pt').export(format='openvino')"
+```
+This creates `best_openvino_model/`; the kiosk loads it automatically when it exists (diagnostics shows the
+file and its SHA-256). Check accuracy with `tools/eval_model.py` before relying on it.
+
+## Logs and diagnostics
+
+Everything printed to the console is also written to `logs/kiosk.log` (one file per day, 14 days kept).
+Repeating problems (camera gone, sorter reconnecting, Firestore unreachable) are logged once, not every frame.
 
 ---
 
@@ -177,7 +234,7 @@ They replace Firebase, the YOLO model and the camera window with fakes and exerc
 
 For users who don't have their phone with them:
 
-1. Press `R` during QR display → receipt screen appears with a **manual claim code**
+1. Tap **No phone? Claim code** (or press `R`) during QR display → receipt appears with a **manual claim code**
 2. User tells staff their **Gmail account** and the **claim code** shown on screen
 3. Staff opens the **Admin Web Dashboard** → Manual Claim page
 4. Staff enters the claim code + user Gmail → clicks "Claim Points"
@@ -187,16 +244,20 @@ For users who don't have their phone with them:
 
 ## Firebase Structure
 
-### `qr_tokens` collection
+### `qr_tokens` collection (written by the kiosk; shape enforced by `isNewKioskToken()` in the rules)
 ```
 {
-  wasteType: "Recyclable",
-  expiresAt: "2025-01-01T12:00:00",
-  usedBy: [],           // Flutter app adds user ID here on scan
-  createdAt: "2025-01-01T11:40:00"
+  wasteType: "Recyclable",          // Biodegradable | Recyclable | Residual
+  expiresAt: <Timestamp>,           // createdAt + 20 min (config/rules.json); a Timestamp so the rules check expiry with server time
+  createdAt: <server Timestamp>,
+  usedBy: [],                       // the Flutter app adds the customer's uid when they claim it
+  isUsed: false,
+  claimCode: "4821"                 // shown on the receipt as ECO-4821 for manual claims
 }
 ```
-Document ID = the UUID token itself.
+Document ID = the UUID token itself. The kiosk also writes `detections/{id}` (one per issued code),
+`kiosks/{kioskId}` (heartbeat every 30 s, `offline` on a clean exit) and, with a real ESP32, `bins/{kioskId}-{bio|rec|res}`.
+It never writes `users`, `waste_logs`, `redemptions` or `profiles`.
 
 ### QR Code Format
 ```
@@ -206,19 +267,12 @@ Example: `ECOBIN:Recyclable:550e8400-e29b-41d4-a716-446655440000`
 
 ---
 
-## Model Performance (5 epochs, CPU, imgsz=320)
+## Model
 
-| Detected Class | Waste Category | Points | mAP50 |
-|----------------|---------------|--------|-------|
-| BIODEGRADABLE | Biodegradable | 15 pts | 0.507 |
-| CARDBOARD | Recyclable | 10 pts | 0.455 |
-| GLASS | Recyclable | 10 pts | 0.638 |
-| METAL | Recyclable | 10 pts | 0.421 |
-| PAPER | Recyclable | 10 pts | 0.066 ⚠️ |
-| PLASTIC | Recyclable | 10 pts | 0.079 ⚠️ |
-| *(anything else)* | Residual | 5 pts | — |
-
-> ⚠️ PAPER and PLASTIC have low accuracy — more training epochs recommended before final defense.
+The shipped `best.pt` is a 20-class YOLOv8n model (imgsz 640, 100 epochs, trained on Kaggle) — see
+`docs/ml-model-card.md` for its classes, validation results and limits. `train.py` is a legacy 6-class script
+that did **not** produce it. Every class must be listed in `config/waste_map.json`, or the kiosk refuses to
+issue codes and says so on screen.
 
 ---
 
@@ -226,10 +280,13 @@ Example: `ECOBIN:Recyclable:550e8400-e29b-41d4-a716-446655440000`
 
 ```
 App.py---CASPTONE-master/
-├── app.py                        # Main scanner application
-├── train.py                      # YOLOv8 training script (optional)
-├── dataset/
-│   └── data.yaml                 # Dataset config (6 classes)
+├── app.py                        # Entry point: camera, model, Firestore, main loop
+├── kiosk/                        # config.py (settings), hardware.py (sorters), flow.py (deposit state machine)
+│   └── ui/                       # theme, drawing, icons, components, screens (DESIGN_SYSTEM.md)
+├── assets/fonts/                 # DM Sans + Fraunces (SIL OFL, same as the ECOReward app)
+├── config/                       # rules.json (shared business rules), waste_map.json, kiosk_settings.json
+├── DESIGN_SYSTEM.md              # kiosk visual and interaction specification
+├── train.py                      # legacy training script (did not produce best.pt)
 ├── kiosk_firestore.py            # least-privilege Firestore client used with the kiosk identity
 ├── (kiosk.json)                  # ⚠️ NOT in repo — kiosk PC only: ~/.ecoreward/kiosk.json (tools/set_claims.py)
 ├── (kiosk-sa.json)               # ⚠️ NOT in repo — ADMIN PC only, OUTSIDE the project: ~/.ecoreward/kiosk-sa.json
