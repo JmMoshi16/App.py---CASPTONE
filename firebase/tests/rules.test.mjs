@@ -367,7 +367,7 @@ describe('qr_scan_history, settings, bins and everything else', () => {
     await denied(setDoc(doc(alice(), 'settings', 'app'), { pointsRecyclable: 1000 }));
     await ok(setDoc(doc(admin(), 'settings', 'app'), { pointsRecyclable: 12, qrExpiryMinutes: 20 }));
   });
-  it('bins: admin reads, nobody writes', async () => {
+  it('bins: admin reads; customers and admins never write (only the kiosk identity does)', async () => {
     await denied(getDocs(collection(alice(), 'bins')));
     await ok(getDocs(collection(admin(), 'bins')));
     await denied(setDoc(doc(admin(), 'bins', 'bin2'), { fillLevel: 1 }));
@@ -437,6 +437,26 @@ describe('kiosk identity (Phase 7, audit C-02): least privilege', () => {
     await denied(addDoc(collection(kiosk(), 'detections'), det({ kioskId: 'other-kiosk' })));
     await denied(addDoc(collection(kiosk(), 'detections'), det({ confidence: 7 })));
     await denied(addDoc(collection(alice(), 'detections'), det()));
+  });
+  it('writes fill levels for its own three compartments only, in the dashboard shape (kiosk audit K-05)', async () => {
+    const db = kiosk();
+    const bin = (o = {}) => ({ location: 'CAFE-PC · Recyclable', fillLevel: 55, status: 'online',
+      lastUpdated: serverTimestamp(), ...o });
+    for (const s of ['bio', 'rec', 'res']) await ok(setDoc(doc(db, 'bins', `kiosk1-${s}`), bin()));
+    await denied(setDoc(doc(db, 'bins', 'other-kiosk-rec'), bin()));
+    await denied(setDoc(doc(db, 'bins', 'kiosk1-xyz'), bin()));
+    await denied(setDoc(doc(db, 'bins', 'kiosk1-rec'), bin({ fillLevel: 140 })));
+    await denied(setDoc(doc(db, 'bins', 'kiosk1-rec'), bin({ fillLevel: 50.5 })));
+    await denied(setDoc(doc(db, 'bins', 'kiosk1-rec'), bin({ lastUpdated: Timestamp.fromMillis(0) })));
+    await denied(setDoc(doc(db, 'bins', 'kiosk1-rec'), bin({ status: 'full' })));
+    await denied(setDoc(doc(db, 'bins', 'kiosk1-rec'), bin({ temperature: 30 })));
+    await denied(deleteDoc(doc(db, 'bins', 'kiosk1-rec')));
+    await denied(getDocs(collection(db, 'bins')));
+    await denied(setDoc(doc(alice(), 'bins', 'alice-rec'), bin()));
+  });
+  it('rejects a token whose dates are ISO strings (kiosk audit K-01)', async () => {
+    const iso = (m) => new Date(Date.now() + m * 60_000).toISOString();
+    await denied(setDoc(doc(kiosk(), 'qr_tokens', 'iso1'), token({ expiresAt: iso(20), createdAt: iso(0) })));
   });
   it('customers cannot create tokens, write heartbeats or read detections', async () => {
     await denied(setDoc(doc(alice(), 'qr_tokens', 'forged2'), token()));

@@ -207,9 +207,20 @@ service cloud.firestore {
       allow read:  if signedIn();
       allow write: if isAdmin();
     }
+    // Fill levels of the kiosk's three compartments, from the ESP32's HC-SR04 sensors (kiosk audit K-05).
+    // Only the kiosk identity writes, only its own documents {uid}-bio|rec|res, in the web's BinStatus shape,
+    // with server time. Nobody else writes; simulated sorters never send these.
     match /bins/{id} {
       allow read:  if isAdmin();
-      allow write: if false;           // nothing in the project writes bins (audit H-09)
+      allow create, update: if isKiosk()
+                    && id in [request.auth.uid + '-bio', request.auth.uid + '-rec', request.auth.uid + '-res']
+                    && request.resource.data.keys().hasOnly(['location', 'fillLevel', 'status', 'lastUpdated'])
+                    && request.resource.data.fillLevel is int
+                    && request.resource.data.fillLevel >= 0 && request.resource.data.fillLevel <= 100
+                    && request.resource.data.status in ['online', 'offline']
+                    && request.resource.data.location is string && request.resource.data.location.size() <= 80
+                    && request.resource.data.lastUpdated == request.time;
+      allow delete: if false;
     }
 
     // ── kiosks (heartbeat) ───────────────────────────────────────────────────

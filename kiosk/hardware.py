@@ -146,7 +146,8 @@ class SimulatedSorter(Sorter):
         out = [e for t, e in self._due if t <= now]
         self._due = [(t, e) for t, e in self._due if t > now]
         for e in out:
-            self.recent.append(f"< {e} (simulated)")
+            line = "OK" if isinstance(e, Ack) else f"W:{e.grams:g}" if isinstance(e, Weight) else str(e)
+            self.recent.append(f"< {line} (simulated)")
         return out
 
 
