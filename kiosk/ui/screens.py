@@ -34,6 +34,7 @@ class View:
     camera_ok: bool = True
     sorter_state: str = "not used"
     sorter_detail: str = ""
+    sorter_port: str = ""
     sorter_ready: bool = False
     detection: object = None                # flow.Detection (voted)
     latest: object = None                   # flow.Detection (this frame, has the box)
@@ -543,6 +544,9 @@ class Renderer:
         elif v.phase == "paused" and v.pause_reason == "bin_full":
             icon, fg, bg = "bin", C.amber_ink, C.surface
             title, sub = "A bin is full. Please call staff.", "The kiosk starts again once the bin is emptied."
+        elif v.phase == "paused" and v.sorter_state == "error":      # will not fix itself: say so
+            icon, fg, bg = "plug", C.error, C.surface
+            title, sub = "Out of service", "Please call staff."
         elif v.phase == "paused":
             icon, fg, bg, spin = "plug", C.error, C.surface, True
             title, sub = "Out of service", "Reconnecting to the sorter…"
@@ -567,6 +571,30 @@ class Renderer:
         if v.phase == "jam":
             ui.text(img, "Staff: clear the tray, then press C", cx, y2 - px(48), "body", C.error_ink, "mt")
 
+    def _sorter_help(self, img, v, x1, y, x2):
+        """Out of service: what is wrong with the ESP32 link and what staff can do about it."""
+        ui, px = self.ui, self.m.px
+        detail = v.sorter_detail or "no answer yet"
+        port = v.sorter_port or "the configured port"
+        if "PySerial" in detail:
+            title = "The serial library is missing"
+            body = ("This PC cannot talk to the ESP32 until PySerial is installed: "
+                    "py -3.11 -m pip install pyserial — then restart the kiosk.")
+        elif v.sorter_state == "error":
+            title, body = "The sorter could not start", f"{detail}. Restart the kiosk after fixing it."
+        elif "waiting for PONG" in detail:
+            title = f"Connected to {port}, but the ESP32 does not answer"
+            body = "Check that the ESP32 firmware is running and answers P with PONG. Retrying every 2 s."
+        else:
+            title = f"Cannot open {port}"
+            body = (f"{detail}. Check the USB cable and that serial_port in config/kiosk_settings.json "
+                    "matches Device Manager. Retrying every 2 s.")
+        y = ui.note(img, x1, y, x2, title, body, "error" if v.sorter_state == "error" else "warning", icon="plug")
+        y += px(12)
+        ui.para(img, "Staff: press D for diagnostics. Test without the ESP32: py -3.11 app.py --no-hardware",
+                x1, y, x2 - x1, "caption", C.ink_2, max_lines=3)
+        return y + px(40)
+
     def _tray_panel(self, img, v, L, now):
         ui, px = self.ui, self.m.px
         x1, y, x2, y2 = self._inner(L)
@@ -574,7 +602,7 @@ class Renderer:
         tx = v.tx
         over = {"weighing": "Checking", "identifying": "Checking", "sorting": "Sorting", "issuing": "Your reward",
                 "rejected": "No reward for this item", "notice": "Sorted", "jam": "Item stuck",
-                "paused": "Paused"}.get(v.phase, "")
+                "paused": "Bin full" if v.pause_reason == "bin_full" else "For staff"}.get(v.phase, "")
         y = ui.overline(img, over, x1, y, C.error_ink if v.phase == "jam" else C.forest) + px(16)
         grams = tx.grams if tx and tx.grams is not None else v.weight
         if grams is not None and v.phase not in ("paused",):
@@ -595,6 +623,8 @@ class Renderer:
                 ui.text(img, f"{pct} %", x2, y, "body_strong", C.error_ink if pct >= 100 else C.ink, "rt")
                 y = ui.meter(img, x1, y + px(30), x2, pct / 100, C.error if pct >= 100 else category(name)["color"]) \
                     + px(16)
+        if v.phase == "paused" and v.pause_reason == "link":
+            y = self._sorter_help(img, v, x1, y, x2)
         y += px(8)
         if v.stages and v.phase != "paused":
             ui.stepper(img, x1, max(y, y2 - len(v.stages) * px(52)), w, v.stages)

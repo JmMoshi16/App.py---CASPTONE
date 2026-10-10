@@ -652,6 +652,7 @@ def _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, no
     return View(
         phase=flow.phase.value, mode=settings.sorter, online=db is not None, model_ok=not bad_labels,
         camera_ok=camera.ok, sorter_state=sorter.state.value, sorter_detail=sorter.detail, sorter_ready=sorter.ready,
+        sorter_port=sorter.port,
         detection=flow.current, latest=flow.latest, lock_progress=flow.lock_progress, armed=flow.armed,
         stages=flow.stages(), tx=tx, points=POINTS_MAP,
         qr_modules=modules_cache.get(tx.token) if tx else None,
