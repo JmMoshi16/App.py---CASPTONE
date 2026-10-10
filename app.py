@@ -253,15 +253,6 @@ def arc(img, cx, cy, r, frac, color, bg=GRAY_DIM, thick=8):
     if frac > 0:
         cv2.ellipse(img, (cx, cy), (r, r), -90, 0, int(360 * frac), color, thick, cv2.LINE_AA)
 
-def vgrad(img, x1, y1, x2, y2, c_top, c_bot):
-    for y in range(y1, y2):
-        t   = (y - y1) / max(y2 - y1, 1)
-        col = tuple(int(c_top[i] * (1 - t) + c_bot[i] * t) for i in range(3))
-        cv2.line(img, (x1, y), (x2, y), col, 1)
-
-def divider(img, x1, x2, y, color=BORDER):
-    cv2.line(img, (x1, y), (x2, y), color, 1)
-
 def dot_divider(img, x1, x2, y, color=BORDER):
     for dx in range(x1, x2, 10):
         cv2.line(img, (dx, y), (dx + 5, y), color, 1)
@@ -763,7 +754,6 @@ def _write_bins(bio_pct: int, rec_pct: int, res_pct: int):  # FIX-H-02
 
 # ── Splash ─────────────────────────────────────────────────────────────────────
 def draw_splash_animation(window_name):
-    import math
     total_frames = 30
     cx, cy = WIN_W // 2, WIN_H // 2
 
@@ -999,9 +989,12 @@ def main():
             _write_in_flight = True
 
             def _do_write(waste_type=_wt, det_label=_wlabel, det_conf=_wconf):
-                global qr_image, qr_active, qr_token, qr_waste_type, qr_points
-                global qr_expires_at, qr_total_secs, qr_claim_code, show_receipt
-                global status_msg, _write_in_flight
+                # nonlocal — these are locals of main(), not module-level globals.
+                # Using 'global' would write to the module namespace and main()'s
+                # loop would never see the update (qr_active would stay False forever).
+                nonlocal qr_image, qr_active, qr_token, qr_waste_type, qr_points
+                nonlocal qr_expires_at, qr_total_secs, qr_claim_code, show_receipt
+                nonlocal status_msg, _write_in_flight
                 try:
                     if db is None:
                         status_msg = "Firebase offline — QR not issued."
