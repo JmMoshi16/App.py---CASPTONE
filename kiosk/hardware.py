@@ -22,6 +22,7 @@ sort command is outstanding at a time; a silent ESP32 (no line for 3 s, no answe
 """
 import queue
 import random
+import sys
 import threading
 import time
 from collections import deque
@@ -291,7 +292,8 @@ class SerialSorter(Sorter):
                 self.port = self._resolve_port()
                 dev = self._opener(self.port, self._baud)
             except ImportError:
-                self._set(LinkState.ERROR, "PySerial is not installed (pip install pyserial)")
+                v = f"{sys.version_info.major}.{sys.version_info.minor}"
+                self._set(LinkState.ERROR, f"PySerial is not installed for Python {v} (py -{v} -m pip install pyserial)")
                 return
             except Exception as e:                           # port missing, busy, access denied
                 self._set(LinkState.RECONNECTING if attempt else LinkState.CONNECTING, f"{e}"[:80])

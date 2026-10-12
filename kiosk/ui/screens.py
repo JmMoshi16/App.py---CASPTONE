@@ -577,9 +577,12 @@ class Renderer:
         detail = v.sorter_detail or "no answer yet"
         port = v.sorter_port or "the configured port"
         if "PySerial" in detail:
-            title = "The serial library is missing"
-            body = ("This PC cannot talk to the ESP32 until PySerial is installed: "
-                    "py -3.11 -m pip install pyserial — then restart the kiosk.")
+            import re
+            m = re.search(r"Python (\d+\.\d+)", detail)
+            ver = m.group(1) if m else "3.11"
+            title = f"The serial library is missing for Python {ver}"
+            body = (f"The kiosk is running on Python {ver}, which has no PySerial. Install it: "
+                    f"py -{ver} -m pip install pyserial — then restart the kiosk. (Or start the kiosk with py -3.11 app.py.)")
         elif v.sorter_state == "error":
             title, body = "The sorter could not start", f"{detail}. Restart the kiosk after fixing it."
         elif "waiting for PONG" in detail:
