@@ -585,6 +585,10 @@ class Renderer:
                     f"py -{ver} -m pip install pyserial — then restart the kiosk. (Or start the kiosk with py -3.11 app.py.)")
         elif v.sorter_state == "error":
             title, body = "The sorter could not start", f"{detail}. Restart the kiosk after fixing it."
+        elif "denied" in detail.lower() or "PermissionError" in detail:     # Windows: another program has the port
+            title = f"{port} is in use by another program"
+            body = (f"Close Arduino IDE's Serial Monitor (or any other program using {port}). "
+                    "The kiosk connects by itself within 2 s.")
         elif "waiting for PONG" in detail:
             title = f"Connected to {port}, but the ESP32 does not answer"
             body = "Check that the ESP32 firmware is running and answers P with PONG. Retrying every 2 s."
