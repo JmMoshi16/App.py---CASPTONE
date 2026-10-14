@@ -886,10 +886,6 @@ def main(argv=None):
                     run(flow.staff_clear(now), now)
                 elif key in (ord('i'), ord('I')) and sorter.device is not None:
                     log(f"[SIM] item placed on the tray: {sorter.device.place_item()} g")
-                elif key in (ord('i'), ord('I')) and settings.mode == "esp32":
-                    ok = getattr(sorter, "test_item", lambda: False)()
-                    log("[TEST] asked the ESP32 for a pretend 20 g item (firmware HAS_SCALE = false)" if ok
-                        else "[TEST] the ESP32 is not connected; no test item")
             except Exception as e:
                 _warn_once(f"keys:{type(e).__name__}", f"[ERROR] {e}\n{traceback.format_exc()}", every=60)
 
