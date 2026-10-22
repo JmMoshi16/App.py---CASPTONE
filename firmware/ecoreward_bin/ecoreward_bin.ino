@@ -16,9 +16,14 @@ const int SORTER_PIN       = 13;
 const int HOME_ANGLE       = 90;
 const int BIN_ANGLE[3]     = {0, 90, 180};       // bins 1 Biodegradable, 2 Recyclable, 3 Residual
 
-const bool HAS_FILL_SENSORS = false;              // true once the 3 analog sensors are wired
-const int  FILL_PIN[3]      = {34, 35, 32};       // analog 0-4095 -> 0-100 %
-const int  FILL_STEP        = 3;                  // without sensors: estimated % added per drop
+// 3x HC-SR04 Ultrasonic Fill Sensors
+const bool HAS_FILL_SENSORS = true;               // Enabled for 3x HC-SR04 sensors
+const int  TRIG_PIN[3]      = {5, 19, 22};       // TRIG: Bin 1 (Bio), Bin 2 (Recyc), Bin 3 (Resid)
+const int  ECHO_PIN[3]      = {32, 21, 23};      // ECHO: Bin 1 (Bio), Bin 2 (Recyc), Bin 3 (Resid)
+
+const float BIN_EMPTY_CM    = 30.0;              // Distance (cm) when bin is empty (0%)
+const float BIN_FULL_CM     = 5.0;               // Distance (cm) when trash reaches top (100%)
+const int   FILL_STEP       = 3;                 // Fallback estimated % added per drop if HAS_FILL_SENSORS is false
 
 // ── timing ───────────────────────────────────────────────────────────────────
 const unsigned long WEIGHT_EVERY_MS = 200;
@@ -43,9 +48,32 @@ void sendFill() {
   Serial.printf("FILL:%d,%d,%d\n", fill[0], fill[1], fill[2]);
 }
 
+// Measure distance using HC-SR04 ultrasonic sensor
+float getUltrasonicDistanceCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout (~5m max)
+  if (duration == 0) return -1.0;                 // Timeout/no reading
+  return (duration * 0.0343) / 2.0;
+}
+
+// Read all 3 HC-SR04 sensors and map distance (cm) to fill level (0 - 100%)
 void readFillSensors() {
   if (!HAS_FILL_SENSORS) return;
-  for (int i = 0; i < 3; i++) fill[i] = map(analogRead(FILL_PIN[i]), 0, 4095, 0, 100);
+  
+  for (int i = 0; i < 3; i++) {
+    float dist = getUltrasonicDistanceCM(TRIG_PIN[i], ECHO_PIN[i]);
+    delay(50); // Short delay to prevent ultrasonic echo crosstalk between bins
+
+    if (dist > 0) {
+      dist = constrain(dist, BIN_FULL_CM, BIN_EMPTY_CM);
+      fill[i] = (int)map(dist * 10, BIN_EMPTY_CM * 10, BIN_FULL_CM * 10, 0, 100);
+    }
+  }
 }
 
 void startSort(int n) {
@@ -113,6 +141,14 @@ void setup() {
   sorter.setPeriodHertz(50);
   sorter.attach(SORTER_PIN, 500, 2400);
   sorter.write(HOME_ANGLE);
+
+  // Initialize HC-SR04 sensor pins
+  if (HAS_FILL_SENSORS) {
+    for (int i = 0; i < 3; i++) {
+      pinMode(TRIG_PIN[i], OUTPUT);
+      pinMode(ECHO_PIN[i], INPUT);
+    }
+  }
 
   scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
   scaleOk = scale.wait_ready_timeout(1000);
