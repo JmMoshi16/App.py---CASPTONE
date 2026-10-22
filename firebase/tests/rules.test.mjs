@@ -550,6 +550,106 @@ describe('concurrency (Phase 8, audit H-02 / H-06 / stock race)', () => {
   });
 });
 
+describe('scan = claim + credit in ONE transaction (Flutter FirebaseService.claimScan, 2026-10-15)', () => {
+  // Mirrors the Flutter transaction: read token + user, refuse like tokenRefusal(), then write the token,
+  // the waste log, the user and the profile copy together. `skipExpiryCheck` plays a phone whose clock is
+  // behind (the client thinks the code is still valid); `bonus` forces a credit above the +100 cap.
+  const claimScan = (db, uid, tokenId, { skipExpiryCheck = false, bonus = 0 } = {}) => runTransaction(db, async (tx) => {
+    const tokenRef = doc(db, 'qr_tokens', tokenId), userRef = doc(db, 'users', uid);
+    const t = (await tx.get(tokenRef)).data();
+    const u = (await tx.get(userRef)).data();                       // all reads before any write
+    if (!t || !['Biodegradable', 'Recyclable', 'Residual'].includes(t.wasteType)) throw new Error('invalid');
+    if ((t.usedBy ?? []).includes(uid)) throw new Error('claimedByYou');
+    if (!skipExpiryCheck && t.expiresAt.toDate() < new Date()) throw new Error('expired');
+    if (t.isUsed === true) throw new Error('alreadyUsed');
+    const base = { Biodegradable: 15, Recyclable: 10, Residual: 5 }[t.wasteType], awarded = base + bonus;
+    const points = u.points + awarded, lifetimePoints = (u.lifetimePoints ?? u.points) + awarded;
+    tx.update(tokenRef, { isUsed: true, usedBy: arrayUnion(uid) });
+    tx.set(doc(collection(db, 'waste_logs')), { userId: uid, wasteType: t.wasteType, pointsEarned: base,
+      pointsAwarded: awarded, timestamp: Timestamp.now(), binId: tokenId });
+    tx.update(userRef, { points, lifetimePoints, scanCount: u.scanCount + 1, streak: 1, lastScanDate: '2026-10-15',
+      badges: u.badges });
+    tx.set(doc(db, 'profiles', uid), { username: u.username, points, lifetimePoints, badges: u.badges });
+  });
+  const state = async (uid, tokenId) => {
+    let out;
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      out = {
+        user: (await getDoc(doc(db, 'users', uid))).data(),
+        token: (await getDoc(doc(db, 'qr_tokens', tokenId))).data(),
+        logs: (await getDocs(query(collection(db, 'waste_logs'), where('binId', '==', tokenId)))).size,
+      };
+    });
+    return out;
+  };
+
+  it('a customer claims and is credited in one transaction (allowed by the rules)', async () => {
+    await ok(claimScan(alice(), 'alice', 'tokTs'));
+    const s = await state('alice', 'tokTs');
+    assert.deepEqual([s.token.isUsed, s.token.usedBy], [true, ['alice']]);
+    assert.deepEqual([s.user.points, s.user.lifetimePoints, s.user.scanCount, s.logs], [60, 60, 4, 1]);
+  });
+
+  it('scanning again after a lost reply is recognised as "claimed by you", not credited twice', async () => {
+    await ok(claimScan(alice(), 'alice', 'tokTs'));
+    await assert.rejects(claimScan(alice(), 'alice', 'tokTs'), /claimedByYou/);
+    assert.equal((await state('alice', 'tokTs')).user.points, 60);
+  });
+
+  it('two phones scan the same code at once: one is credited, the other gets nothing', async () => {
+    const results = await settle([claimScan(alice(), 'alice', 'tokTs'), claimScan(bob(), 'bob', 'tokTs')]);
+    assert.deepEqual(results.sort(), ['fulfilled', 'rejected']);
+    const a = await state('alice', 'tokTs'), b = await state('bob', 'tokTs');
+    assert.equal(a.token.usedBy.length, 1);
+    assert.equal(a.logs, 1);
+    assert.equal((a.user.points - 50) + (b.user.points - 120), 10, 'exactly one credit of 10 points in total');
+  });
+
+  it('expired by SERVER time (phone clock behind): denied, and nothing is half-written', async () => {
+    await denied(claimScan(alice(), 'alice', 'tokOld', { skipExpiryCheck: true }));
+    const s = await state('alice', 'tokOld');
+    assert.deepEqual([s.token.isUsed, s.user.points, s.logs], [false, 50, 0]);
+  });
+
+  it('a credit above the +100 cap is denied and the code stays usable (never used-up-but-unpaid)', async () => {
+    await denied(claimScan(alice(), 'alice', 'tokTs', { bonus: 91 }));
+    const s = await state('alice', 'tokTs');
+    assert.deepEqual([s.token.isUsed, s.user.points, s.logs], [false, 50, 0]);
+  });
+});
+
+describe('staff analytics from server-side counts (design check, 2026-10-15)', () => {
+  // The fixtures hold 2 waste logs with ISO-string timestamps (older app versions). Add 3 with Timestamps.
+  const addTimestampLogs = () => env.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+    for (const [i, type] of ['Recyclable', 'Recyclable', 'Residual'].entries()) {
+      await setDoc(doc(db, 'waste_logs', `ts${i}`), { userId: 'alice', wasteType: type, pointsEarned: 10,
+        pointsAwarded: 10, timestamp: Timestamp.fromDate(new Date('2026-10-14T03:00:00Z')), binId: 'b' });
+    }
+  });
+  const logs = (db) => collection(db, 'waste_logs');
+
+  it('staff can count all disposals and per category without downloading them', async () => {
+    await addTimestampLogs();
+    assert.equal((await ok(getCountFromServer(logs(admin())))).data().count, 5);
+    const rec = await ok(getCountFromServer(query(logs(admin()), where('wasteType', '==', 'Recyclable'))));
+    assert.equal(rec.data().count, 4);
+  });
+
+  it('a customer cannot count everyone\'s disposals', async () => {
+    await denied(getCountFromServer(logs(alice())));
+  });
+
+  it('a time-range count silently skips logs whose timestamp is a string: migrate before switching', async () => {
+    await addTimestampLogs();
+    const inRange = query(logs(admin()),
+      where('timestamp', '>=', Timestamp.fromDate(new Date('2000-01-01'))),
+      where('timestamp', '<', Timestamp.fromDate(new Date('2100-01-01'))));
+    assert.equal((await ok(getCountFromServer(inRange))).data().count, 3, 'the 2 ISO-string logs are not counted');
+  });
+});
+
 describe('registration self-heal (Phase 8, audit H-10)', () => {
   // Flutter FirebaseService.login: Auth account exists but users/{uid} was never written ->
   // create a default customer + profile in one batch at the next login.
