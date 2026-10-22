@@ -529,6 +529,30 @@ def _views():
     }
 
 
+class SorterHelpTextTests(unittest.TestCase):
+    """The staff box names the problem in plain words; raw (and truncated) errors only as a last resort."""
+
+    def setUp(self):
+        from kiosk.ui.screens import sorter_help_text
+        self.f = sorter_help_text
+
+    def test_nothing_plugged_in_says_so_without_the_raw_error(self):
+        detail = "could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the fil"   # cut at 80
+        title, body = self.f(detail, "reconnecting", "COM3")
+        self.assertEqual(title, "No ESP32 found on COM3")
+        self.assertIn("data USB cable", body)
+        self.assertNotIn("FileNotFoundError", body)
+
+    def test_the_other_cases_keep_their_wording(self):
+        self.assertEqual(self.f("could not open port 'COM3': PermissionError(13, 'Access is denied.')",
+                                "reconnecting", "COM3")[0], "COM3 is in use by another program")
+        self.assertEqual(self.f("PySerial is not installed for Python 3.14 (py -3.14 -m pip install pyserial)",
+                                "error", None)[0], "The serial library is missing for Python 3.14")
+        self.assertEqual(self.f("COM3: waiting for PONG", "connecting", "COM3")[0],
+                         "Connected to COM3, but the ESP32 does not answer")
+        self.assertEqual(self.f("something odd", "reconnecting", "COM3")[0], "Cannot open COM3")
+
+
 class ScreenTests(unittest.TestCase):
     SIZES = [(1280, 720), (1024, 600), (1920, 1080)]
 

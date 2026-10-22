@@ -574,28 +574,7 @@ class Renderer:
     def _sorter_help(self, img, v, x1, y, x2):
         """Out of service: what is wrong with the ESP32 link and what staff can do about it."""
         ui, px = self.ui, self.m.px
-        detail = v.sorter_detail or "no answer yet"
-        port = v.sorter_port or "the configured port"
-        if "PySerial" in detail:
-            import re
-            m = re.search(r"Python (\d+\.\d+)", detail)
-            ver = m.group(1) if m else "3.11"
-            title = f"The serial library is missing for Python {ver}"
-            body = (f"The kiosk is running on Python {ver}, which has no PySerial. Install it: "
-                    f"py -{ver} -m pip install pyserial — then restart the kiosk. (Or start the kiosk with py -3.11 app.py.)")
-        elif v.sorter_state == "error":
-            title, body = "The sorter could not start", f"{detail}. Restart the kiosk after fixing it."
-        elif "denied" in detail.lower() or "PermissionError" in detail:     # Windows: another program has the port
-            title = f"{port} is in use by another program"
-            body = (f"Close Arduino IDE's Serial Monitor (or any other program using {port}). "
-                    "The kiosk connects by itself within 2 s.")
-        elif "waiting for PONG" in detail:
-            title = f"Connected to {port}, but the ESP32 does not answer"
-            body = "Check that the ESP32 firmware is running and answers P with PONG. Retrying every 2 s."
-        else:
-            title = f"Cannot open {port}"
-            body = (f"{detail}. Check the USB cable and that serial_port in config/kiosk_settings.json "
-                    "matches Device Manager. Retrying every 2 s.")
+        title, body = sorter_help_text(v.sorter_detail, v.sorter_state, v.sorter_port)
         y = ui.note(img, x1, y, x2, title, body, "error" if v.sorter_state == "error" else "warning", icon="plug")
         y += px(12)
         ui.para(img, "Staff: press D for diagnostics. Test without the ESP32: py -3.11 app.py --no-hardware",
@@ -868,3 +847,32 @@ class Renderer:
         self.ts.draw(layer, "Smart café recycling", W / 2, cy + r + self.m.px(24), "body_lg", C.ink_2, "mt")
         cv2.addWeighted(layer, a, img, 1 - a, 0, dst=img)
         return img
+
+def sorter_help_text(detail, state, port):
+    """(title, body) for the staff box when the ESP32 link is down. Plain words first; raw errors only as a last resort."""
+    detail = detail or "no answer yet"
+    port = port or "the configured port"
+    if "PySerial" in detail:
+        import re
+        m = re.search(r"Python (\d+\.\d+)", detail)
+        ver = m.group(1) if m else "3.11"
+        return (f"The serial library is missing for Python {ver}",
+                f"The kiosk is running on Python {ver}, which has no PySerial. Install it: "
+                f"py -{ver} -m pip install pyserial — then restart the kiosk. (Or start the kiosk with py -3.11 app.py.)")
+    if state == "error":
+        return "The sorter could not start", f"{detail}. Restart the kiosk after fixing it."
+    if "denied" in detail.lower() or "PermissionError" in detail:     # Windows: another program has the port
+        return (f"{port} is in use by another program",
+                f"Close Arduino IDE's Serial Monitor (or any other program using {port}). "
+                "The kiosk connects by itself within 2 s.")
+    if "FileNotFoundError" in detail or "cannot find" in detail.lower():   # Windows: nothing on that port
+        return (f"No ESP32 found on {port}",
+                "Windows does not see a device on that port. Plug the ESP32 in with a data USB cable "
+                "(charge-only cables do not work), then check Device Manager > Ports (COM & LPT) for its COM number "
+                "and set serial_port in config/kiosk_settings.json. Retrying every 2 s.")
+    if "waiting for PONG" in detail:
+        return (f"Connected to {port}, but the ESP32 does not answer",
+                "Check that the ESP32 firmware is running and answers P with PONG. Retrying every 2 s.")
+    return (f"Cannot open {port}",
+            f"{detail}. Check the USB cable and that serial_port in config/kiosk_settings.json "
+            "matches Device Manager. Retrying every 2 s.")
