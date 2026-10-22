@@ -29,7 +29,7 @@ The ECOReward system has 3 parts that share the same Firebase backend:
    only after that write succeeded
 5. User scans the QR with the Flutter app → the app credits points → the kiosk sees the claim and shows "Claimed!"
 6. No phone? Tap **"No phone? Claim code"** (or staff press **R**) → receipt with a manual claim code
-7. Staff enter **Gmail + claim code** in the Admin Web → points credited
+7. Staff enter the **claim code + username** in the Admin Web, confirm the account by its email → points credited
 
 ---
 
@@ -37,14 +37,13 @@ The ECOReward system has 3 parts that share the same Firebase backend:
 
 - [x] Full 1280×720 UI with camera HUD, scan frame corners, confidence bar
 - [x] QR panel with waste type card, points card, circular arc timer, token card
-- [x] Receipt screen with manual claim code (`token[:6]-token[6:10]`)
+- [x] Receipt screen with a manual claim code (`ECO-` + 4 random digits, stored as `claimCode` on the token)
 - [x] Success overlay after QR is scanned
 - [x] Firebase integration — reads/writes `qr_tokens` collection
 - [x] Firestore real-time listener (`watch_token`) auto-dismisses QR on scan
 - [x] QR fix — uses `INTER_NEAREST` resize to keep modules sharp and scannable
-- [x] Downloaded `garbage-classification-3` dataset from Roboflow (10,464 images, 6 classes)
-- [x] Trained custom YOLOv8n model locally on CPU (5 epochs, imgsz=320)
-- [x] `best.pt` trained and working — detects BIODEGRADABLE, CARDBOARD, GLASS, METAL, PAPER, PLASTIC
+- [x] Custom YOLOv8n model `best.pt`: 20 classes, imgsz 640, 100 epochs (trained on Kaggle). Classes, validation
+      results and limits: `docs/ml-model-card.md` (the first 6-class / 5-epoch prototype was replaced)
 - [x] Full environment setup on new machine (Python 3.11, PyTorch CPU, all dependencies)
 - [x] Flutter mobile app — users can scan QR codes and receive points
 - [x] Admin web dashboard — staff can monitor waste logs and scan history
@@ -53,12 +52,12 @@ The ECOReward system has 3 parts that share the same Firebase backend:
 
 ## What Still Needs To Be Done
 
-- [x] **Admin Web: Manual Claim page** — staff inputs claim code + user Gmail → system verifies and credits points ✅
+- [x] **Admin Web: Manual Claim page** — staff enter claim code + username, confirm the account by email → credited like a phone scan ✅
 - [x] **Connect all 3 parts to same Firebase project** — `.env.local` created with `ecoreward-bin` project config ✅
 - [ ] **Test full QR flow end-to-end** — run `app.py`, scan QR with Flutter app, confirm points awarded
-- [ ] **Test receipt / manual claim flow** — press R, give Gmail + claim code to staff, verify points credited
-- [ ] **Fine-tune model** — 5 epochs is functional; retrain with more epochs for better accuracy on PAPER and PLASTIC classes
-- [ ] **Add more waste classes** — PAPER and PLASTIC detection accuracy is low; more training data needed
+- [ ] **Test receipt / manual claim flow** — press R, give the username + claim code to staff, verify points credited
+- [ ] **Improve the model** — mAP@50 0.776 / mAP@50-95 0.613; fix the label-set issues listed in
+      `docs/ml-model-card.md` before retraining. Model files are git-ignored: keep a backup of `best.pt`
 
 ---
 
@@ -297,10 +296,12 @@ Repeating problems (camera gone, sorter reconnecting, Firestore unreachable) are
 For users who don't have their phone with them:
 
 1. Tap **No phone? Claim code** (or press `R`) during QR display → receipt appears with a **manual claim code**
-2. User tells staff their **Gmail account** and the **claim code** shown on screen
-3. Staff opens the **Admin Web Dashboard** → Manual Claim page
-4. Staff enters the claim code + user Gmail → clicks "Claim Points"
-5. System verifies the code is valid and not yet used → credits points to that Gmail account
+2. The customer tells staff their **username** and the **claim code** shown on screen (`ECO-1234`)
+3. Staff opens the **Admin Web Dashboard** → Manual Claim page and enters both
+4. Staff confirm the account by its email (if several customers share the username, staff pick by email)
+5. The site checks the code is unused and unexpired and credits the account exactly like a phone scan
+   (streak multiplier, scan count, badges). If two live receipts share the 4 digits, it refuses and asks for
+   the QR scan instead of guessing
 
 ---
 
