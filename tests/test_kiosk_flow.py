@@ -725,7 +725,7 @@ class SettingsTests(unittest.TestCase):
         s, problems = cfgmod.load_settings(Path(__file__).resolve().parents[1] / "config" / "kiosk_settings.json")
         self.assertEqual(problems, [])
         self.assertEqual((s.mode, s.serial_port, s.baud, s.min_item_g, s.steady_ms, s.identify_timeout_s),
-                         ("esp32", "COM3", 115200, 3.0, 500, 3.0))
+                         ("esp32", "COM3", 115200, 6.0, 500, 3.0))   # 6 g: above the 3-4 g drift of the empty tray
 
     def test_rules_have_a_weight_limit_for_every_label(self):
         import json
