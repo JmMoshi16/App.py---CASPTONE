@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { assertFails, assertSucceeds, initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import {
-  addDoc, arrayUnion, collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, increment, limit,
+  addDoc, arrayUnion, Bytes, deleteField, collection, deleteDoc, doc, getCountFromServer, getDoc, getDocs, increment, limit,
   orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, updateDoc, where, writeBatch,
 } from 'firebase/firestore';
 
@@ -154,6 +154,17 @@ describe('users - updating (the privilege-escalation and cheating paths)', () =>
   const a = () => doc(alice(), 'users', 'alice');
   it('H-01 payload: username only', async () => { await ok(updateDoc(a(), { username: 'alice_new' })); });
   it('a customer cannot make themselves admin', async () => { await denied(updateDoc(a(), { role: 'admin' })); });
+  it('Edit profile: a small photo can be set and removed', async () => {
+    await ok(updateDoc(a(), { username: 'alice', photo: Bytes.fromUint8Array(new Uint8Array(30 * 1024)) }));
+    await ok(updateDoc(a(), { photo: deleteField() }));
+  });
+  it('Edit profile: an oversized or non-bytes photo is refused', async () => {
+    await denied(updateDoc(a(), { photo: Bytes.fromUint8Array(new Uint8Array(160 * 1024)) }));
+    await denied(updateDoc(a(), { photo: 'https://example.com/me.jpg' }));
+  });
+  it("Edit profile: nobody can set someone else's photo", async () => {
+    await denied(updateDoc(doc(bob(), 'users', 'alice'), { photo: Bytes.fromUint8Array(new Uint8Array(10)) }));
+  });
   it('a customer cannot change their e-mail', async () => { await denied(updateDoc(a(), { email: 'ceo@example.com' })); });
   it('scan transaction (logWaste): points +15, scanCount +1, streak, lastScanDate, badges', async () => {
     const db = alice(); const ref = doc(db, 'users', 'alice');

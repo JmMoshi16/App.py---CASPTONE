@@ -86,6 +86,12 @@ service cloud.firestore {
       return after is int && after >= before && after <= before + 100;
     }
 
+    // Optional profile photo (Edit profile, 2026-10-27): a small JPEG of at most 150 KB, or removed.
+    function photoOk() {
+      return !('photo' in request.resource.data)
+          || (request.resource.data.photo is bytes && request.resource.data.photo.size() <= 153600);
+    }
+
     // ── users ────────────────────────────────────────────────────────────────
     // Private: e-mail and role. The leaderboard reads /profiles instead (audit H-13).
     match /users/{uid} {
@@ -107,9 +113,10 @@ service cloud.firestore {
       // `role` and `email` are NOT in the list, so they can never change.
       allow update: if (isOwner(uid)
                         && changedKeys().hasOnly(['username', 'points', 'lifetimePoints', 'scanCount', 'streak',
-                                                  'lastScanDate', 'badges', 'createdAt'])
+                                                  'lastScanDate', 'badges', 'createdAt', 'photo'])
                         && pointsOk()
-                        && lifetimeOk())
+                        && lifetimeOk()
+                        && photoOk())
                     || isAdmin();
 
       allow delete: if false;

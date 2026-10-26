@@ -13,6 +13,7 @@ This notice explains what information we keep, why, and how to have it deleted.
 |---|---|---|
 | Your e-mail address and password | When you register | So you can sign in. Your password is handled by Google Firebase Authentication; we never see it. |
 | Your username | When you register or change it | Shown on the leaderboard |
+| Your profile photo (optional) | When you add one in Edit profile | Shown to you in the app. Never on the leaderboard; you can remove it any time |
 | Each scan: waste category, time, points earned | When you scan a bin QR code | To credit your points, streaks and badges, and show your history |
 | Rewards you redeem and their codes | When you redeem | So cafe staff can hand the reward over |
 
@@ -25,7 +26,7 @@ We do **not** use advertising, analytics or tracking tools in the app or the adm
 ## Who can see it
 
 - **You** — your profile, points, history and redemptions.
-- **Other customers** — only your **username, points and badges** on the leaderboard. Never your e-mail.
+- **Other customers** — only your **username, points and badges** on the leaderboard. Never your e-mail or photo.
 - **Cafe staff with admin access** — your account, scans and redemptions, to run the reward programme.
 
 Your data is stored in Google Firebase (Cloud Firestore and Authentication) for the cafe's project.
