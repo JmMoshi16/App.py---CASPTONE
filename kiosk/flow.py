@@ -108,6 +108,13 @@ class IssueToken:
 
 
 @dataclass(frozen=True)
+class SaveOfflineReward:
+    """Firebase is unreachable after a sort: keep the reward on this machine and upload it later."""
+    tx_id: int
+    waste_type: str
+
+
+@dataclass(frozen=True)
 class WatchToken:
     token: str
 
@@ -209,15 +216,37 @@ class _RewardFlow:
         self._go(Phase.QR, now)
         return [WatchToken(token)]
 
+    def _save_offline(self, now):
+        """The item is in the bin but Firebase is out of reach: the app saves the reward locally."""
+        self._go(Phase.ISSUING, now)
+        return [SaveOfflineReward(self.tx.id, self.tx.waste_type)]
+
+    def on_offline_saved(self, tx_id, claim_code, now):
+        if self.phase != Phase.ISSUING or self.tx is None or self.tx.id != tx_id:
+            return []
+        self.tx.claim_code = claim_code
+        self._say(f"[OFFLINE] #{tx_id} reward saved on this kiosk, claim code {claim_code}")
+        self.notice = (f"Your code: {claim_code}",
+                       "We're offline. Show this code to staff: they can add your points once the kiosk is back "
+                       "online.")
+        self._notice_hold = getattr(self.cfg, "offline_code_seconds", 30.0)
+        self._go(Phase.NOTICE, now)
+        return [Sound("success")]
+
+    def on_offline_failed(self, tx_id, reason, now):
+        if self.phase != Phase.ISSUING or self.tx is None or self.tx.id != tx_id:
+            return []
+        return self._fail(Failure("issue_failed", "We couldn't create your code",
+                                  f"Your item went into the {self.tx.waste_type} bin, but the reward could not be "
+                                  "saved. Please ask staff.", "error"), now)
+
     def on_issue_failed(self, tx_id, reason, now):
         if self.phase != Phase.ISSUING or self.tx is None or self.tx.id != tx_id:
             return []
         if self.tx.sorted:
-            msg = (f"Your item went into the {self.tx.waste_type} bin, but we couldn't create a reward code. "
-                   "Please ask staff.")
-        else:
-            msg = "Please try again in a moment. If it keeps happening, ask staff."
-        return self._fail(Failure("issue_failed", "We couldn't create your code", msg, "error"), now)
+            return [SaveOfflineReward(self.tx.id, self.tx.waste_type)]   # keep the points; upload later
+        return self._fail(Failure("issue_failed", "We couldn't create your code",
+                                  "Please try again in a moment. If it keeps happening, ask staff.", "error"), now)
 
     def on_scanned(self, token, now, wall_local=None):
         if self.phase != Phase.QR or self.tx is None or token != self.tx.token:
@@ -465,6 +494,7 @@ class TrayConfig:
     weighing_hint_s: float = 5.0    # "please let go" after this long without a steady weight
     reject_seconds: float = 4.0
     notice_seconds: float = 3.0
+    offline_code_seconds: float = 30.0   # long enough to write down or photograph the claim code
     issue_timeout: float = 20.0
     qr_display_seconds: float = 180.0
     success_seconds: float = 4.0
@@ -481,7 +511,9 @@ class TrayFlow(_RewardFlow):
         self.cfg = cfg
         self.scale = WeightTracker(cfg.steady_ms, cfg.steady_tolerance_g)
         self.fill = None
+        self._notice_hold = None             # a longer NOTICE (the offline claim code)
         self.link_up = False
+        self.scale_ok = True                 # False after ERR:HX711: a sort could not tell the item fell
         self.pause_reason = "link"           # out of service until the ESP32 answers PONG
         self._go(Phase.PAUSED, 0.0)
         self._votes = []
@@ -512,13 +544,14 @@ class TrayFlow(_RewardFlow):
         return self.scale.latest is None or self.scale.latest < self.cfg.min_item_g
 
     def _bin_full(self):
-        return self.fill is not None and any(v >= self.cfg.bin_full_pct for v in self.fill)
+        # A bin without a reading (None) is unknown, never full.
+        return self.fill is not None and any(v is not None and v >= self.cfg.bin_full_pct for v in self.fill)
 
     def bins_warn(self):
         """Names of bins at or above bin_warn_pct."""
         if self.fill is None:
             return []
-        return [BIN_NAMES[i + 1] for i, v in enumerate(self.fill) if v >= self.cfg.bin_warn_pct]
+        return [BIN_NAMES[i + 1] for i, v in enumerate(self.fill) if v is not None and v >= self.cfg.bin_warn_pct]
 
     def _code(self, waste_type):
         return str(self.cfg.bin_codes.get(waste_type, DEFAULT_BIN_CODES[waste_type]))
@@ -535,8 +568,12 @@ class TrayFlow(_RewardFlow):
         """Leave a finished deposit. Never READY while the scale still reads an item: that item is new."""
         self.tx, self.current, self.latest, self.notice = None, None, None, None
         self._votes, self._multi, self._awaiting = [], 0, None
+        self._notice_hold = None
         if not self.link_up:
             self.pause_reason = "link"
+            self._go(Phase.PAUSED, now)
+        elif not self.scale_ok:
+            self.pause_reason = "scale"
             self._go(Phase.PAUSED, now)
         elif self._bin_full():
             self.pause_reason = "bin_full"
@@ -576,6 +613,9 @@ class TrayFlow(_RewardFlow):
             return []
         if isinstance(ev, LinkLost):
             self.link_up = False
+            self.scale_ok = True                            # the ESP32 reboots and reports its scale again
+            if self.phase == Phase.PAUSED and self.pause_reason == "scale":
+                self.pause_reason = "link"                  # now waiting for the reboot, not the scale
             self._say(f"[SORTER] lost: {ev.reason}")
             if self.phase in (Phase.READY, Phase.WEIGHING, Phase.IDENTIFYING, Phase.SORTING, Phase.JAM):
                 return self._abort("ESP32 disconnected", now)
@@ -595,6 +635,11 @@ class TrayFlow(_RewardFlow):
                 self._say(f"[SORTER] ignored {ev} during {self.phase.value}")
             elif isinstance(ev, DeviceError):
                 self._say(f"[SORTER] ESP32 error: {ev.message}")
+                if "HX711" in ev.message.upper():
+                    self.scale_ok = False
+                    if self.phase in (Phase.READY, Phase.WEIGHING):
+                        self.pause_reason = "scale"
+                        self._go(Phase.PAUSED, now)
             return []
         expected = int(self.tx.bin_code)
         if isinstance(ev, Ok):
@@ -699,9 +744,7 @@ class TrayFlow(_RewardFlow):
             self._go(Phase.NOTICE, now)
             return []
         if not self.online:
-            self.notice = ("Sorted!", "Reward codes are offline right now.")
-            self._go(Phase.NOTICE, now)
-            return []
+            return self._save_offline(now)
         return self._begin_issue(now)
 
     # ── staff and time ─────────────────────────────────────────────────────
@@ -737,7 +780,7 @@ class TrayFlow(_RewardFlow):
             return []
         if p == Phase.REJECTED and dt >= self.cfg.reject_seconds:
             return self._end(now)
-        if p == Phase.NOTICE and dt >= self.cfg.notice_seconds:
+        if p == Phase.NOTICE and dt >= (self._notice_hold or self.cfg.notice_seconds):
             return self._end(now)
         return self._reward_tick(now, wall_utc)
 

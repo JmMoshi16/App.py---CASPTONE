@@ -128,9 +128,10 @@ def parse_line(text):
             return Jam(_bin(t[4:]))
         if up.startswith("FILL:"):
             parts = [float(p) for p in t[5:].split(",")]
-            if len(parts) != 3 or not all(0 <= v <= 150 for v in parts):
+            # -1 = that sensor has no reading (unwired, out of range): unknown, not 0 % full.
+            if len(parts) != 3 or not all(v == -1 or 0 <= v <= 150 for v in parts):
                 return None
-            return Fill(*(min(100, int(round(v))) for v in parts))
+            return Fill(*(None if v < 0 else min(100, int(round(v))) for v in parts))
         if up.startswith("ERR:"):
             return DeviceError(t[4:].strip()[:80] or "unspecified")
     except (ValueError, TypeError):

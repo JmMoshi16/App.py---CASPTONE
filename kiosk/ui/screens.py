@@ -66,7 +66,7 @@ class View:
     steady: bool = False
     fill: object = None                     # (bio, rec, res) percent
     bins_warn: list = field(default_factory=list)
-    pause_reason: object = None             # "bin_full" | "link"
+    pause_reason: object = None             # "bin_full" | "link" | "scale"
     notice: object = None                   # (title, message) for rejected / notice
     weighing_hint: bool = False
     serial_lines: list = field(default_factory=list)
@@ -544,6 +544,9 @@ class Renderer:
         elif v.phase == "paused" and v.pause_reason == "bin_full":
             icon, fg, bg = "bin", C.amber_ink, C.surface
             title, sub = "A bin is full. Please call staff.", "The kiosk starts again once the bin is emptied."
+        elif v.phase == "paused" and v.pause_reason == "scale":
+            icon, fg, bg = "plug", C.error, C.surface
+            title, sub = "Out of service", "The scale is not responding. Please call staff."
         elif v.phase == "paused" and v.sorter_state == "error":      # will not fix itself: say so
             icon, fg, bg = "plug", C.error, C.surface
             title, sub = "Out of service", "Please call staff."
@@ -605,9 +608,11 @@ class Renderer:
             y += px(32)
         if v.phase == "paused" and v.fill:
             for name, pct in zip(("Biodegradable", "Recyclable", "Residual"), v.fill):
+                full = pct is not None and pct >= 100      # None: that sensor has no reading
                 ui.text(img, name, x1, y, "body", C.ink)
-                ui.text(img, f"{pct} %", x2, y, "body_strong", C.error_ink if pct >= 100 else C.ink, "rt")
-                y = ui.meter(img, x1, y + px(30), x2, pct / 100, C.error if pct >= 100 else category(name)["color"]) \
+                ui.text(img, "no reading" if pct is None else f"{pct} %", x2, y, "body_strong",
+                        C.error_ink if full else C.ink, "rt")
+                y = ui.meter(img, x1, y + px(30), x2, (pct or 0) / 100, C.error if full else category(name)["color"]) \
                     + px(16)
         if v.phase == "paused" and v.pause_reason == "link":
             y = self._sorter_help(img, v, x1, y, x2)

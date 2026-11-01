@@ -43,8 +43,8 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kiosk_firestore import KioskFirestore, SERVER_TIMESTAMP as KIOSK_SERVER_TIMESTAMP  # noqa: E402
 from kiosk.config import load_settings  # noqa: E402
-from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SendSort, Sound, StopWatching, Tare,  # noqa: E402
-                        TransactionFlow, TrayConfig, TrayFlow, WatchToken)
+from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SaveOfflineReward, SendSort, Sound,  # noqa: E402
+                        StopWatching, Tare, TransactionFlow, TrayConfig, TrayFlow, WatchToken)
 from kiosk.hardware import DEFAULT_BIN_CODES, Fill, LinkLost, make_sorter  # noqa: E402
 from kiosk.ui.screens import Renderer, View  # noqa: E402
 
@@ -167,7 +167,8 @@ else:
 # ── YOLO ───────────────────────────────────────────────────────────────────────
 # An OpenVINO export (README "Faster inference") is used when present; otherwise the PyTorch weights.
 _OPENVINO_DIR = _APP_DIR / "best_openvino_model"
-MODEL_FILE = str(_OPENVINO_DIR) if _OPENVINO_DIR.is_dir() else "best.pt"
+# Next to app.py, not the current folder: starting the kiosk from elsewhere used to load the fallback model.
+MODEL_FILE = str(_OPENVINO_DIR) if _OPENVINO_DIR.is_dir() else str(_APP_DIR / "best.pt")
 print("[AI] Loading YOLO model...")
 try:
     model = YOLO(MODEL_FILE)
@@ -377,7 +378,7 @@ def issue_token(waste_type, label, confidence):
             "wasteType":   waste_type,
             "label":       label,
             "confidence":  float(confidence),
-            "modelFile":   MODEL_FILE,
+            "modelFile":   Path(MODEL_FILE).name,   # the name only: never this machine's folders
             "modelSha256": MODEL_SHA256,
             "timestamp":   SERVER_TS,
             "token":       token,
@@ -424,7 +425,8 @@ class BinsReporter:
         self.latest = levels
         if db is None:
             return False
-        changed = self.last is None or max(abs(a - b) for a, b in zip(levels, self.last)) >= 3
+        changed = self.last is None or any(
+            (a is None) != (b is None) or (a is not None and abs(a - b) >= 3) for a, b in zip(levels, self.last))
         due = (changed and now - self.last_t >= self.min_interval) or now - self.last_t >= self.refresh
         if not due:
             return False
@@ -435,6 +437,8 @@ class BinsReporter:
     def _write(self, levels):
         try:
             for (suffix, name), level in zip(self.KEYS, levels):
+                if level is None:      # no reading from that sensor: leave the dashboard's last real value
+                    continue
                 db.collection("bins").document(f"{KIOSK_ID}-{suffix}").set({
                     "location":    f"{KIOSK_NAME} · {name}",
                     "fillLevel":   int(level),
@@ -443,6 +447,90 @@ class BinsReporter:
                 })
         except Exception as e:
             _warn_once("bins", f"[BINS] fill levels not written: {e}")
+
+
+# ── Rewards saved while offline -> qr_tokens once Firebase is back ────────────
+PENDING_FILE = Path.home() / ".ecoreward" / "pending_tokens.jsonl"
+PENDING_VALID_MINUTES = 29   # the rules accept at most 30 min after the upload's server time
+
+
+class PendingRewards:
+    """The item is in the bin but Firebase is unreachable: keep the reward as one JSON line on this machine,
+    show the customer its 4-digit claim code, and upload it as a normal kiosk token once online. Staff then
+    credit it with the web's Manual Claim (which finds tokens by claim code). No QR is shown for it: a QR
+    must never point at a token that does not exist yet (audit C-03)."""
+
+    def __init__(self, path=PENDING_FILE):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def add(self, waste_type):
+        """Save one reward; returns its claim code. Raises OSError if the disk write fails."""
+        entry = {"token": str(uuid.uuid4()), "wasteType": waste_type,
+                 "claimCode": str(1000 + secrets.randbelow(9000)), "savedAt": _now().isoformat()}
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        log(f"[OFFLINE] reward saved locally: {waste_type}, claim code {entry['claimCode']}")
+        return entry["claimCode"]
+
+    def count(self):
+        with self._lock:
+            return len(self._read())
+
+    def _read(self):
+        if not self.path.exists():
+            return []
+        out = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                log(f"[OFFLINE] skipped an unreadable line in {self.path.name}")
+        return out
+
+    def flush(self):
+        """Upload what is waiting (worker thread). Each uploaded line is removed; failures stay for next time."""
+        if db is None:
+            return 0
+        with self._lock:
+            left, sent = [], 0
+            for e in self._read():
+                try:
+                    db.collection("qr_tokens").document(e["token"]).set({
+                        "wasteType": e["wasteType"],
+                        "expiresAt": _now() + timedelta(minutes=PENDING_VALID_MINUTES),
+                        "usedBy":    [],
+                        "isUsed":    False,
+                        "createdAt": SERVER_TS,
+                        "claimCode": e["claimCode"],
+                    })
+                    sent += 1
+                    log(f"[OFFLINE] uploaded claim code {e['claimCode']} ({e['wasteType']}); "
+                        f"staff can claim it for {PENDING_VALID_MINUTES} min")
+                except Exception as err:
+                    left.append(e)
+                    _warn_once("pending", f"[OFFLINE] upload failed, will retry: {err}")
+            if sent:
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text("".join(json.dumps(e) + "\n" for e in left), encoding="utf-8")
+                tmp.replace(self.path)
+            return sent
+
+
+def _start_pending_uploader(pending, interval=30):
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(interval):
+            try:
+                pending.flush()
+            except Exception as e:
+                _warn_once("pending", f"[OFFLINE] uploader error: {e}")
+
+    threading.Thread(target=_loop, daemon=True, name="pending-rewards").start()
+    return stop.set
 
 
 # ── Detection ─────────────────────────────────────────────────────────────────
@@ -620,6 +708,7 @@ def _diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, star
     mapped = "all mapped" if not bad_labels else f"{len(bad_labels)} unmapped"
     rows = [
         ("Kiosk", [("Name", KIOSK_NAME), ("Firestore", firestore_mode),
+                   ("Offline rewards waiting", str(PendingRewards().count())),
                    ("Uptime", f"{up // 3600} h {up % 3600 // 60} min"),
                    ("Log", Path(log_path).name if log_path else "off")]),
         ("Model", [("File", Path(MODEL_FILE).name), ("SHA-256", MODEL_SHA256[:12] + "…"),
@@ -639,9 +728,11 @@ def _diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, star
         rows.insert(0, ("Scale", [("Weight", f"{w:.1f} g" if w is not None else "—"),
                                   ("Steady", "yes" if sorter.steady else "no"),
                                   ("Item threshold", f"{settings.min_item_g:g} g"),
-                                  ("Fill (bio/rec/res)", " / ".join(f"{v} %" for v in flow.fill) if flow.fill else "—")]))
+                                  ("Fill (bio/rec/res)", " / ".join("—" if v is None else f"{v} %" for v in flow.fill)
+                                   if flow.fill else "—")]))
     if bins.latest:
-        rows.append(("Fill levels (ESP32)", [(n, f"{v} %") for (_, n), v in zip(BinsReporter.KEYS, bins.latest)]))
+        rows.append(("Fill levels (ESP32)", [(n, "no reading" if v is None else f"{v} %")
+                                             for (_, n), v in zip(BinsReporter.KEYS, bins.latest)]))
     return rows
 
 
@@ -712,6 +803,7 @@ def main(argv=None):
             drop_timeout=settings.drop_timeout, cooldown_seconds=settings.cooldown_seconds, debug=settings.debug))
     camera = Camera(settings.camera_index)
     bins = BinsReporter(settings.bins_min_interval)
+    pending = PendingRewards()
     results = queue.Queue()
     clicks = deque(maxlen=8)
 
@@ -740,6 +832,9 @@ def main(argv=None):
 
     draw_splash_animation(WINDOW)
     stop_heartbeat = _start_heartbeat()
+    stop_pending = _start_pending_uploader(pending)
+    if pending.count():
+        log(f"[OFFLINE] {pending.count()} reward(s) saved while offline; uploading when Firebase is reachable")
 
     # (audit M-22) A model whose classes are not all in waste_map.json would silently score
     # unknown objects as Residual — e.g. the yolov8n.pt fallback sees a "person". Refuse QRs instead.
@@ -782,6 +877,12 @@ def main(argv=None):
                         log(f"[FIREBASE ERROR] Could not store token — QR not shown: {err}\n")
                         results.put((a.tx_id, False, str(err)))
                 run_in_background(work)
+            elif isinstance(a, SaveOfflineReward):
+                try:
+                    run(flow.on_offline_saved(a.tx_id, pending.add(a.waste_type), now), now)
+                except OSError as err:
+                    log(f"[OFFLINE] could not save the reward on this machine: {err}")
+                    run(flow.on_offline_failed(a.tx_id, str(err), now), now)
             elif isinstance(a, WatchToken):
                 watch_token(a.token)
             elif isinstance(a, StopWatching):
@@ -903,6 +1004,7 @@ def main(argv=None):
         camera.release()
         stop_watching()
         stop_heartbeat()
+        stop_pending()
         cv2.destroyAllWindows()
         log("\n[SYSTEM] Shut down.")
 

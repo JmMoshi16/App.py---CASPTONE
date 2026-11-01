@@ -14,6 +14,7 @@ import tempfile
 import time
 import types
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -431,6 +432,12 @@ class BinsTests(unittest.TestCase):
         self.assertEqual((doc["fillLevel"], doc["status"]), (90, "online"))
         self.assertIsNotNone(doc["lastUpdated"])
 
+    def test_a_sensor_without_a_reading_is_not_written_as_empty(self):
+        db = FakeFirestore()
+        with mock.patch.object(app, "db", db):
+            app.BinsReporter()._write((None, 55, None))
+        self.assertEqual(sorted(doc for coll, doc, _ in db.sets if coll == "bins"), [f"{app.KIOSK_ID}-rec"])
+
     def test_simulated_readings_are_never_written(self):
         db = FakeFirestore()
         drive(lambda n, seen: ord("q") if n > 3 else None, db=db, settings={"sorter": "esp32"},
@@ -527,6 +534,46 @@ def _views():
         "model-mismatch": View(phase="detected", model_ok=False, detection=Detection("person", None, 0.9),
                                latest=Detection("person", None, 0.9, (10, 10, 600, 470)), **base),
     }
+
+
+class PendingRewardsTests(unittest.TestCase):
+    """Firebase down after a sort: the reward waits on disk and is uploaded later as a normal kiosk token."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.pending = app.PendingRewards(Path(self.dir.name) / "pending.jsonl")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_saved_offline_then_uploaded_in_the_rules_shape(self):
+        with mock.patch.object(app, "db", None):
+            code = self.pending.add("Recyclable")
+            self.assertEqual(self.pending.flush(), 0, "still offline: nothing is sent, nothing is lost")
+        self.assertRegex(code, r"^[0-9]{4}$")
+        self.assertEqual(self.pending.count(), 1)
+        db = FakeFirestore()
+        with mock.patch.object(app, "db", db):
+            self.assertEqual(self.pending.flush(), 1)
+        (coll, _, data), = db.sets
+        self.assertEqual(coll, "qr_tokens")
+        # firestore.rules isNewKioskToken: exactly these keys, server createdAt, expiry within 30 minutes.
+        self.assertEqual(set(data), {"wasteType", "expiresAt", "usedBy", "isUsed", "createdAt", "claimCode"})
+        self.assertEqual((data["wasteType"], data["claimCode"], data["usedBy"], data["isUsed"]),
+                         ("Recyclable", code, [], False))
+        self.assertIs(data["createdAt"], app.SERVER_TS)
+        self.assertLessEqual(data["expiresAt"] - app._now(), timedelta(minutes=30))
+        self.assertEqual(self.pending.count(), 0, "uploaded rewards leave the file")
+
+    def test_a_failed_upload_keeps_the_reward_for_next_time(self):
+        class Broken:
+            def collection(self, name):
+                raise RuntimeError("unavailable")
+        with mock.patch.object(app, "db", None):
+            self.pending.add("Biodegradable")
+        with mock.patch.object(app, "db", Broken()), mock.patch.object(app, "_warn_once", lambda *a, **k: None):
+            self.assertEqual(self.pending.flush(), 0)
+        self.assertEqual(self.pending.count(), 1)
 
 
 class SorterHelpTextTests(unittest.TestCase):

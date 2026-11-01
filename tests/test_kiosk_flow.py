@@ -422,6 +422,23 @@ class TrayFaultTests(unittest.TestCase):
         f.on_sorter_event(Fill(5, 40, 10), 5.0)
         self.assertEqual(f.phase, Phase.READY)
 
+    def test_a_sensor_without_a_reading_is_unknown_not_empty_or_full(self):
+        f = tray()
+        f.on_sorter_event(Fill(None, 100, None), 1.0)
+        self.assertEqual((f.phase, f.pause_reason), (Phase.PAUSED, "bin_full"), "a real full reading still pauses")
+        f.on_sorter_event(Fill(None, 10, None), 2.0)
+        self.assertEqual(f.phase, Phase.READY, "no reading never counts as full")
+        self.assertEqual(f.bins_warn(), [])
+
+    def test_no_scale_puts_the_kiosk_out_of_service_until_the_esp32_reboots(self):
+        f = tray()
+        f.on_sorter_event(DeviceError("HX711 not found"), 1.0)
+        self.assertEqual((f.phase, f.pause_reason), (Phase.PAUSED, "scale"),
+                         "without the scale every sort would look done, so no deposits")
+        f.on_sorter_event(LinkLost("unplugged"), 2.0)
+        f.on_sorter_event(LinkUp(), 3.0)
+        self.assertEqual(f.phase, Phase.READY, "after a reboot without the error the kiosk is back")
+
     def test_a_bin_filling_up_during_a_deposit_pauses_afterwards(self):
         f = tray()
         to_sorting(f, CAN, 15.0)
@@ -434,15 +451,31 @@ class TrayFaultTests(unittest.TestCase):
         f.dismiss(5.0)
         self.assertEqual((f.phase, f.pause_reason), (Phase.PAUSED, "bin_full"))
 
-    def test_firebase_offline_sorts_but_shows_no_qr(self):
+    def test_firebase_offline_saves_the_reward_and_shows_a_claim_code_not_a_qr(self):
         f = tray(online=False)
         to_sorting(f, CAN, 15.0)
         f.on_sorter_event(Ok(2), 3.0)
-        self.assertNotIn("IssueToken", kinds(f.on_sorter_event(Done(2, 15.0), 3.5)))
-        self.assertEqual((f.phase, f.notice), (Phase.NOTICE, ("Sorted!", "Reward codes are offline right now.")))
-        weigh(f, 0.0, 3.6, n=2)
-        f.tick(3.5 + 3.1, UTC0)
+        actions = kinds(f.on_sorter_event(Done(2, 15.0), 3.5))
+        self.assertNotIn("IssueToken", actions, "no QR may point at a token that does not exist yet")
+        self.assertIn("SaveOfflineReward", actions)
+        f.on_offline_saved(f.tx.id, "4821", 3.6)
+        self.assertEqual(f.phase, Phase.NOTICE)
+        self.assertEqual(f.notice[0], "Your code: 4821")
+        weigh(f, 0.0, 3.7, n=2)
+        f.tick(3.6 + 10, UTC0)
+        self.assertEqual(f.phase, Phase.NOTICE, "the code stays up long enough to write it down")
+        f.tick(3.6 + 31, UTC0)
         self.assertEqual(f.phase, Phase.READY)
+
+    def test_a_failed_token_write_after_sorting_keeps_the_points(self):
+        f = tray()
+        to_sorting(f, CAN, 15.0)
+        f.on_sorter_event(Ok(2), 3.0)
+        f.on_sorter_event(Done(2, 15.0), 3.5)
+        self.assertEqual(f.phase, Phase.ISSUING)
+        self.assertIn("SaveOfflineReward", kinds(f.on_issue_failed(f.tx.id, "unavailable", 4.0)))
+        f.on_offline_failed(f.tx.id, "disk full", 4.1)
+        self.assertEqual(f.phase, Phase.FAILED, "if even the local save fails, staff are asked")
 
     def test_items_that_earn_no_points(self):
         f = tray(points={"Biodegradable": 15, "Recyclable": 10, "Residual": 0})
@@ -498,6 +531,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parse_line("DONE:3:18.2"), Done(3, 18.2))
         self.assertEqual(parse_line("JAM:1"), Jam(1))
         self.assertEqual(parse_line("FILL:45,22,104"), Fill(45, 22, 100))
+        self.assertEqual(parse_line("FILL:-1,40,-1"), Fill(None, 40, None), "-1 = that sensor has no reading")
         self.assertEqual(parse_line("ERR:servo stalled"), DeviceError("servo stalled"))
         for bad in ("", "OK", "OK:4", "DONE:2", "DONE:x:1", "JAM:", "W:", "W:abc", "FILL:1,2", "FILL:1,2,300",
                     "hello", "x" * 200):
