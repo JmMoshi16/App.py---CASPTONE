@@ -533,6 +533,24 @@ def _start_pending_uploader(pending, interval=30):
     return stop.set
 
 
+# ── Training photos from this kiosk's own camera (staff key S) ────────────────
+CAPTURE_DIR = _APP_DIR / "dataset" / "kiosk_captures"
+
+
+def save_capture(frame, folder=CAPTURE_DIR):
+    """Save the raw camera frame (no overlays) for retraining; returns the file path, or None without a frame.
+    The model was trained on other cameras' photos and sees nothing on this tray: photos taken here, at this
+    angle and light, are what it needs. They stay on this machine (dataset/ is not in git)."""
+    if frame is None:
+        return None
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"kiosk_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
+    if not cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+        raise OSError(f"could not write {path}")
+    return path
+
+
 # ── Detection ─────────────────────────────────────────────────────────────────
 def _iou(a, b):
     ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
@@ -811,7 +829,8 @@ def main(argv=None):
     log(f"  ECOReward Bin  |  {width}x{height}  |  mode: {settings.mode}"
         f"{' (SIMULATED)' if sorter.simulated else ''}"
         f"{f'  |  {settings.serial_port} @ {settings.baud}' if settings.mode == 'esp32' else ''}")
-    log("  D diagnostics   H history   R receipt   C clear jam   I sim item   SPACE attendant   Q quit")
+    log("  D diagnostics   H history   R receipt   C clear jam   S save training photo   I sim item   "
+        "SPACE attendant   Q quit")
     log("------------------------------------------\n")
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
@@ -985,6 +1004,14 @@ def main(argv=None):
                     overlay = None
                 elif key in (ord('c'), ord('C')):            # staff cleared a jammed tray by hand
                     run(flow.staff_clear(now), now)
+                elif key in (ord('s'), ord('S')):            # staff: training photo of the tray
+                    path = save_capture(frame)
+                    if path:
+                        n = len(list(CAPTURE_DIR.glob("*.jpg")))
+                        log(f"[CAPTURE] saved {path.name} ({n} photos in {CAPTURE_DIR.relative_to(_APP_DIR)})")
+                        play("detect")
+                    else:
+                        log("[CAPTURE] no camera frame to save")
                 elif key in (ord('i'), ord('I')) and sorter.device is not None:
                     log(f"[SIM] item placed on the tray: {sorter.device.place_item()} g")
             except Exception as e:

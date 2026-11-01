@@ -576,6 +576,16 @@ class PendingRewardsTests(unittest.TestCase):
         self.assertEqual(self.pending.count(), 1)
 
 
+class CaptureTests(unittest.TestCase):
+    def test_s_saves_the_raw_frame_for_retraining(self):
+        with tempfile.TemporaryDirectory() as d:
+            frame = np.full((48, 64, 3), 120, np.uint8)
+            path = app.save_capture(frame, Path(d) / "caps")
+            self.assertTrue(path.exists())
+            self.assertEqual(cv2.imread(str(path)).shape, (48, 64, 3), "the camera frame, not the screen")
+            self.assertIsNone(app.save_capture(None, Path(d) / "caps"), "no camera: nothing saved, no crash")
+
+
 class SorterHelpTextTests(unittest.TestCase):
     """The staff box names the problem in plain words; raw (and truncated) errors only as a last resort."""
 
