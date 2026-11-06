@@ -8,14 +8,20 @@ def _bgr(hex_rgb):
 
 
 class C:
-    canvas = _bgr("#F7F3EC")
+    # Neutrals and brand match the phone app (lib/core/tokens.dart): the partner café Crave's navy and yellow.
+    canvas = _bgr("#F7F6F2")
     surface = _bgr("#FFFFFF")
-    sunken = _bgr("#EFE9DF")
-    border = _bgr("#E4DCD0")
-    ink = _bgr("#211A17")
-    ink_2 = _bgr("#6B645E")
-    ink_3 = _bgr("#77716B")
+    sunken = _bgr("#F0EFEA")
+    border = _bgr("#E2E0D8")
+    ink = _bgr("#1A1C26")
+    ink_2 = _bgr("#5A5F70")
+    ink_3 = _bgr("#656A7A")
     coffee = _bgr("#795548")
+    navy = _bgr("#0D1C77")             # brand: wordmark, primary buttons, progress
+    navy_dark = _bgr("#08124F")        # pressed primary
+    navy_tint = _bgr("#E6E9F7")
+    sun = _bgr("#F9C50D")              # accent: fills and icons only, never text on light
+    # Success and the Biodegradable bin (the physical bin is green).
     forest = _bgr("#247A52")
     forest_dark = _bgr("#1B5E3F")
     sage = _bgr("#DCE9DF")

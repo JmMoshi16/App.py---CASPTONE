@@ -226,11 +226,11 @@ class Renderer:
         r = px(26 if big else 17)
         x0 = px(24) if cx is None else cx
         cy = L["top"] / 2 if cy is None else cy
-        D.circle(img, x0 + r, cy, r, C.forest)
-        draw_icon_centered(img, "leaf", x0 + r, cy, int(r * 1.15), C.white)
+        D.circle(img, x0 + r, cy, r, C.navy)
+        draw_icon_centered(img, "leaf", x0 + r, cy, int(r * 1.15), C.sun)
         role = "title" if big else "heading"
         x = x0 + 2 * r + px(12)
-        eco = self.ts.draw(img, "ECO", x, cy, role, C.forest, "lm")
+        eco = self.ts.draw(img, "ECO", x, cy, role, C.navy, "lm")
         self.ts.draw(img, "Reward", eco[2] - 1, cy, role, C.ink, "lm")
 
     # ── top bar ────────────────────────────────────────────────────────────
@@ -332,8 +332,8 @@ class Renderer:
         ui.category_pill(img, cx1 + pad, y, v.tx.waste_type if v.tx else None, ok)
         y += px(56)
         for n, text in ((1, "Open the ECOReward app"), (2, "Tap Scan"), (3, "Point your phone at the code")):
-            D.circle(img, cx1 + pad + px(16), y + px(16), px(16), C.sage)
-            ui.text(img, str(n), cx1 + pad + px(16), y + px(16), "body_strong", C.forest, "mm")
+            D.circle(img, cx1 + pad + px(16), y + px(16), px(16), C.navy_tint)
+            ui.text(img, str(n), cx1 + pad + px(16), y + px(16), "body_strong", C.navy, "mm")
             ui.text(img, text, cx1 + pad + px(44), y + px(16), "body_lg", C.ink, "lm", max_w=w - pad * 2 - px(44))
             y += px(52)
         draw_icon(img, "phone", cx1 + w - pad - px(40), cy1 + pad + px(2), px(36), C.ink_3)
@@ -411,7 +411,7 @@ class Renderer:
         elif v.automatic:
             y = ui.note(img, x1, y, x2, "Hold still", "Checking what it is…" if v.camera_only
                         else "Sorting starts in a moment.", "ok", icon="clock")
-            ui.meter(img, x1, y + px(12), x2, v.lock_progress, C.forest, height=6)
+            ui.meter(img, x1, y + px(12), x2, v.lock_progress, C.navy, height=6)
         else:
             y = ui.note(img, x1, y, x2, "Waiting for staff", "A staff member will confirm your deposit.", "info",
                         icon="list")
@@ -485,7 +485,7 @@ class Renderer:
                 cv2.addWeighted(qr3, a, region, 1 - a, 0, dst=region)
             y += n * k + px(20)
         frac = v.secs_left / max(1, v.total_secs)
-        color = C.forest if v.secs_left > 300 else C.amber if v.secs_left > 60 else C.error
+        color = C.navy if v.secs_left > 300 else C.amber if v.secs_left > 60 else C.error
         r = px(20)
         ui.ring(img, x1 + r + px(2), y + timer_h / 2, r, frac, color, 5)
         draw_icon_centered(img, "clock", x1 + r + px(2), y + timer_h / 2, px(18), color)
@@ -505,7 +505,7 @@ class Renderer:
         tx = v.tx
         waste = tx.waste_type if tx else None
         cat = category(waste)
-        tone = {"ready": C.sage, "jam": C.error_tint, "paused": C.amber_tint if v.pause_reason == "bin_full"
+        tone = {"ready": C.navy_tint, "jam": C.error_tint, "paused": C.amber_tint if v.pause_reason == "bin_full"
                 else C.error_tint, "rejected": C.amber_tint}.get(v.phase, C.surface)
         D.fill_rr(img, x1, y1, x2, y2, px(28), tone)
         if v.phase == "qr":
@@ -513,7 +513,7 @@ class Renderer:
             return
         if v.phase in ("complete", "failed"):
             return
-        icon, fg, bg, title, sub = "arrow_down", C.forest, C.surface, "", ""
+        icon, fg, bg, title, sub = "arrow_down", C.navy, C.surface, "", ""
         spin = False
         if v.phase == "ready":
             title, sub = "Drop one item into the slot", "We'll weigh it, recognise it and sort it for you."
@@ -570,7 +570,7 @@ class Renderer:
         if sub:
             ui.para(img, sub, cx, y, w - px(96), "body_lg", C.ink_2, max_lines=2, align="m")
         if v.phase == "identifying":
-            ui.meter(img, cx - px(160), y2 - px(72), cx + px(160), v.lock_progress, C.forest, height=8)
+            ui.meter(img, cx - px(160), y2 - px(72), cx + px(160), v.lock_progress, C.navy, height=8)
         if v.phase == "jam":
             ui.text(img, "Staff: clear the tray, then press C", cx, y2 - px(48), "body", C.error_ink, "mt")
 
@@ -592,7 +592,7 @@ class Renderer:
         over = {"weighing": "Checking", "identifying": "Checking", "sorting": "Sorting", "issuing": "Your reward",
                 "rejected": "No reward for this item", "notice": "Sorted", "jam": "Item stuck",
                 "paused": "Bin full" if v.pause_reason == "bin_full" else "For staff"}.get(v.phase, "")
-        y = ui.overline(img, over, x1, y, C.error_ink if v.phase == "jam" else C.forest) + px(16)
+        y = ui.overline(img, over, x1, y, C.error_ink if v.phase == "jam" else C.navy) + px(16)
         grams = tx.grams if tx and tx.grams is not None else v.weight
         if grams is not None and v.phase not in ("paused",):
             ui.text(img, "Weight", x1, y, "body", C.ink_2)
@@ -640,7 +640,7 @@ class Renderer:
         cx = cx1 + cw / 2
         r = px(46)
         cy = cy1 + pad + r
-        D.circle(img, cx, cy, r, C.forest)
+        D.circle(img, cx, cy, r, C.navy)
         dur = self.m.duration("slow")
         p = _ease(v.phase_age / dur) if dur else 1.0
         pts = [(cx - r * 0.42, cy + r * 0.02), (cx - r * 0.1, cy + r * 0.34), (cx + r * 0.45, cy - r * 0.32)]
@@ -652,7 +652,7 @@ class Renderer:
             end = (pts[1][0] + (pts[2][0] - pts[1][0]) * seg2, pts[1][1] + (pts[2][1] - pts[1][1]) * seg2)
             D.line(img, pts[1], end, C.white, px(7))
         for dx, dy, s in ((-1.9, -0.6, 22), (1.8, -0.9, 16), (2.1, 0.5, 12)):
-            draw_icon_centered(img, "sparkle", cx + dx * r, cy + dy * r, px(s), C.amber, opacity=p)
+            draw_icon_centered(img, "sparkle", cx + dx * r, cy + dy * r, px(s), C.sun, opacity=p)
         y = cy + r + px(22)
         ui.text(img, "Claimed!", cx, y, "display", C.ink, "mt")
         y += px(70)
@@ -694,7 +694,7 @@ class Renderer:
         else:
             total = v.seconds_to_ready + v.phase_age
             frac = v.seconds_to_ready / total if total > 0 else 0.0
-            ui.meter(img, cx1 + pad, y - px(8), cx1 + cw - pad, frac, C.forest, height=4)
+            ui.meter(img, cx1 + pad, y - px(8), cx1 + cw - pad, frac, C.navy, height=4)
             ui.text(img, text, cx1 + cw / 2, y + px(14), "body", C.ink_2, "mt")
 
     # ── modals (receipt for customers, history / diagnostics for staff) ────
@@ -716,7 +716,7 @@ class Renderer:
         x1, y1 = int((W - w) / 2), int((H - h) / 2)
         ui.card(img, x1, y1, x1 + w, y1 + h, radius=24, elevation="modal")
         pad = px(32)
-        ui.icon_tile(img, x1 + pad, y1 + pad, px(48), icon, C.forest, C.sage)
+        ui.icon_tile(img, x1 + pad, y1 + pad, px(48), icon, C.navy, C.navy_tint)
         ui.text(img, title, x1 + pad + px(64), y1 + pad - px(2), "heading", C.ink, max_w=w - pad * 2 - px(140))
         if subtitle:
             ui.text(img, subtitle, x1 + pad + px(64), y1 + pad + px(28), "caption", C.ink_2, max_w=w - pad * 2 - px(140))
@@ -790,7 +790,7 @@ class Renderer:
         top = y1 + pad + px(80)
         # column 1: camera preview with the tray_roi rectangle, then live state
         yy = top
-        ui.text(img, "CAMERA · TRAY_ROI", x[0], yy, "label", C.forest)
+        ui.text(img, "CAMERA · TRAY_ROI", x[0], yy, "label", C.navy)
         yy += px(26)
         if v.preview is not None:
             ph, pw = v.preview.shape[:2]
@@ -814,7 +814,7 @@ class Renderer:
             yy += px(28)
         # column 3: the last serial lines (without the 5-per-second weight stream)
         yy = top
-        ui.text(img, "SERIAL · LAST 20", x[2], yy, "label", C.forest)
+        ui.text(img, "SERIAL · LAST 20", x[2], yy, "label", C.navy)
         yy += px(26)
         for line in (v.serial_lines[-20:] or ["No serial device in this mode"]):
             ui.text(img, line, x[2], yy, "caption", C.ink if line.startswith("<") else C.ink_2, max_w=col_w)
@@ -824,7 +824,7 @@ class Renderer:
         for section, rows in v.diagnostics:
             if yy + px(48) > bottom:
                 break
-            ui.text(img, section.upper(), x[1], yy, "label", C.forest)
+            ui.text(img, section.upper(), x[1], yy, "label", C.navy)
             yy += px(24)
             for k, val in rows:
                 if yy + px(20) > bottom:
@@ -845,9 +845,9 @@ class Renderer:
         cy = H / 2 - self.m.px(30)
         tw = self.ts.measure("ECO", "display") + self.ts.measure("Reward", "display")
         x0 = W / 2 - (2 * r + self.m.px(16) + tw) / 2
-        D.circle(layer, x0 + r, cy, r, C.forest)
-        draw_icon_centered(layer, "leaf", x0 + r, cy, int(r * 1.15), C.white)
-        e = self.ts.draw(layer, "ECO", x0 + 2 * r + self.m.px(16), cy, "display", C.forest, "lm")
+        D.circle(layer, x0 + r, cy, r, C.navy)
+        draw_icon_centered(layer, "leaf", x0 + r, cy, int(r * 1.15), C.sun)
+        e = self.ts.draw(layer, "ECO", x0 + 2 * r + self.m.px(16), cy, "display", C.navy, "lm")
         self.ts.draw(layer, "Reward", e[2] - 1, cy, "display", C.ink, "lm")
         self.ts.draw(layer, "Smart café recycling", W / 2, cy + r + self.m.px(24), "body_lg", C.ink_2, "mt")
         cv2.addWeighted(layer, a, img, 1 - a, 0, dst=img)

@@ -666,9 +666,22 @@ class ScreenTests(unittest.TestCase):
             "error_ink/error_tint": (C.error_ink, C.error_tint), "forest_dark/sage(chip)": (C.forest_dark, C.sage),
             "blue_ink/blue_tint": (C.blue_ink, C.blue_tint), "charcoal/charcoal_tint": (C.charcoal, C.charcoal_tint), "ink/sunken": (C.ink, C.sunken), "ink_2/sunken": (C.ink_2, C.sunken),
             "white/blue": (C.white, C.blue), "white/charcoal": (C.white, C.charcoal),
+            "navy/surface": (C.navy, C.surface), "navy/canvas": (C.navy, C.canvas), "white/navy": (C.white, C.navy),
+            "navy/navy_tint": (C.navy, C.navy_tint), "navy_tint/navy(hint)": (C.navy_tint, C.navy),
         }
         low = {k: round(ratio(*v), 2) for k, v in pairs.items() if ratio(*v) < 4.5}
         self.assertEqual(low, {})
+
+    def test_the_brand_is_cafe_navy_and_yellow_while_the_bins_keep_their_colours(self):
+        from kiosk.ui.theme import CATEGORY, C
+        self.assertEqual(C.navy, (0x77, 0x1C, 0x0D))   # #0D1C77 as BGR, the café's wordmark
+        self.assertEqual(C.sun, (0x0D, 0xC5, 0xF9))    # #F9C50D
+        self.assertEqual(CATEGORY["Biodegradable"]["color"], C.forest, "the physical bin is green")
+        _, views = _views()
+        img = Renderer(1280, 720).render(self.cam, views["qr"], 10.0, transition=False)
+        self.assertTrue((img == np.array(C.navy, np.uint8)).all(axis=2).any(), "the wordmark and buttons are navy")
+        img = Renderer(1280, 720).render(self.cam, views["complete"], 10.0, transition=False)
+        self.assertTrue((img == np.array(C.sun, np.uint8)).all(axis=2).any(), "the celebration sparkles are yellow")
 
     def test_steady_state_frame_cost(self):
         _, views = _views()

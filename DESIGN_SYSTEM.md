@@ -49,15 +49,19 @@ A "bin almost full" strip (amber tint, bin icon) sits under the top bar at 90 %.
 
 | Token | Hex | Use | Contrast |
 |---|---|---|---|
-| `canvas` | `#F7F3EC` | app background (warm cream) | — |
+| `canvas` | `#F7F6F2` | app background (same as the phone app) | — |
 | `surface` | `#FFFFFF` | cards | — |
-| `sunken` | `#EFE9DF` | tracks, wells | — |
-| `border` | `#E4DCD0` | 1 px card borders, dividers | — |
-| `ink` | `#211A17` | primary text (espresso) | 15.5 on canvas |
-| `ink_2` | `#6B645E` | secondary text | 5.26 on canvas |
-| `ink_3` | `#77716B` | tertiary text — only ≥ 18 px or on white | 4.82 on white |
-| `coffee` | `#795548` | brand accent, wordmark | 5.92 on canvas |
-| `forest` | `#247A52` | primary actions, success, Biodegradable | 5.28 on white |
+| `sunken` | `#F0EFEA` | tracks, wells | — |
+| `border` | `#E2E0D8` | 1 px card borders, dividers | — |
+| `ink` | `#1A1C26` | primary text | 15.7 on canvas |
+| `ink_2` | `#5A5F70` | secondary text | 5.87 on canvas |
+| `ink_3` | `#656A7A` | tertiary text — only ≥ 18 px or on white | 5.39 on white |
+| `navy` | `#0D1C77` | brand (Crave's wordmark): wordmark, primary actions, progress, overlines, timer | 14.5 on white |
+| `navy_dark` | `#08124F` | pressed primary | — |
+| `navy_tint` | `#E6E9F7` | idle tray panel, step numbers, info banner, hint text on primary | navy 12.0 on it |
+| `sun` | `#F9C50D` | accent (Crave's yellow): logo leaf, celebration sparkles. Never text on light | ink 10.5 on it |
+| `coffee` | `#795548` | unused (kept for reference) | — |
+| `forest` | `#247A52` | success and Biodegradable (the physical bin is green) | 5.28 on white |
 | `forest_dark` | `#1B5E3F` | pressed primary; text on `sage` (forest on sage is only 4.21) | 6.16 on sage |
 | `sage` | `#DCE9DF` | success / Biodegradable tint | ink 13.7 on it |
 | `blue` | `#2B6CB0` | Recyclable | 5.42 on white |
@@ -115,15 +119,15 @@ Minimum rendered size 13 px after scaling. Line height 1.25 (display 1.1).
 
 | Component | Anatomy / rules |
 |---|---|
-| **TopBar** | wordmark (leaf mark + "ECO" forest, "Reward" ink), status chips, local time. Height 64. |
+| **TopBar** | wordmark (navy circle with a yellow leaf + "ECO" navy, "Reward" ink), status chips, local time. Height 64. |
 | **StatusChip** | dot + word, pill; states `ok` (forest), `busy` (amber, pulsing dot), `error` (error), `off` (ink_3), `sim` (amber outline + "SIMULATION"). Never shows "connected" until a real connection exists. |
 | **Card** | surface, radius 20, border, card shadow, padding 24. |
-| **Button** | min height 80 px on every display (56 design units, never below 80 px), radius 14, label `body_lg` 600. Primary = forest/white; secondary = white/ink with border; ghost = text only. Pressed = darker fill for 120 ms. Every button has a keyboard equivalent for staff. |
+| **Button** | min height 80 px on every display (56 design units, never below 80 px), radius 14, label `body_lg` 600. Primary = navy/white; secondary = white/ink with border; ghost = text only. Pressed = darker fill for 120 ms. Every button has a keyboard equivalent for staff. |
 | **CategoryBadge** | tinted pill, icon + category word in the category colour; large variant 64 px icon tile. |
-| **Stepper** | vertical list of the stages the sorter mode supports (bin/esp32: Weigh → Recognise → Sort → Code; camera: Identify → Drop it into the bin → Code; ESP32: Identify → Sort → Confirm drop → Code; attendant: Identify → Staff confirms → Code): done (check, forest), active (spinner, ink, bold), pending (hollow circle, ink_3). |
-| **ProgressBar / Meter** | 8 px track `sunken`, fill category or forest, rounded ends; label + value in text. |
+| **Stepper** | vertical list of the stages the sorter mode supports (bin/esp32: Weigh → Recognise → Sort → Code; camera: Identify → Drop it into the bin → Code; ESP32: Identify → Sort → Confirm drop → Code; attendant: Identify → Staff confirms → Code): done (check, navy), active (spinner, ink, bold), pending (hollow circle, ink_3). |
+| **ProgressBar / Meter** | 8 px track `sunken`, fill category or navy, rounded ends; label + value in text. |
 | **Spinner** | 270° arc, 3 px, 1.2 s per turn; static "…" in reduced motion. |
-| **CountdownRing** | ring 6 px; forest → amber (< 5 min) → error (< 1 min); time as text inside. |
+| **CountdownRing** | ring 6 px; navy → amber (< 5 min) → error (< 1 min); time as text inside. |
 | **QRCard** | white card, QR with 4-module quiet zone, ≥ 300 px at 720p, never scaled with interpolation. |
 | **Banner** | full-width strip under the top bar: info/warn/error tint + icon + one sentence. |
 | **Modal** | scrim + centred card; close button 56 px; Esc closes. |

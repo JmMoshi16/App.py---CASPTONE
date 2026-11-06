@@ -49,7 +49,7 @@ class UI:
     def para(self, img, s, x, y, w, role, color, max_lines=None, align="l", opacity=1.0):
         return self.t.paragraph(img, s, x, y, w, role, color, max_lines, align, opacity)
 
-    def overline(self, img, s, x, y, color=C.forest):
+    def overline(self, img, s, x, y, color=C.navy):
         return self.text(img, s.upper(), x, y, "label", color)[3]
 
     # ── chips and badges ───────────────────────────────────────────────────
@@ -100,7 +100,7 @@ class UI:
         pressed = self.pressed and self.pressed[0] == action and self.now - self.pressed[1] < 0.16
         r = self.px(14)
         if kind == "primary":
-            D.fill_rr(img, x1, y1, x2, y2, r, C.forest_dark if pressed else C.forest)
+            D.fill_rr(img, x1, y1, x2, y2, r, C.navy_dark if pressed else C.navy)
             fg = C.white
         elif kind == "secondary":
             D.fill_rr(img, x1, y1, x2, y2, r, C.sunken if pressed else C.surface)
@@ -109,7 +109,7 @@ class UI:
         else:
             if pressed:
                 D.fill_rr(img, x1, y1, x2, y2, r, C.sunken)
-            fg = C.forest
+            fg = C.navy
         label_w = self.t.measure(label, "button")
         ic = self.px(22) if icon else 0
         gap = self.px(10) if icon else 0
@@ -120,7 +120,7 @@ class UI:
             draw_icon_centered(img, icon, lx + ic / 2, cy, ic, fg)
         self.text(img, label, lx + ic + gap, cy, "button", fg, "lm", max_w=(x2 - x1) - self.px(24) - ic - gap)
         if hint:
-            self.text(img, hint, x2 - self.px(12), y2 - self.px(6), "caption", C.ink_3 if kind != "primary" else C.sage, "rb")
+            self.text(img, hint, x2 - self.px(12), y2 - self.px(6), "caption", C.ink_3 if kind != "primary" else C.navy_tint, "rb")
         self.buttons.append((int(x1), int(y1), int(x2), int(y2), action))
 
     def icon_button(self, img, cx, cy, icon, action, size=56):
@@ -168,14 +168,14 @@ class UI:
             if i < len(stages) - 1:                      # connector to the next row
                 done = status == "done"
                 D.blend_rect(img, int(cx - self.px(1)), int(cy + r + self.px(3)), int(cx + self.px(1)),
-                             int(cy + row - r - self.px(3)), C.forest if done else C.border, 1)
+                             int(cy + row - r - self.px(3)), C.navy if done else C.border, 1)
             if status == "done":
-                D.circle(img, cx, cy, r, C.forest)
+                D.circle(img, cx, cy, r, C.navy)
                 draw_icon_centered(img, "check", cx, cy, int(r * 1.3), C.white)
                 color = C.ink_2
             elif status == "active":
                 D.circle(img, cx, cy, r, C.surface)
-                self.spinner(img, cx, cy, r, C.forest, 3)
+                self.spinner(img, cx, cy, r, C.navy, 3)
                 color = C.ink
             elif status == "failed":
                 D.circle(img, cx, cy, r, C.error)
@@ -192,7 +192,7 @@ class UI:
     # ── messages ───────────────────────────────────────────────────────────
     def banner(self, img, x1, y1, x2, y2, text, kind):
         bg, fg, icon = {"warning": (C.amber, C.ink, "wifi_off"), "error": (C.error, C.white, "alert"),
-                        "info": (C.sage, C.ink, "info"), "bin": (C.amber_tint, C.amber_ink, "bin")}[kind]
+                        "info": (C.navy_tint, C.ink, "info"), "bin": (C.amber_tint, C.amber_ink, "bin")}[kind]
         D.blend_rect(img, x1, y1, x2, y2, bg, 1)
         ic = self.px(20)
         tw = self.t.measure(text, "body_strong")
