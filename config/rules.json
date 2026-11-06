@@ -56,15 +56,15 @@
     { "minDays": 7, "maxDays": null, "multiplier": 2.0 }
   ],
   "badges": [
-    { "id": "first_scan", "label": "First Scan",   "desc": "Completed your first scan",  "icon": "🌱", "req": "scans",  "value": 1   },
-    { "id": "scan_5",     "label": "5 Scans",       "desc": "Scanned waste 5 times",      "icon": "♻️", "req": "scans",  "value": 5   },
-    { "id": "scan_10",    "label": "Eco Starter",   "desc": "Scanned waste 10 times",     "icon": "🌿", "req": "scans",  "value": 10  },
-    { "id": "scan_25",    "label": "Eco Warrior",   "desc": "Scanned waste 25 times",     "icon": "🏆", "req": "scans",  "value": 25  },
-    { "id": "scan_50",    "label": "Eco Champion",  "desc": "Scanned waste 50 times",     "icon": "🥇", "req": "scans",  "value": 50  },
-    { "id": "pts_50",     "label": "Point Earner",  "desc": "Earned 50 points total",     "icon": "⭐",      "req": "points", "value": 50  },
-    { "id": "pts_100",    "label": "Century Club",  "desc": "Earned 100 points total",    "icon": "💯", "req": "points", "value": 100 },
-    { "id": "pts_500",    "label": "Platinum Eco",  "desc": "Earned 500 points total",    "icon": "💎", "req": "points", "value": 500 },
-    { "id": "streak_3",   "label": "On a Roll",     "desc": "3-day scan streak",          "icon": "🔥", "req": "streak", "value": 3   },
-    { "id": "streak_7",   "label": "Week Warrior",  "desc": "7-day scan streak",          "icon": "🌟", "req": "streak", "value": 7   }
+    { "id": "first_scan", "label": "First Scan",   "desc": "Completed your first scan",  "icon": "🌱", "req": "scans",  "value": 1, "bonus": 5 },
+    { "id": "scan_5",     "label": "5 Scans",       "desc": "Scanned waste 5 times",      "icon": "♻️", "req": "scans",  "value": 5, "bonus": 10 },
+    { "id": "scan_10",    "label": "Eco Starter",   "desc": "Scanned waste 10 times",     "icon": "🌿", "req": "scans",  "value": 10, "bonus": 15 },
+    { "id": "scan_25",    "label": "Eco Warrior",   "desc": "Scanned waste 25 times",     "icon": "🏆", "req": "scans",  "value": 25, "bonus": 20 },
+    { "id": "scan_50",    "label": "Eco Champion",  "desc": "Scanned waste 50 times",     "icon": "🥇", "req": "scans",  "value": 50, "bonus": 25 },
+    { "id": "pts_50",     "label": "Point Earner",  "desc": "Earned 50 points total",     "icon": "⭐",      "req": "points", "value": 50, "bonus": 5 },
+    { "id": "pts_100",    "label": "Century Club",  "desc": "Earned 100 points total",    "icon": "💯", "req": "points", "value": 100, "bonus": 10 },
+    { "id": "pts_500",    "label": "Platinum Eco",  "desc": "Earned 500 points total",    "icon": "💎", "req": "points", "value": 500, "bonus": 20 },
+    { "id": "streak_3",   "label": "On a Roll",     "desc": "3-day scan streak",          "icon": "🔥", "req": "streak", "value": 3, "bonus": 10 },
+    { "id": "streak_7",   "label": "Week Warrior",  "desc": "7-day scan streak",          "icon": "🌟", "req": "streak", "value": 7, "bonus": 20 }
   ]
 }

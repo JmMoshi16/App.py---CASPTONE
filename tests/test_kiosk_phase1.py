@@ -582,6 +582,10 @@ class ConfigParityTest(unittest.TestCase):
             self.assertEqual(
                 kiosk_cfg["qrExpiryMinutes"], other_cfg["qrExpiryMinutes"],
                 f"qrExpiryMinutes mismatch between kiosk and {other_name} (M-24)")
+            # Badges (thresholds and the one-time bonus each pays) are credited by the app and the web's Manual Claim.
+            self.assertEqual(
+                kiosk_cfg["badges"], other_cfg["badges"],
+                f"badges mismatch between kiosk and {other_name}")
 
     def test_kiosk_module_uses_config_values(self):
         kiosk_cfg = self._load(APP_DIR / "config" / "rules.json")
