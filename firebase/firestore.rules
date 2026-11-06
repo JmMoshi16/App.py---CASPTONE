@@ -14,6 +14,8 @@ rules_version = '2';
 //     documents, and redemption status.
 //   - Listing / enumerating QR tokens, and forging "scanned by" / "user" ids on logs, history, redemptions.
 //   - Setting points to an arbitrary number in one write (max +100 per write, never negative).
+//   - Free rewards (2026-11-06): a reward code must be paid in the same write (its reward's exact price, a payment
+//     tagged with the code's id), dated by the server; stock drops only with that payment; claimed stays claimed.
 //
 // WHAT THIS CANNOT CLOSE  (needs a trusted code path: audit C-01 step 3)
 //   - The phone credits points itself, so a customer can still raise their OWN `points` in small steps.
@@ -111,9 +113,10 @@ service cloud.firestore {
       // points / lifetimePoints / scanCount / streak / lastScanDate / badges (scan + redeem transactions).
       // `createdAt` is tolerated only for app versions that still send the whole document (audit H-01).
       // `role` and `email` are NOT in the list, so they can never change.
+      // `lastRedemptionId` tags a redeem's payment with the code it pays for (see /redemptions).
       allow update: if (isOwner(uid)
                         && changedKeys().hasOnly(['username', 'points', 'lifetimePoints', 'scanCount', 'streak',
-                                                  'lastScanDate', 'badges', 'createdAt', 'photo'])
+                                                  'lastScanDate', 'badges', 'createdAt', 'photo', 'lastRedemptionId'])
                         && pointsOk()
                         && lifetimeOk()
                         && photoOk())
@@ -147,24 +150,48 @@ service cloud.firestore {
       allow read: if signedIn();
       allow create, delete: if isAdmin();
 
-      // A redemption lowers a limited stock by exactly 1 (never unlimited = -1, never below 0).
+      // A redemption lowers a limited stock by exactly 1 (never unlimited = -1, never below 0), and only when
+      // the same write pays this reward's price from the customer's balance.
       allow update: if (signedIn()
                         && changedKeys().hasOnly(['stock'])
                         && resource.data.get('stock', -1) is int
                         && resource.data.get('stock', -1) > 0
-                        && request.resource.data.stock == resource.data.stock - 1)
+                        && request.resource.data.stock == resource.data.stock - 1
+                        && paysFor(resource.data.pointsCost))
                     || isAdmin();
     }
 
     // ── redemptions ──────────────────────────────────────────────────────────
+    // The same write lowers the caller's balance by exactly `cost` (the redeem transaction).
+    function paysFor(cost) {
+      let me = /databases/$(database)/documents/users/$(request.auth.uid);
+      return cost is int && cost > 0
+          && getAfter(me).data.points == get(me).data.points - cost;
+    }
+
+    // A reward code exactly as the app's redeem transaction writes it: the reward's real price, server time,
+    // pending, and paid for in the same write by a payment tagged with THIS code's id, so one payment can
+    // never cover a second code written alongside it.
+    function isPaidRedemption(id) {
+      let r = request.resource.data;
+      let reward = get(/databases/$(database)/documents/rewards/$(r.rewardId)).data;
+      return r.keys().hasOnly(['userId', 'userEmail', 'rewardId', 'rewardTitle', 'pointsUsed', 'redeemedAt',
+                               'status', 'redemptionCode'])
+          && r.userId == request.auth.uid
+          && r.status == 'pending'
+          && r.redeemedAt == request.time
+          && r.pointsUsed == reward.pointsCost
+          && paysFor(r.pointsUsed)
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('lastRedemptionId', '') == id;
+    }
+
     match /redemptions/{id} {
       allow read:   if (signedIn() && resource.data.userId == request.auth.uid) || isAdmin();
-      allow create: if signedIn()
-                    && request.resource.data.userId == request.auth.uid
-                    && request.resource.data.status == 'pending';
-      // Only an admin, and only pending -> claimed.
+      allow create: if signedIn() && isPaidRedemption(id);
+      // Only an admin, and only pending -> claimed (a handed-out code cannot be handed out again).
       allow update: if isAdmin()
                     && changedKeys().hasOnly(['status'])
+                    && resource.data.status == 'pending'
                     && request.resource.data.status == 'claimed';
       allow delete: if false;
     }

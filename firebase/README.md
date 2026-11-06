@@ -4,7 +4,7 @@
 |---|---|
 | `firestore.rules` | Draft rules, written from what the Flutter app, the Next.js admin and the QR flow actually do. **Not deployed.** |
 | `firebase.json` | Points the Firebase CLI / emulator at the rules (no project is bound on purpose — see below). |
-| `tests/rules.test.mjs` | 84 checks that replay the real app operations as *anonymous*, *customer*, *another customer*, *admin* and the *kiosk identity* (tokens, heartbeat, detections, `bins` fill levels). |
+| `tests/rules.test.mjs` | 101 checks that replay the real app operations as *anonymous*, *customer*, *another customer*, *admin* and the *kiosk identity* (tokens, heartbeat, detections, `bins` fill levels). |
 
 ## Run the tests (local emulator only — never touches your real Firebase project)
 
@@ -25,9 +25,12 @@ npm test
    draft denies is a behaviour change you must understand first.
 2. Run the Flutter app and the web admin against the **emulator or a separate test project** with these rules, and walk through:
    sign-up, login, scan a QR, redeem a reward, edit the profile, leaderboard, admin dashboard, reward CRUD, mark claimed, Manual Claim.
-3. Only then deploy: `firebase use <project-id>` then `firebase deploy --only firestore:rules`.
+3. **Install the current app on every phone first** (2026-11-06 or later). A reward code is accepted only when the
+   same write pays its exact price, is dated by the server and tags the payment with the code's id
+   (`isPaidRedemption`). Older app builds don't do this, so redeeming fails on them once these rules are live.
+4. Only then deploy: `firebase use <project-id>` then `firebase deploy --only firestore:rules`.
    (`.firebaserc` is intentionally not committed so nobody deploys by accident.)
-4. Keep the backup from step 1 so you can roll back in one paste.
+5. Keep the backup from step 1 so you can roll back in one paste.
 
 ## What these rules do — and do not — fix
 

@@ -223,7 +223,9 @@ describe('rewards', () => {
     await denied(updateDoc(doc(db, 'rewards', 'limited'), { title: 'Hacked' }));
     await denied(deleteDoc(doc(db, 'rewards', 'limited')));
   });
-  it('redeem: limited stock 3 -> 2', async () => { await ok(updateDoc(doc(alice(), 'rewards', 'limited'), { stock: increment(-1) })); });
+  it('stock goes down only inside a paid redemption, never on its own', async () => {
+    await denied(updateDoc(doc(alice(), 'rewards', 'limited'), { stock: increment(-1) }));
+  });
   it('a customer cannot lower stock by more than 1, raise it, or touch other fields with it', async () => {
     const r = () => doc(alice(), 'rewards', 'limited');
     await denied(updateDoc(r(), { stock: 0 }));
@@ -245,25 +247,50 @@ describe('rewards', () => {
 
 describe('redemptions', () => {
   const mine = (o = {}) => ({ userId: 'alice', userEmail: 'alice@example.com', rewardId: 'limited', rewardTitle: 'Free Coffee',
-    pointsUsed: 50, redeemedAt: '2026-10-09T10:00:00.000', status: 'pending', redemptionCode: 'ZZZZ9999', ...o });
-  it('full redeem transaction (redemption + points - cost + stock - 1)', async () => {
-    const db = alice(); const rdRef = doc(collection(db, 'redemptions'));
-    await ok(runTransaction(db, async (tx) => {
-      await tx.get(doc(db, 'users', 'alice')); await tx.get(doc(db, 'rewards', 'limited'));
-      tx.set(rdRef, mine());
-      tx.update(doc(db, 'users', 'alice'), { points: increment(-50) });
-      tx.update(doc(db, 'rewards', 'limited'), { stock: increment(-1) });
-    }));
+    pointsUsed: 50, redeemedAt: serverTimestamp(), status: 'pending', redemptionCode: 'ZZZZ9999', ...o });
+  // Flutter FirebaseService.redeemReward: the code, the payment (tagged with the code's id), the profile copy and
+  // stock - 1, all in one transaction. alice has 50 points; 'limited' costs 50.
+  const redeem = (db, { redemption = {}, pay = 50, tag = true, stock = true } = {}) => runTransaction(db, async (tx) => {
+    await tx.get(doc(db, 'users', 'alice')); await tx.get(doc(db, 'rewards', 'limited'));
+    const rdRef = doc(collection(db, 'redemptions'));
+    tx.set(rdRef, mine(redemption));
+    const points = 50 - pay;
+    tx.update(doc(db, 'users', 'alice'), { points, lifetimePoints: 50, ...(tag ? { lastRedemptionId: rdRef.id } : {}) });
+    tx.set(doc(db, 'profiles', 'alice'), { username: 'alice', points, lifetimePoints: 50, badges: ['first_scan'] });
+    if (stock) tx.update(doc(db, 'rewards', 'limited'), { stock: increment(-1) });
   });
-  it('Phase 5 redeem: balance down, lifetime unchanged, profile copied', async () => {
-    const db = alice(); const rdRef = doc(collection(db, 'redemptions'));
-    await ok(runTransaction(db, async (tx) => {
-      await tx.get(doc(db, 'users', 'alice')); await tx.get(doc(db, 'rewards', 'limited'));
-      tx.set(rdRef, mine());
-      tx.update(doc(db, 'users', 'alice'), { points: 0, lifetimePoints: 50 });
-      tx.set(doc(db, 'profiles', 'alice'), { username: 'alice', points: 0, lifetimePoints: 50, badges: ['first_scan'] });
-      tx.update(doc(db, 'rewards', 'limited'), { stock: increment(-1) });
+  it('full redeem transaction: code + balance down by the price + lifetime kept + profile + stock - 1', async () => {
+    await ok(redeem(alice()));
+  });
+  it('an unlimited reward is redeemed without touching stock', async () => {
+    await ok(redeem(alice(), { redemption: { rewardId: 'unlimited' }, stock: false }));
+  });
+  it('a code without paying for it is denied (the free-reward hole)', async () => {
+    await denied(addDoc(collection(alice(), 'redemptions'), mine()));
+    await denied(redeem(alice(), { pay: 0 }));
+  });
+  it("a code must cost the reward's real price", async () => {
+    // claims a 1-point price (unlimited reward, so only the price check can stop it)
+    await denied(redeem(alice(), { pay: 1, redemption: { pointsUsed: 1, rewardId: 'unlimited' }, stock: false }));
+    await denied(redeem(alice(), { pay: 1 }));                                   // says 50, pays 1
+  });
+  it("a code dated by the phone's clock is denied: only the server's time counts", async () => {
+    await denied(redeem(alice(), { redemption: { redeemedAt: Timestamp.fromDate(new Date('2099-01-01')) } }));
+    await denied(redeem(alice(), { redemption: { redeemedAt: Timestamp.now() } }));
+  });
+  it('one payment cannot cover two codes written together', async () => {
+    const db = alice();
+    await denied(runTransaction(db, async (tx) => {
+      await tx.get(doc(db, 'users', 'alice'));
+      const a = doc(collection(db, 'redemptions')), b = doc(collection(db, 'redemptions'));
+      tx.set(a, mine()); tx.set(b, mine());
+      tx.update(doc(db, 'users', 'alice'), { points: 0, lifetimePoints: 50, lastRedemptionId: a.id });
     }));
+    await denied(redeem(alice(), { tag: false }));                               // payment not tied to this code
+  });
+  it('a code cannot carry extra fields', async () => {
+    await denied(redeem(alice(), { redemption: { status: 'claimed' } }));
+    await denied(redeem(alice(), { redemption: { expiresAt: Timestamp.fromDate(new Date('2099-01-01')) } }));
   });
   it('a redemption cannot lower lifetimePoints', async () => {
     await denied(updateDoc(doc(alice(), 'users', 'alice'), { points: 0, lifetimePoints: 0 }));
@@ -295,6 +322,10 @@ describe('redemptions', () => {
     await ok(updateDoc(doc(db, 'redemptions', 'rd_bob'), { status: 'claimed' }));
     await denied(updateDoc(doc(db, 'redemptions', 'rd_alice'), { pointsUsed: 1 }));
     await denied(updateDoc(doc(db, 'redemptions', 'rd_alice'), { status: 'pending' }));
+  });
+  it('a code already handed out cannot be handed out again', async () => {
+    await ok(updateDoc(doc(admin(), 'redemptions', 'rd_bob'), { status: 'claimed' }));
+    await denied(updateDoc(doc(admin(), 'redemptions', 'rd_bob'), { status: 'claimed' }));
   });
 });
 
@@ -516,9 +547,10 @@ describe('concurrency (Phase 8, audit H-02 / H-06 / stock race)', () => {
     const u = (await tx.get(userRef)).data(), r = (await tx.get(rewardRef)).data();
     if (u.points < r.pointsCost || r.stock <= 0) throw new Error('cannotRedeem');
     const lifetime = u.lifetimePoints ?? u.points, balance = u.points - r.pointsCost;
-    tx.set(doc(collection(db, 'redemptions')), { userId: uid, userEmail: `${uid}@example.com`, rewardId: 'last1',
-      rewardTitle: 'Last one', pointsUsed: r.pointsCost, redeemedAt: Timestamp.now(), status: 'pending', redemptionCode: uid.toUpperCase() });
-    tx.update(userRef, { points: balance, lifetimePoints: lifetime });
+    const rdRef = doc(collection(db, 'redemptions'));
+    tx.set(rdRef, { userId: uid, userEmail: `${uid}@example.com`, rewardId: 'last1',
+      rewardTitle: 'Last one', pointsUsed: r.pointsCost, redeemedAt: serverTimestamp(), status: 'pending', redemptionCode: uid.toUpperCase() });
+    tx.update(userRef, { points: balance, lifetimePoints: lifetime, lastRedemptionId: rdRef.id });
     tx.set(doc(db, 'profiles', uid), { username: u.username, points: balance, lifetimePoints: lifetime, badges: u.badges });
     tx.update(rewardRef, { stock: increment(-1) });
   });
