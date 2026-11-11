@@ -21,16 +21,19 @@ app.py feeds inputs with the current time and executes the returned actions. Eve
 results for an older transaction are ignored, so a slow network or a repeated serial line can never issue a
 second code or resurrect a finished one.
 """
+import random
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
-from .hardware import (BIN_NAMES, DEFAULT_BIN_CODES, DeviceError, Done, Fill, Jam, LinkLost, LinkUp, Ok, Weight,
-                       WeightTracker)
+from .hardware import (BIN_NAMES, DEFAULT_BIN_CODES, DeviceError, Done, Fill, Jam, LinkLost, LinkUp, NoDrop, Ok,
+                       Weight, WeightTracker)
 
 VOTE_WINDOW = 7    # frames in the majority vote (manuscript)
 HOLD_FRAMES = 15   # camera/attendant: keep the last label this many empty frames before forgetting it
+PRESENT_FRAMES = 3   # pretend_weight: frames with an item in view that start a deposit
+CLEAR_FRAMES = 10    # pretend_weight: empty frames before the next item may start one
 
 
 class Phase(Enum):
@@ -40,6 +43,9 @@ class Phase(Enum):
     WEIGHING = "weighing"         # tray: waiting for a steady weight
     IDENTIFYING = "identifying"   # tray: YOLO on the tray crop
     SORTING = "sorting"           # tray: OK then DONE from the ESP32
+    HOLDING = "holding"           # hold: the customer holds the item still under the camera
+    TURNING = "turning"           # hold: the chute turns to the bin (waiting for OK:n)
+    LETGO = "letgo"               # hold: the customer lets go; the drop plate proves it (DONE:n)
     ISSUING = "issuing"
     QR = "qr"
     COMPLETE = "complete"
@@ -58,6 +64,7 @@ class Detection:
     confidence: float
     box: object = None          # (x1, y1, x2, y2) in camera-frame pixels
     objects: int = 1            # separate objects seen in this frame (tray mode: "one item at a time")
+    area_frac: object = None    # tray mode: the box as a share of the tray area (crushed items look smaller)
 
 
 @dataclass
@@ -76,6 +83,8 @@ class Transaction:
     expires_at: object = None   # timezone-aware UTC datetime
     payload: object = None
     qr_shown_at: object = None
+    area_frac: object = None    # tray: median size of the item on the tray (rules.json compactBonus)
+    bonus: int = 0              # tray: compact bonus for a crushed can, bottle or cup
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,7 @@ class IssueToken:
     waste_type: str
     label: str
     confidence: float
+    bonus: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,7 @@ class SaveOfflineReward:
     """Firebase is unreachable after a sort: keep the reward on this machine and upload it later."""
     tx_id: int
     waste_type: str
+    bonus: int = 0
 
 
 @dataclass(frozen=True)
@@ -198,7 +209,7 @@ class _RewardFlow:
 
     def _begin_issue(self, now):
         self._go(Phase.ISSUING, now)
-        return [IssueToken(self.tx.id, self.tx.waste_type, self.tx.label, self.tx.confidence)]
+        return [IssueToken(self.tx.id, self.tx.waste_type, self.tx.label, self.tx.confidence, self.tx.bonus)]
 
     def _end(self, now):          # back to the start; each mode decides where that is
         raise NotImplementedError
@@ -219,7 +230,7 @@ class _RewardFlow:
     def _save_offline(self, now):
         """The item is in the bin but Firebase is out of reach: the app saves the reward locally."""
         self._go(Phase.ISSUING, now)
-        return [SaveOfflineReward(self.tx.id, self.tx.waste_type)]
+        return [SaveOfflineReward(self.tx.id, self.tx.waste_type, self.tx.bonus)]
 
     def on_offline_saved(self, tx_id, claim_code, now):
         if self.phase != Phase.ISSUING or self.tx is None or self.tx.id != tx_id:
@@ -244,7 +255,7 @@ class _RewardFlow:
         if self.phase != Phase.ISSUING or self.tx is None or self.tx.id != tx_id:
             return []
         if self.tx.sorted:
-            return [SaveOfflineReward(self.tx.id, self.tx.waste_type)]   # keep the points; upload later
+            return [SaveOfflineReward(self.tx.id, self.tx.waste_type, self.tx.bonus)]   # keep the points; upload later
         return self._fail(Failure("issue_failed", "We couldn't create your code",
                                   "Please try again in a moment. If it keeps happening, ask staff.", "error"), now)
 
@@ -308,6 +319,13 @@ class FlowConfig:
     drop_timeout: float = 15.0      # camera mode: seconds to drop the item before giving up
     cooldown_seconds: float = 15.0  # camera mode: minimum time between two codes
     debug: bool = False
+    # hold mode: the customer holds the item under the camera, the ESP32 turns the chute, the scale proves the drop
+    bin_codes: dict = field(default_factory=lambda: dict(DEFAULT_BIN_CODES))
+    hold_min_s: float = 3.0         # the item must be held still this long
+    hold_max_s: float = 5.0         # no clear label by then: "we couldn't recognise this item"
+    hold_majority: float = 0.6      # share of the frames since the hold started that one label needs
+    hold_move_frac: float = 0.25    # a jump of more than this share of the box restarts the count
+    ok_timeout_s: float = 15.0      # waiting for OK:n while the chute turns
 
 
 class TransactionFlow(_RewardFlow):
@@ -473,16 +491,224 @@ class TransactionFlow(_RewardFlow):
         return [(k, lbl, "done" if i < idx else "active" if i == idx else "pending") for i, (k, lbl) in enumerate(steps)]
 
 
+# ── hold mode: no tray; the customer holds the item under the camera, then lets go onto the drop plate ──
+HOLD_GAP_FRAMES = 2   # empty frames tolerated inside a hold (YOLO misses a frame now and then)
+DROP_GRACE_S = 1.0    # the ESP32 decides NODROP at drop_timeout; wait a little longer for its DONE line
+
+HOLD_FAILURES = {
+    "unrecognised": ("We couldn't recognise this item",
+                     "Hold it still in the middle of the opening and try again, or ask staff."),
+    "bin_not_ready": ("The bin couldn't get ready", "Please keep the item and try again, or ask staff."),
+    "no_drop": ("We didn't see it go in", "No code was issued. Please try again, or ask staff."),
+}
+
+
+class HoldFlow(TransactionFlow):
+    """READY -> HOLDING (3-5 s still under the camera) -> TURNING (SendSort, wait OK:n) -> LETGO (wait DONE:n
+    from the drop plate) -> ISSUING -> QR. The camera never counts the drop here: only DONE from the scale does."""
+    automatic = True
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self._hold = []                    # frames (Detection or None) since the hold started
+        self._hold_t = 0.0
+        self._prev_box = None
+        self._gap = 0
+        self._step_t = 0.0
+        self._frame_t = 0.0
+        self.notice = None
+        self._notice_hold = None
+
+    @property
+    def camera_only(self):
+        return False
+
+    @property
+    def wants_frames(self):
+        return self.phase in (Phase.READY, Phase.HOLDING)
+
+    @property
+    def lock_progress(self):
+        if self.phase != Phase.HOLDING:
+            return 0.0
+        return min(1.0, max(0.0, self._frame_t - self._hold_t) / self.cfg.hold_min_s)
+
+    def cooldown_left(self, now):
+        return max(0.0, self.cooldown_until - now)
+
+    def _issued(self, now):
+        self.cooldown_until = now + self.cfg.cooldown_seconds
+
+    def can_start(self, now):
+        return self.sorter_ready and self.online and self.model_ok and self.armed and now >= self.cooldown_until
+
+    def _end(self, now):
+        self._hold, self._prev_box, self._gap = [], None, 0
+        self.notice, self._notice_hold = None, None
+        return super()._end(now)
+
+    def confirm(self, now):
+        return []                                   # nothing for staff to confirm: DONE is the proof
+
+    # ── camera ──────────────────────────────────────────────────────────
+    def observe(self, det, now):
+        if self.phase not in (Phase.READY, Phase.HOLDING):
+            return []
+        self._frame_t = now
+        if det is None:
+            self.latest = None
+            self._clear += 1
+            if self._clear >= self.cfg.rearm_clear_frames:
+                self.armed = True
+            if self.phase == Phase.HOLDING:
+                self._gap += 1
+                if self._gap > HOLD_GAP_FRAMES:
+                    self._say("[HOLD] the item left the view; the count restarts")
+                    self._go(Phase.READY, now)
+                    self._hold, self.current = [], None
+                else:
+                    self._hold.append(None)
+            return []
+        self._clear = 0
+        self.latest = det
+        if self.phase == Phase.READY:
+            self.current = det
+            if not self.can_start(now):
+                return []
+            self._start_hold(det, now)
+            return []
+        self._gap = 0
+        if self._moved(det):
+            self._say("[HOLD] the item moved; the count restarts")
+            self._start_hold(det, now)
+            return []
+        self._prev_box = det.box
+        self._hold.append(det)
+        return self._check(now)
+
+    def _start_hold(self, det, now):
+        self._hold, self._hold_t, self._prev_box, self._gap = [det], now, det.box, 0
+        self.current = det
+        self._go(Phase.HOLDING, now)
+
+    def _moved(self, det):
+        a, b = self._prev_box, det.box
+        if a is None or b is None:
+            return False
+        size = max(a[2] - a[0], a[3] - a[1], 1.0)
+        dx = (b[0] + b[2] - a[0] - a[2]) / 2
+        dy = (b[1] + b[3] - a[1] - a[3]) / 2
+        return (dx * dx + dy * dy) ** 0.5 > self.cfg.hold_move_frac * size
+
+    def _majority(self):
+        """(label, waste_type, best detection) when one label has a clear majority of the hold's frames, else None."""
+        seen = [d for d in self._hold if d is not None]
+        if not seen:
+            return None
+        label, count = Counter(d.label for d in seen).most_common(1)[0]
+        best = max((d for d in seen if d.label == label), key=lambda d: d.confidence)
+        self.current = best
+        if count < self.cfg.hold_majority * len(self._hold) or not best.waste_type:
+            return None
+        return best
+
+    def _check(self, now):
+        held = now - self._hold_t + 1e-9
+        if held < self.cfg.hold_min_s:
+            self._majority()                        # keeps the label on screen up to date
+            return []
+        best = self._majority()
+        if best is not None:
+            return self._lock(best, now)
+        if held >= self.cfg.hold_max_s:
+            return self._hold_fail("unrecognised", now)
+        return []
+
+    def _lock(self, best, now):
+        tx = self._new_tx(best.waste_type, best.label, best.confidence, now)
+        tx.bin_code = str(self.cfg.bin_codes.get(best.waste_type, DEFAULT_BIN_CODES[best.waste_type]))
+        self.armed = False                          # the same item can't start another deposit
+        self._step_t = now
+        self._go(Phase.TURNING, now)
+        self._say(f"[HOLD] #{tx.id} {best.label} ({best.confidence:.0%}) -> {tx.waste_type}, chute to bin {tx.bin_code}")
+        return [SendSort(tx.id, tx.waste_type, tx.bin_code), Sound("detect")]
+
+    def _hold_fail(self, kind, now):
+        title, message = HOLD_FAILURES[kind]
+        self.armed = False                          # the item must leave the view before a new try
+        self._hold = []
+        if self.tx is not None:
+            self._say(f"[HOLD] #{self.tx.id} {kind}; no code issued")
+        return self._fail(Failure(kind, title, message, "error" if kind == "bin_not_ready" else "warning"), now)
+
+    # ── ESP32 ───────────────────────────────────────────────────────────
+    def on_sorter_event(self, ev, now):
+        if self.phase not in (Phase.TURNING, Phase.LETGO) or self.tx is None:
+            if isinstance(ev, (Ok, Done, NoDrop, Jam)):
+                self._say(f"[SORTER] ignored {ev} during {self.phase.value}")
+            return []
+        expected = int(self.tx.bin_code)
+        if isinstance(ev, (Jam, DeviceError, LinkLost)):
+            self._say(f"[SORTER] #{self.tx.id} {ev} during {self.phase.value}")
+            return self._hold_fail("bin_not_ready", now)
+        if isinstance(ev, (Ok, Done, NoDrop)) and ev.bin != expected:
+            self._say(f"[SORTER] ignored {ev}: waiting for bin {expected}")
+            return []
+        if isinstance(ev, Ok) and self.phase == Phase.TURNING:
+            self._go(Phase.LETGO, now)
+            self._say(f"[HOLD] #{self.tx.id} chute at bin {expected}; let go")
+            return [Sound("detect")]
+        if isinstance(ev, NoDrop) and self.phase == Phase.LETGO:
+            return self._hold_fail("no_drop", now)
+        if isinstance(ev, Done) and self.phase == Phase.LETGO:
+            tx = self.tx
+            tx.grams, tx.sorted = round(float(ev.grams), 1), True
+            self._say(f"[DONE] #{tx.id} landed in bin {ev.bin} ({tx.waste_type}), {tx.grams:g} g")
+            return self._begin_issue(now) if self.online else self._save_offline(now)
+        return []
+
+    def tick(self, now, wall_utc):
+        if self.toast and now >= self.toast.until:
+            self.toast = None
+        p = self.phase
+        if p == Phase.HOLDING and now - self._hold_t >= self.cfg.hold_max_s:
+            return self._check(now)
+        if p == Phase.TURNING and now - self._step_t >= self.cfg.ok_timeout_s:
+            self._say(f"[SORTER] #{self.tx.id} no OK:{self.tx.bin_code} within {self.cfg.ok_timeout_s:g} s")
+            return self._hold_fail("bin_not_ready", now)
+        if p == Phase.LETGO and now - self.since >= self.cfg.drop_timeout + DROP_GRACE_S:
+            return self._hold_fail("no_drop", now)
+        if p == Phase.NOTICE and now - self.since >= (self._notice_hold or 3.0):
+            return self._end(now)
+        return self._reward_tick(now, wall_utc)
+
+    def stages(self):
+        steps = [("identify", "Identify the item"), ("turn", "Turn to the right bin"), ("letgo", "Let go of the item"),
+                 ("code", "Create your reward code")]
+        if self.phase == Phase.FAILED:
+            idx = {"unrecognised": 0, "bin_not_ready": 1, "no_drop": 2}.get(
+                self.failure.kind if self.failure else "", 3)
+            return [(k, lbl, "done" if i < idx else "failed" if i == idx else "pending")
+                    for i, (k, lbl) in enumerate(steps)]
+        idx = {Phase.READY: 0, Phase.HOLDING: 0, Phase.TURNING: 1, Phase.LETGO: 2, Phase.ISSUING: 3, Phase.QR: 4,
+               Phase.COMPLETE: 4, Phase.NOTICE: 4}.get(self.phase, 0)
+        return [(k, lbl, "done" if i < idx else "active" if i == idx else "pending") for i, (k, lbl) in enumerate(steps)]
+
+
 # ── the bin: load cell -> YOLO -> ESP32 sort -> DONE -> reward ────────────────
 @dataclass
 class TrayConfig:
     points: dict = field(default_factory=lambda: {"Biodegradable": 15, "Recyclable": 10, "Residual": 5})
     bin_codes: dict = field(default_factory=lambda: dict(DEFAULT_BIN_CODES))
     max_weight_g: dict = field(default_factory=lambda: {"default": 500})
+    compact_points: int = 0          # rules.json compactBonus.points
+    compact_max_frac: dict = field(default_factory=dict)   # label -> largest tray share that still counts as crushed
     min_item_g: float = 3.0
     steady_ms: float = 500
     steady_tolerance_g: float = 1.0
     identify_timeout_s: float = 3.0
+    identify_s: float = 0.0         # look at the item at least this long before deciding (0 = once 7 frames agree)
+    pretend_weight: bool = False    # no load cell: the camera starts a deposit and the weight shown is made up
     ok_timeout_s: float = 3.0
     drop_timeout_s: float = 4.0
     multi_item_frames: int = 3      # frames showing 2+ separate objects that make it "two items"
@@ -523,11 +749,14 @@ class TrayFlow(_RewardFlow):
         self._empty_since = None             # JAM: since when the scale reads empty
         self._last_tare = -1e9
         self.notice = None                   # (title, message) for NOTICE / REJECTED
+        self._frame_t = 0.0                  # time of the last camera frame
+        self._present = 0                    # pretend_weight: frames in a row with an item in view
+        self._clear = CLEAR_FRAMES           # pretend_weight: empty frames since the last deposit
 
     # ── helpers ────────────────────────────────────────────────────────────
     @property
     def wants_frames(self):
-        return self.phase == Phase.IDENTIFYING
+        return self.phase == Phase.IDENTIFYING or (self.cfg.pretend_weight and self.phase == Phase.READY)
 
     @property
     def weight(self):
@@ -538,9 +767,13 @@ class TrayFlow(_RewardFlow):
 
     @property
     def lock_progress(self):
+        if self.cfg.identify_s > 0:
+            return min(1.0, max(0.0, self._frame_t - self.since) / self.cfg.identify_s)
         return min(1.0, len(self._votes) / VOTE_WINDOW)
 
     def _empty(self):
+        if self.cfg.pretend_weight:
+            return True
         return self.scale.latest is None or self.scale.latest < self.cfg.min_item_g
 
     def _bin_full(self):
@@ -559,6 +792,17 @@ class TrayFlow(_RewardFlow):
     def _max_weight(self, label):
         table = self.cfg.max_weight_g
         return float(table.get(label, table.get("default", 500)))
+
+    def _compact(self, label):
+        """(median tray share of the voted label's frames, bonus). A crushed can, bottle or cup looks much smaller
+        than a normal one; the median keeps one odd frame from deciding."""
+        sizes = sorted(d.area_frac for d in self._votes
+                       if d is not None and d.label == label and d.area_frac is not None)
+        if not sizes:
+            return None, 0
+        mid = sizes[len(sizes) // 2] if len(sizes) % 2 else (sizes[len(sizes) // 2 - 1] + sizes[len(sizes) // 2]) / 2
+        limit = self.cfg.compact_max_frac.get(label)
+        return mid, (int(self.cfg.compact_points) if limit is not None and mid <= limit else 0)
 
     def hint(self, now):
         """The weight has been moving for a while (a hand in the slot)."""
@@ -596,7 +840,7 @@ class TrayFlow(_RewardFlow):
     def _jam(self, why, now):
         self._say(f"[JAM] #{self.tx.id if self.tx else '-'} {why}; weight {self.weight} g; no code issued")
         self.tx, self._awaiting = None, None
-        self._empty_since = None
+        self._empty_since = now if self.cfg.pretend_weight else None
         self._go(Phase.JAM, now)
         return [Sound("error")]
 
@@ -604,7 +848,7 @@ class TrayFlow(_RewardFlow):
     def on_sorter_event(self, ev, now):
         if isinstance(ev, Weight):
             self.scale.add(ev.grams, now)
-            return self._on_weight(now)
+            return [] if self.cfg.pretend_weight else self._on_weight(now)
         if isinstance(ev, LinkUp):
             self.link_up = True
             self._say("[SORTER] ESP32 answered PONG")
@@ -635,7 +879,7 @@ class TrayFlow(_RewardFlow):
                 self._say(f"[SORTER] ignored {ev} during {self.phase.value}")
             elif isinstance(ev, DeviceError):
                 self._say(f"[SORTER] ESP32 error: {ev.message}")
-                if "HX711" in ev.message.upper():
+                if "HX711" in ev.message.upper() and not self.cfg.pretend_weight:
                     self.scale_ok = False
                     if self.phase in (Phase.READY, Phase.WEIGHING):
                         self.pause_reason = "scale"
@@ -687,22 +931,36 @@ class TrayFlow(_RewardFlow):
         return []
 
     def observe(self, det, now):
+        self._frame_t = now
+        if self.phase == Phase.READY and self.cfg.pretend_weight:
+            return self._watch_tray(det, now)
         if self.phase != Phase.IDENTIFYING:
             return []
         self.latest = det
         self._votes.append(det)
         if det is not None and det.objects >= 2:
             self._multi += 1
-        if len(self._votes) >= VOTE_WINDOW:
+        if len(self._votes) >= VOTE_WINDOW and now - self.since >= self.cfg.identify_s:
             return self._decide(now)
         return []
+
+    def _watch_tray(self, det, now):
+        """pretend_weight: an item in view for a few frames starts a deposit, once the tray was seen empty."""
+        if det is None:
+            self._present, self._clear = 0, self._clear + 1
+            return []
+        self._present += 1
+        if self._present < PRESENT_FRAMES or self._clear < CLEAR_FRAMES:
+            return []
+        self._present = self._clear = 0
+        return self._begin_identify(round(random.uniform(8, 30), 1), now)   # made up: there is no load cell
 
     def _decide(self, now):
         seen = [d for d in self._votes if d is not None]
         label, waste, conf = None, None, 0.0
         if seen:
             top, count = Counter(d.label for d in seen).most_common(1)[0]
-            if count >= max(3, len(self._votes) // 2 + 1):           # a real majority of the frames
+            if count >= max(3, len(seen) // 2 + 1):                  # a real majority of the frames that saw an item
                 best = max((d for d in seen if d.label == top), key=lambda d: d.confidence)
                 label, waste, conf = top, best.waste_type, best.confidence
                 self.current = best
@@ -713,7 +971,7 @@ class TrayFlow(_RewardFlow):
             reject = "two_items"
         elif label is None or waste is None or not self.model_ok:
             reject = "unknown"
-        elif tx.grams > self._max_weight(label):
+        elif not self.cfg.pretend_weight and tx.grams > self._max_weight(label):
             reject = "too_heavy"
         if reject:
             tx.reject = (reject, REJECT_MESSAGES[reject])
@@ -722,7 +980,10 @@ class TrayFlow(_RewardFlow):
             self._say(f"[REJECT] #{tx.id} {reject}: label={label} {conf:.0%} weight={tx.grams} g "
                       f"(max {limit} g) -> Residual, no code")
         else:
-            self._say(f"[IDENTIFIED] #{tx.id} {label} ({conf:.0%}) -> {waste}, {tx.grams} g")
+            tx.area_frac, tx.bonus = self._compact(label)
+            size = f", {tx.area_frac:.1%} of tray" if tx.area_frac is not None else ""
+            extra = f", compact bonus +{tx.bonus}" if tx.bonus else ""
+            self._say(f"[IDENTIFIED] #{tx.id} {label} ({conf:.0%}) -> {waste}, {tx.grams} g{size}{extra}")
         tx.waste_type = waste
         tx.bin_code = self._code(waste)
         self._awaiting, self._step_t = "ok", now
@@ -764,7 +1025,7 @@ class TrayFlow(_RewardFlow):
         p, dt = self.phase, now - self.since
         if p == Phase.READY:
             return self._maybe_tare(now)
-        if p == Phase.IDENTIFYING and dt >= self.cfg.identify_timeout_s:
+        if p == Phase.IDENTIFYING and dt >= max(self.cfg.identify_timeout_s, self.cfg.identify_s):
             return self._decide(now)
         if p == Phase.SORTING:
             waited = now - self._step_t

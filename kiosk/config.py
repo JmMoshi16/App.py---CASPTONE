@@ -9,14 +9,16 @@ import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-MODES = ("esp32", "sim", "camera", "attendant")
+MODES = ("hold", "esp32", "sim", "camera", "attendant")
 SORTER_MODES = MODES                     # older name
 LEGACY_KEYS = {"sorter": "mode", "serial_baud": "baud"}
 
 
 @dataclass
 class Settings:
-    # mode: "esp32"     = the bin: load cell triggers, YOLO on the tray, ESP32 sorts, DONE proves the deposit
+    # mode: "hold"      = no tray: the customer holds the item under the camera 3-5 s, the ESP32 turns the chute,
+    #                     the customer lets go, and DONE from the drop plate's scale proves the deposit
+    #       "esp32"     = the bin: load cell triggers, YOLO on the tray, ESP32 sorts, DONE proves the deposit
     #       "sim"       = the same flow with a simulated ESP32 (labelled SIMULATION; staff key I places an item)
     #       "camera"    = no hardware: the camera sees the item leave (testing)
     #       "attendant" = no hardware: staff press SPACE (testing)
@@ -28,12 +30,17 @@ class Settings:
     steady_ms: float = 500
     steady_tolerance_g: float = 1.0
     identify_timeout_s: float = 3.0
+    identify_s: float = 5.0              # look at the item this long before deciding
+    pretend_weight: bool = False         # no load cell: the camera starts a deposit, the weight shown is made up
     ok_timeout_s: float = 3.0
     drop_timeout_s: float = 4.0
     tray_roi: list = field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])   # x0, y0, x1, y1 as fractions
     multi_item_frames: int = 3
     jam_clear_s: float = 10.0
     auto_tare_idle_s: float = 60.0
+    # hold mode
+    hold_min_s: float = 3.0              # the item is held still this long before it can lock
+    hold_max_s: float = 5.0              # no clear label by then: "we couldn't recognise this item"
     # display
     width: int = 1280
     height: int = 720

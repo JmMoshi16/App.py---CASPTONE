@@ -1,6 +1,6 @@
 {
-  "_comment": "Kiosk settings (no secrets). Command-line flags override these (py -3.11 app.py --help). mode: esp32 = the bin (load cell + YOLO on the tray + ESP32 sorting), sim = the same flow with a simulated ESP32 (labelled SIMULATION, staff key I places an item), camera / attendant = testing without hardware. Missing keys fall back to defaults; the older names 'sorter' and 'serial_baud' are still read.",
-  "mode": "esp32",
+  "_comment": "Kiosk settings (no secrets). Command-line flags override these (py -3.11 app.py --help). mode: hold = no tray: the customer holds the item under the camera 3-5 s (hold_min_s / hold_max_s), the ESP32 turns the chute (OK within ok_timeout_s), the customer lets go and the drop plate's DONE proves it (drop_timeout); esp32 = the tray bin (load cell + YOLO on the tray + ESP32 sorting), sim = the same flow with a simulated ESP32 (labelled SIMULATION, staff key I places an item), camera / attendant = testing without hardware. pretend_weight true = no load cell: the camera starts a deposit and the weight is made up; identify_s = seconds the camera looks at the item before deciding. Missing keys fall back to defaults; the older names 'sorter' and 'serial_baud' are still read.",
+  "mode": "hold",
   "serial_port": "COM3",
   "baud": 115200,
 
@@ -8,7 +8,11 @@
   "steady_ms": 500,
   "steady_tolerance_g": 1,
   "identify_timeout_s": 3,
-  "ok_timeout_s": 3,
+  "identify_s": 5,
+  "pretend_weight": true,
+  "ok_timeout_s": 15,
+  "hold_min_s": 3,
+  "hold_max_s": 5,
   "drop_timeout_s": 12,
   "tray_roi": [0.0, 0.0, 1.0, 1.0],
   "multi_item_frames": 3,

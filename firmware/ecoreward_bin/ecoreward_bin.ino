@@ -1,4 +1,4 @@
-// ECOReward Bin — ESP32 firmware for the kiosk protocol (README "ESP32 protocol", firmware/README.md).
+// ECOReward Bin — ESP32 firmware for the kiosk protocol (README "ESP32 protocol and firmware").
 //
 // app.py -> ESP32:  P ping · T tare · 1/2/3 sort into Biodegradable / Recyclable / Residual
 // ESP32 -> app.py:  READY · PONG · W:<g> every 200 ms · OK:<n> · DONE:<n>:<g> · JAM:<n> · FILL:<b>,<r>,<s> · ERR:<text>

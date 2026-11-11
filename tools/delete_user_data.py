@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Erase one customer's personal data on request (roadmap 7.7, see docs/privacy.md).
+"""Erase one customer's personal data on request (roadmap 7.7, see README "Privacy").
 
 Run on an ADMIN's computer with the service-account key. Dry run by default:
 

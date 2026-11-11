@@ -5,7 +5,7 @@ rules_version = '2';
 // STATUS: drafted from what the Flutter app, the Next.js admin console and the kiosk actually do, and
 // exercised by firebase/tests/rules.test.mjs in the local Firestore emulator.
 // NOT DEPLOYED. Compare with the rules currently live in the Firebase console, try the apps against the
-// emulator or a test project, and only then deploy (see firebase/README.md).
+// emulator or a test project, and only then deploy (see README "Firestore rules").
 //
 // WHAT THIS CLOSES
 //   - A customer promoting themselves to admin (`role` can only be set to 'customer' at sign-up and is
@@ -61,7 +61,11 @@ service cloud.firestore {
     // created now (server time) and expiring within 30 minutes.
     function isNewKioskToken() {
       let t = request.resource.data;
-      return t.keys().hasOnly(['wasteType', 'expiresAt', 'usedBy', 'isUsed', 'createdAt', 'claimCode'])
+      // bonusPoints: the compact bonus for a crushed can, bottle or cup (optional, a whole number 0-5).
+      return t.keys().hasOnly(['wasteType', 'expiresAt', 'usedBy', 'isUsed', 'createdAt', 'claimCode', 'bonusPoints'])
+          && t.get('bonusPoints', 0) is int
+          && t.get('bonusPoints', 0) >= 0
+          && t.get('bonusPoints', 0) <= 5
           && t.wasteType in ['Biodegradable', 'Recyclable', 'Residual']
           && t.usedBy == []
           && t.isUsed == false

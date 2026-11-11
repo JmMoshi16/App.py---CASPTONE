@@ -1,4 +1,4 @@
-"""Reusable components (DESIGN_SYSTEM.md §6). Each draws onto `img` and returns what the caller needs
+"""Reusable components (README "Kiosk screen design"). Each draws onto `img` and returns what the caller needs
 (usually the bottom y or the hit box). Sizes are design units scaled by the Metrics `m`."""
 import math
 

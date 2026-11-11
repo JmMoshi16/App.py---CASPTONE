@@ -1,4 +1,4 @@
-"""Design tokens (DESIGN_SYSTEM.md §3–§7). Colours are stored as RGB hex and converted to OpenCV's BGR once."""
+"""Design tokens (README "Kiosk screen design"). Colours are stored as RGB hex and converted to OpenCV's BGR once."""
 from dataclasses import dataclass
 
 

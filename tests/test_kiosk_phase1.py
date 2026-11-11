@@ -586,6 +586,9 @@ class ConfigParityTest(unittest.TestCase):
             self.assertEqual(
                 kiosk_cfg["badges"], other_cfg["badges"],
                 f"badges mismatch between kiosk and {other_name}")
+            self.assertEqual(
+                kiosk_cfg["compactBonus"], other_cfg.get("compactBonus"),
+                f"compactBonus mismatch between kiosk and {other_name}")
 
     def test_kiosk_module_uses_config_values(self):
         kiosk_cfg = self._load(APP_DIR / "config" / "rules.json")

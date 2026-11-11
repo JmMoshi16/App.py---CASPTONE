@@ -189,6 +189,31 @@ class TrayEndToEnd(unittest.TestCase):
         self.assertNotIn("[QR GENERATED]", out)
 
 
+class HoldEndToEnd(unittest.TestCase):
+    """Hold mode through the real main(): held still under the camera -> chute turns (OK) -> let go -> DONE -> QR."""
+
+    def test_a_held_can_gets_a_code_only_after_done(self):
+        db = FakeFirestore()
+        make, holder = fast_sim()                      # its sort answers OK:n, then DONE:n:<g>, like the drop plate
+
+        def controller(n, seen):
+            ph = phase(seen)
+            if ph == "qr" and not db.unsubscribed:
+                claim(db, tokens(db)[0])
+            if ph == "ready" and any(p == "complete" for p, _ in seen):
+                return ord("q")
+
+        out, seen, _ = drive(controller, db=db, model=ScriptedModel([True]),
+                             settings={"mode": "hold", "hold_min_s": 0.3, "hold_max_s": 1.0, "cooldown_seconds": 0},
+                             extra=[mock.patch.object(app, "make_sorter", make)], max_frames=3000)
+        order = [p for i, (p, _) in enumerate(seen) if i == 0 or seen[i - 1][0] != p]
+        start = order.index("holding")
+        self.assertEqual(order[start:start + 7], ["holding", "turning", "letgo", "issuing", "qr", "complete", "ready"],
+                         order)
+        self.assertEqual(len(tokens(db)), 1)
+        self.assertLess(out.index("[DONE] #1 landed in bin 2"), out.index("[QR GENERATED]"), "a token before DONE")
+
+
 class CameraSelfServiceEndToEnd(unittest.TestCase):
     def test_a_customer_alone_gets_a_code_without_any_key(self):
         db = FakeFirestore()
@@ -237,6 +262,23 @@ class TokenContractTests(unittest.TestCase):
         det = [d for c, d in db.adds if c == "detections"][0]
         self.assertIs(det["timestamp"], app.SERVER_TS)
         self.assertEqual(det["kioskId"], app.KIOSK_ID)
+
+    def test_a_crushed_item_token_carries_its_bonus_and_others_keep_the_old_shape(self):
+        db = FakeFirestore()
+        with mock.patch.object(app, "db", db), contextlib.redirect_stdout(io.StringIO()):
+            app.issue_token("Recyclable", "can", 0.9, bonus=5)
+            app.issue_token("Recyclable", "can", 0.9)
+        (_, _, crushed), (_, _, normal) = [s for s in db.sets if s[0] == "qr_tokens"]
+        self.assertEqual(crushed["bonusPoints"], 5)
+        self.assertNotIn("bonusPoints", normal, "no bonus: the token keeps its exact earlier shape")
+
+    def test_staff_see_the_last_item_size_to_calibrate_the_compact_bonus(self):
+        tx = types.SimpleNamespace(label="can", area_frac=0.048)
+        with mock.patch.object(app, "COMPACT_MAX_FRAC", {"can": 0.06}):
+            self.assertEqual(app.compact_size_text(tx), "can · 4.8% of tray (bonus at ≤ 6.0%)")
+            self.assertEqual(app.compact_size_text(types.SimpleNamespace(label="fries", area_frac=0.02)),
+                             "fries · 2.0% of tray (no compact bonus for this item)")
+        self.assertEqual(app.compact_size_text(None), "—")
 
     def test_kiosk_never_writes_customer_collections(self):
         src = Path(app.__file__).read_text(encoding="utf-8")
@@ -466,6 +508,7 @@ def _views():
         return f.stages()
     tray_tx = types.SimpleNamespace(waste_type="Recyclable", grams=15.0, reject=None, label="can", confidence=0.91,
                                     claim_code="4821", token=tx.token)
+    crushed = types.SimpleNamespace(waste_type="Recyclable", claim_code="4821", token=tx.token, bonus=5)
     tray_reject = types.SimpleNamespace(waste_type="Residual", grams=120.0, label="cup", confidence=0.88,
                                         reject=("too_heavy", "Cups must be empty to earn points. It went to Residual."))
     base = dict(points=pts, clock="10:42 AM")
@@ -526,6 +569,14 @@ def _views():
         "tray-bin-warn": View(phase="ready", mode="esp32", tray=True, bins_warn=["Recyclable"], fill=(40, 93, 10),
                               stages=tray_st("ready"), **base),
         "tray-qr": View(phase="qr", mode="esp32", tray=True, stages=tray_st("qr"), **qr, **base),
+        "tray-qr-compact": View(phase="qr", mode="esp32", tray=True, stages=tray_st("qr"),
+                                **dict(qr, tx=crushed), **base),
+        "tray-receipt-compact": View(phase="qr", mode="esp32", tray=True, overlay="receipt", stages=tray_st("qr"),
+                                     **dict(qr, tx=crushed), **base),
+        "tray-complete-compact": View(phase="complete", mode="esp32", tray=True, tx=crushed, phase_age=5,
+                                      seconds_to_ready=3, **base),
+        "tray-ready-compact": View(phase="ready", mode="esp32", tray=True, sorter_state="connected",
+                                   compact_points=5, stages=tray_st("ready"), **base),
         "tray-complete": View(phase="complete", mode="esp32", tray=True, tx=tx, phase_age=5, seconds_to_ready=3, **base),
         "tray-diagnostics": View(phase="ready", mode="sim", tray=True, overlay="diagnostics", weight=0.3, steady=True,
                                  fill=(35, 50, 20), serial_lines=["> P", "< PONG", "> 2", "< OK:2", "< DONE:2:15.0"],
@@ -533,6 +584,40 @@ def _views():
                                  diagnostics=[("Kiosk", [("Name", "x")])], **base),
         "model-mismatch": View(phase="detected", model_ok=False, detection=Detection("person", None, 0.9),
                                latest=Detection("person", None, 0.9, (10, 10, 600, 470)), **base),
+        **_hold_views(det, tx, base, qr),
+    }
+
+
+def _hold_views(det, tx, base, qr):
+    """Hold mode: the customer holds the item under the camera, the chute turns, they let go onto the plate."""
+    from kiosk.flow import FlowConfig, HoldFlow, Phase
+    hold_tx = types.SimpleNamespace(waste_type="Recyclable", claim_code="4821", token=tx.token, label="can",
+                                    confidence=0.87, bin_code="2", grams=None, bonus=0)
+
+    def st(ph, kind=None):
+        f = HoldFlow(FlowConfig(mode="hold"))
+        f.phase = Phase(ph)
+        f.failure = Failure(kind, "", "") if kind else None
+        return f.stages()
+    from kiosk.flow import HOLD_FAILURES, Failure
+    hb = dict(mode="hold", sorter_state="connected", sorter_ready=True, **base)
+
+    def failed(kind):
+        return View(phase="failed", tx=hold_tx, failure=Failure(kind, *HOLD_FAILURES[kind]), seconds_to_ready=5,
+                    stages=st("failed", kind), **hb)
+    return {
+        "hold-ready": View(phase="ready", stages=st("ready"), **hb),
+        "hold-ready-reconnecting": View(phase="ready", stages=st("ready"), **dict(hb, sorter_state="reconnecting",
+                                                                                  sorter_ready=False)),
+        "hold-ready-take-away": View(phase="ready", armed=False, latest=det, stages=st("ready"), **hb),
+        "hold-holding": View(phase="holding", detection=det, latest=det, lock_progress=0.45, stages=st("holding"),
+                             **hb),
+        "hold-turning": View(phase="turning", tx=hold_tx, stages=st("turning"), **hb),
+        "hold-letgo": View(phase="letgo", tx=hold_tx, drop_left=11.0, drop_timeout=15.0, stages=st("letgo"), **hb),
+        "hold-qr": View(phase="qr", stages=st("qr"), **dict(qr, tx=hold_tx), **hb),
+        "hold-unrecognised": failed("unrecognised"),
+        "hold-bin-not-ready": failed("bin_not_ready"),
+        "hold-no-drop": failed("no_drop"),
     }
 
 
@@ -564,6 +649,15 @@ class PendingRewardsTests(unittest.TestCase):
         self.assertIs(data["createdAt"], app.SERVER_TS)
         self.assertLessEqual(data["expiresAt"] - app._now(), timedelta(minutes=30))
         self.assertEqual(self.pending.count(), 0, "uploaded rewards leave the file")
+
+    def test_an_offline_crushed_item_is_uploaded_with_its_bonus(self):
+        with mock.patch.object(app, "db", None):
+            self.pending.add("Recyclable", bonus=5)
+        db = FakeFirestore()
+        with mock.patch.object(app, "db", db):
+            self.pending.flush()
+        (_, _, data), = db.sets
+        self.assertEqual(data["bonusPoints"], 5)
 
     def test_a_failed_upload_keeps_the_reward_for_next_time(self):
         class Broken:
@@ -634,6 +728,16 @@ class ScreenTests(unittest.TestCase):
                 img = Renderer(w, h).render(self.cam, views["qr"], 10.0, transition=False)
                 text, _, _ = detector.detectAndDecode(img)
                 self.assertEqual(text, payload)
+
+    def test_a_crushed_item_qr_still_scans_and_says_the_bonus(self):
+        from kiosk.ui.screens import compact_note
+        payload, views = _views()
+        for w, h in self.SIZES:
+            with self.subTest(size=f"{w}x{h}"):
+                img = Renderer(w, h).render(self.cam, views["tray-qr-compact"], 10.0, transition=False)
+                self.assertEqual(cv2.QRCodeDetector().detectAndDecode(img)[0], payload)
+        self.assertEqual(compact_note(5), "Includes +5 compact bonus. Thanks for crushing it!")
+        self.assertEqual(compact_note(0), "")
 
     def test_touch_buttons_are_at_least_80_px_tall_at_every_size(self):
         _, views = _views()

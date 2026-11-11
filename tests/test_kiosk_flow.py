@@ -13,11 +13,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kiosk import config as cfgmod                                          # noqa: E402
-from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SendSort, Sound, StopWatching, Tare,  # noqa: E402
-                        TransactionFlow, TrayConfig, TrayFlow, WatchToken)
+from kiosk.flow import (Detection, FlowConfig, HoldFlow, IssueToken, Phase, SendSort, Sound, StopWatching,  # noqa: E402
+                        Tare, TransactionFlow, TrayConfig, TrayFlow, WatchToken)
 from kiosk.hardware import (AttendantSorter, Booted, DeviceError, Done, Fill, Jam, LinkLost, LinkState,  # noqa: E402
-                            LinkUp, Ok, Pong, SerialSorter, SimulatedESP32, Weight, WeightTracker, make_sorter,
-                            parse_line)
+                            LinkUp, NoDrop, Ok, Pong, SerialSorter, SimulatedESP32, Weight, WeightTracker,
+                            make_sorter, parse_line)
 
 CAN = Detection("can", "Recyclable", 0.9, (1, 2, 3, 4))
 PEEL = Detection("banana peel", "Biodegradable", 0.8, (1, 2, 3, 4))
@@ -300,6 +300,145 @@ class TrayHappyPathTests(unittest.TestCase):
         self.assertEqual([a.code for a in acts if isinstance(a, SendSort)], ["2"])
 
 
+class TrayCompactBonusTests(unittest.TestCase):
+    """+5 when a can, bottle or cup is crushed: it looks much smaller on the tray than a normal one (rules.json
+    compactBonus). area_frac = the item's box as a share of the tray area."""
+    COMPACT = {"can": 0.06, "cup": 0.08}
+
+    def _issue(self, f):
+        code = int(f.tx.bin_code)
+        f.on_sorter_event(Ok(code), 3.0)
+        weigh(f, 0.0, 3.2, n=2)
+        return f.on_sorter_event(Done(code, f.tx.grams), 3.6)
+
+    def _bonus_for(self, frames, grams=15.0, online=True):
+        f = tray(online=online, compact_points=5, compact_max_frac=self.COMPACT)
+        weigh(f, grams, 1.0)
+        for i, d in enumerate(frames):
+            f.observe(d, 2.0 + i * 0.05)
+        return f, self._issue(f)
+
+    @staticmethod
+    def _at(det, frac):
+        return Detection(det.label, det.waste_type, det.confidence, det.box, area_frac=frac)
+
+    def test_a_crushed_can_earns_the_bonus_a_normal_can_does_not(self):
+        _, acts = self._bonus_for([self._at(CAN, 0.04)] * 7)
+        self.assertEqual(kinds(acts), ["IssueToken"])
+        self.assertEqual(acts[0].bonus, 5)
+        _, acts = self._bonus_for([self._at(CAN, 0.10)] * 7)
+        self.assertEqual(acts[0].bonus, 0)
+
+    def test_only_cans_bottles_and_cups_qualify(self):
+        _, acts = self._bonus_for([self._at(PEEL_ITEM, 0.01)] * 7)
+        self.assertEqual(acts[0].bonus, 0, "food can't be compressed: no bonus however small it looks")
+
+    def test_the_median_decides_so_one_odd_frame_does_not(self):
+        _, acts = self._bonus_for([self._at(CAN, f) for f in (0.04, 0.04, 0.30, 0.04, 0.04, 0.30, 0.04)])
+        self.assertEqual(acts[0].bonus, 5)
+        _, acts = self._bonus_for([self._at(CAN, f) for f in (0.10, 0.10, 0.02, 0.10, 0.10, 0.02, 0.10)])
+        self.assertEqual(acts[0].bonus, 0)
+
+    def test_no_size_known_means_no_bonus(self):
+        _, acts = self._bonus_for([CAN] * 7)                     # camera mode / no measurement
+        self.assertEqual(acts[0].bonus, 0)
+
+    def test_a_rejected_item_never_earns_it(self):
+        f, acts = self._bonus_for([self._at(CAN, 0.04)] * 7, grams=120.0)   # heavier than a can may be
+        self.assertNotIn("IssueToken", kinds(acts))
+        self.assertEqual(f.tx.bonus, 0)
+
+    def test_an_offline_reward_keeps_the_bonus(self):
+        _, acts = self._bonus_for([self._at(CAN, 0.04)] * 7, online=False)
+        self.assertEqual(kinds(acts), ["SaveOfflineReward"])
+        self.assertEqual(acts[0].bonus, 5)
+
+
+class TrayPretendWeightTests(unittest.TestCase):
+    """pretend_weight: no load cell. The camera starts the deposit, the weight shown is made up, then the kiosk
+    looks at the item for identify_s seconds before it decides."""
+
+    def _pretend(self, **kw):
+        return tray(pretend_weight=True, identify_s=5.0, **kw)
+
+    def test_the_camera_starts_a_deposit_without_any_weight(self):
+        f = self._pretend()
+        self.assertTrue(f.wants_frames, "READY must watch the camera when there is no scale")
+        f.observe(None, 1.0)
+        self.assertEqual(f.phase, Phase.READY)
+        identify(f, CAN, 1.1, n=3)
+        self.assertEqual(f.phase, Phase.IDENTIFYING)
+        self.assertTrue(5 <= f.tx.grams <= 30)
+
+    def test_it_looks_for_five_seconds_before_deciding(self):
+        f = self._pretend()
+        identify(f, CAN, 1.0, n=3)                                # starts at t = 1.1
+        start = f.since
+        identify(f, CAN, start + 0.1, n=40, dt=0.1)                 # 4 s of frames, all agreeing
+        self.assertEqual(f.phase, Phase.IDENTIFYING, "decided before the 5 s were up")
+        self.assertAlmostEqual(f.lock_progress, 0.8, places=1)
+        acts = f.observe(CAN, start + 5.0)
+        self.assertEqual([a.code for a in acts if isinstance(a, SendSort)], ["2"])
+
+    def test_a_slow_camera_still_decides_after_five_seconds(self):
+        f = self._pretend()
+        identify(f, CAN, 1.0, n=3)
+        start = f.since
+        identify(f, CAN, start + 1.0, n=3, dt=1.0)                  # only 3 frames, never the 7 of a vote window
+        self.assertEqual(f.tick(start + 4.9, UTC0), [])
+        acts = f.tick(start + 5.0, UTC0)
+        self.assertEqual([a.code for a in acts if isinstance(a, SendSort)], ["2"])
+
+    def test_a_made_up_weight_never_rejects_as_too_heavy_and_a_real_scale_is_ignored(self):
+        f = self._pretend()
+        f.on_sorter_event(Weight(900.0), 0.5)                    # a broken or missing load cell
+        self.assertEqual(f.phase, Phase.READY)
+        f.on_sorter_event(DeviceError("HX711 not found"), 0.6)
+        self.assertEqual(f.phase, Phase.READY, "no scale must not put the kiosk out of service")
+        identify(f, CAN, 1.0, n=3)
+        identify(f, CAN, f.since + 1.0, n=3)
+        f.tick(f.since + 5.0, UTC0)
+        self.assertIsNone(f.tx.reject)
+
+    def test_the_same_item_still_in_view_does_not_start_a_second_deposit(self):
+        f = self._pretend()
+        identify(f, CAN, 1.0, n=3)
+        identify(f, CAN, f.since + 1.0, n=3)
+        f.tick(f.since + 5.0, UTC0)
+        f.on_sorter_event(Ok(2), 7.0)
+        f.on_sorter_event(Done(2, 0.0), 7.5)
+        finish_qr(f, 8.0)
+        f.on_scanned("tok", 9.0)
+        f.tick(14.0, UTC0)
+        self.assertEqual(f.phase, Phase.READY)
+        identify(f, CAN, 14.1, n=5)                              # the hand is still holding it
+        self.assertEqual(f.phase, Phase.READY)
+        identify(f, None, 15.0, n=10)                            # taken away: the tray is empty
+        identify(f, CUP, 16.0, n=3)
+        self.assertEqual(f.phase, Phase.IDENTIFYING)
+
+    def test_an_item_seen_in_only_some_of_the_frames_is_still_recognised(self):
+        f = self._pretend()
+        identify(f, CAN, 1.0, n=3)
+        start = f.since
+        frames = ([CAN] + [None] * 3) * 13                       # 5 s of frames; YOLO finds it in 1 of 4
+        acts = identify(f, frames[0], start + 0.1, n=1)
+        for i, d in enumerate(frames[1:]):
+            acts += f.observe(d, start + 0.2 + i * 0.1)
+        self.assertEqual([a.code for a in acts if isinstance(a, SendSort)], ["2"])
+        self.assertIsNone(f.tx.reject)
+
+    def test_a_jam_clears_by_itself_without_a_scale(self):
+        f = self._pretend(jam_clear_s=10.0)
+        identify(f, CAN, 1.0, n=3)
+        identify(f, CAN, f.since + 1.0, n=3)
+        f.tick(f.since + 5.0, UTC0)
+        f.on_sorter_event(Jam(2), 7.0)
+        self.assertEqual(f.phase, Phase.JAM)
+        f.tick(17.1, UTC0)
+        self.assertEqual(f.phase, Phase.READY)
+
+
 class TrayRejectTests(unittest.TestCase):
     def _rejected(self, f, code=3):
         self.assertEqual(f.tx.bin_code, str(code))
@@ -521,6 +660,183 @@ class TrayFaultTests(unittest.TestCase):
 
 
 # ── protocol, serial link, simulated ESP32 ──────────────────────────────────
+# ── hold mode: the customer holds the item under the camera; the chute turns; the scale proves the drop ──
+def held(label="can", waste="Recyclable", x=0.0, conf=0.9):
+    return Detection(label, waste, conf, (100 + x, 100, 200 + x, 250))     # a 100 x 150 px box
+
+
+def hold_flow(**kw):
+    f = HoldFlow(FlowConfig(mode="hold", **kw))
+    f.set_context(online=True, model_ok=True, sorter_ready=True)
+    return f
+
+
+def show(f, det, t0, secs, dt=0.1):
+    """One frame every dt seconds from t0 up to and including t0 + secs; det may be a function of the frame no."""
+    out = []
+    for i in range(int(round(secs / dt)) + 1):
+        out += f.observe(det(i) if callable(det) else det, t0 + i * dt)
+    return out
+
+
+def sorts(acts):
+    return [a.code for a in acts if isinstance(a, SendSort)]
+
+
+def to_letgo(f, det=None, t0=1.0):
+    acts = show(f, det or held(), t0, 3.0)
+    assert f.phase == Phase.TURNING, f.phase
+    acts += f.on_sorter_event(Ok(int(f.tx.bin_code)), t0 + 5.0)
+    assert f.phase == Phase.LETGO, f.phase
+    return acts
+
+
+class HoldFlowTests(unittest.TestCase):
+    def test_no_lock_before_three_seconds(self):
+        f = hold_flow()
+        acts = show(f, held(), 1.0, 2.9)
+        self.assertEqual(sorts(acts), [])
+        self.assertEqual(f.phase, Phase.HOLDING)
+        self.assertLess(f.lock_progress, 1.0)
+        self.assertEqual(sorts(f.observe(held(), 4.0)), ["2"])
+        self.assertEqual(f.phase, Phase.TURNING)
+
+    def test_moving_restarts_the_count(self):
+        f = hold_flow()
+        show(f, held(), 1.0, 2.5)
+        acts = show(f, held(x=60), 3.6, 1.0)                    # jumped 60 px: more than a quarter of 100 px
+        self.assertEqual(sorts(acts), [], "the count must restart after a big move")
+        self.assertEqual(f.phase, Phase.HOLDING)
+        self.assertEqual(sorts(show(f, held(x=60), 4.7, 1.9)), ["2"], "3 s after the move it locks")
+        g = hold_flow()
+        self.assertEqual(sorts(show(g, lambda i: held(x=i * 2), 1.0, 3.0)), ["2"], "a small sway is still")
+
+    def test_leaving_the_view_restarts_the_count(self):
+        f = hold_flow()
+        show(f, held(), 1.0, 2.5)
+        show(f, None, 3.6, 0.5)
+        self.assertEqual(f.phase, Phase.READY)
+        self.assertEqual(sorts(show(f, held(), 4.2, 2.8)), [])
+        self.assertEqual(sorts(f.observe(held(), 7.2)), ["2"])
+
+    def test_unrecognised_after_five_seconds_without_a_clear_label(self):
+        f = hold_flow()
+        mixed = lambda i: held() if i % 2 else held("banana peel", "Biodegradable")   # 50 / 50: below 60 %
+        acts = show(f, mixed, 1.0, 4.9)
+        self.assertEqual(sorts(acts), [])
+        self.assertEqual(f.phase, Phase.HOLDING, "still trying between 3 and 5 s")
+        acts = f.observe(held(), 6.0)
+        self.assertEqual(sorts(acts), [])
+        self.assertEqual(f.phase, Phase.FAILED)
+        self.assertEqual(f.failure.kind, "unrecognised")
+        self.assertIn("hold it still in the middle of the opening", f.failure.message.lower())
+        f.tick(6.0 + 7.1, UTC0)
+        self.assertEqual(f.phase, Phase.READY)
+        self.assertEqual(sorts(show(f, held(), 13.2, 4.0)), [], "the same item, still in view, can't start again")
+        show(f, None, 17.3, 1.2)
+        self.assertEqual(sorts(show(f, held(), 18.6, 3.0)), ["2"], "after it left the view it can")
+
+    def test_an_item_not_in_the_waste_map_is_unrecognised(self):
+        f = hold_flow()
+        show(f, held("person", None), 1.0, 5.0)
+        self.assertEqual((f.phase, f.failure.kind), (Phase.FAILED, "unrecognised"))
+
+    def test_sends_the_right_bin_code(self):
+        for det, code in ((held("banana peel", "Biodegradable"), "1"), (held(), "2"), (held("fork", "Residual"), "3")):
+            with self.subTest(item=det.label):
+                f = hold_flow()
+                self.assertEqual(sorts(show(f, det, 1.0, 3.0)), [code])
+                self.assertEqual(f.tx.bin_code, code)
+        f = hold_flow(bin_codes={"Biodegradable": "3", "Recyclable": "1", "Residual": "2"})
+        self.assertEqual(sorts(show(f, held(), 1.0, 3.0)), ["1"], "codes come from rules.json bin_codes")
+
+    def test_ignores_ok_for_the_wrong_bin(self):
+        f = hold_flow()
+        show(f, held(), 1.0, 3.0)
+        self.assertEqual(f.on_sorter_event(Ok(3), 5.0), [])
+        self.assertEqual(f.phase, Phase.TURNING)
+        f.on_sorter_event(Ok(2), 6.0)
+        self.assertEqual(f.phase, Phase.LETGO)
+
+    def test_the_item_leaving_the_camera_view_is_not_enough(self):
+        f = hold_flow()
+        acts = to_letgo(f)
+        self.assertFalse(f.wants_frames, "hold mode does not watch the drop with the camera")
+        acts += show(f, None, 6.1, 3.0)
+        acts += f.tick(9.0, UTC0)
+        self.assertNotIn("IssueToken", kinds(acts))
+        self.assertEqual(f.phase, Phase.LETGO)
+
+    def test_a_code_only_after_done_and_the_grams_are_saved(self):
+        f = hold_flow()
+        acts = to_letgo(f)
+        self.assertNotIn("IssueToken", kinds(acts))
+        self.assertEqual(f.on_sorter_event(Done(3, 14.5), 7.0), [], "DONE for another bin is not proof")
+        acts = f.on_sorter_event(Done(2, 14.5), 8.0)
+        self.assertEqual(kinds(acts), ["IssueToken"])
+        self.assertEqual((f.tx.grams, f.tx.sorted), (14.5, True))
+        self.assertEqual(f.on_sorter_event(Done(2, 14.5), 8.1), [], "a repeated DONE can't issue a second code")
+        finish_qr(f, 9.0)
+        self.assertEqual(f.phase, Phase.QR)
+
+    def test_offline_at_done_keeps_the_reward_on_the_kiosk(self):
+        f = hold_flow()
+        to_letgo(f)
+        f.set_context(online=False, model_ok=True, sorter_ready=True)
+        self.assertEqual(kinds(f.on_sorter_event(Done(2, 9.0), 8.0)), ["SaveOfflineReward"])
+
+    def test_nodrop_ok_timeout_jam_error_and_lost_link_all_fail_without_a_code(self):
+        def fails(setup, event_at, kind):
+            f = hold_flow(ok_timeout_s=15.0, drop_timeout=15.0)
+            setup(f)
+            acts = event_at(f)
+            self.assertEqual(f.phase, Phase.FAILED)
+            self.assertEqual(f.failure.kind, kind)
+            self.assertNotIn("IssueToken", kinds(acts))
+            self.assertEqual(f.on_sorter_event(Done(2, 10.0), 40.0), [], "a late DONE after a failure is ignored")
+            return f
+        turning = lambda f: show(f, held(), 1.0, 3.0)
+        f = fails(to_letgo, lambda f: f.on_sorter_event(NoDrop(2), 9.0), "no_drop")
+        self.assertIn("didn't see it go in", f.failure.title.lower())
+        fails(to_letgo, lambda f: f.tick(6.0 + 16.1, UTC0), "no_drop")
+        g = hold_flow(ok_timeout_s=15.0)
+        turning(g)
+        self.assertEqual(g.tick(4.0 + 14.9, UTC0), [], "waits the full 15 s for OK")
+        f = fails(turning, lambda f: f.tick(4.0 + 15.1, UTC0), "bin_not_ready")
+        self.assertIn("keep the item", f.failure.message.lower())
+        fails(turning, lambda f: f.on_sorter_event(Jam(2), 9.0), "bin_not_ready")
+        fails(to_letgo, lambda f: f.on_sorter_event(Jam(2), 9.0), "bin_not_ready")
+        fails(turning, lambda f: f.on_sorter_event(DeviceError("busy"), 5.0), "bin_not_ready")
+        fails(turning, lambda f: f.on_sorter_event(LinkLost("unplugged"), 5.0), "bin_not_ready")
+
+    def test_no_start_without_the_esp32(self):
+        f = hold_flow()
+        f.set_context(online=True, model_ok=True, sorter_ready=False)
+        self.assertEqual(sorts(show(f, held(), 1.0, 6.0)), [])
+        self.assertEqual(f.phase, Phase.READY)
+        f.set_context(online=True, model_ok=True, sorter_ready=True)
+        self.assertEqual(sorts(show(f, held(), 7.1, 3.0)), ["2"], "starts once the ESP32 is back")
+
+    def test_cooldown_between_codes(self):
+        f = hold_flow(cooldown_seconds=15.0)
+        to_letgo(f)
+        f.on_sorter_event(Done(2, 12.0), 8.0)
+        finish_qr(f, 9.0)
+        f.on_scanned("tok", 10.0)
+        f.tick(14.1, UTC0)
+        show(f, None, 14.2, 1.2)
+        self.assertEqual(sorts(show(f, held(), 15.5, 5.0)), [], "cooldown: no second code within 15 s")
+        self.assertGreater(f.cooldown_left(20.0), 0)
+        self.assertEqual(sorts(show(f, held(), 24.1, 3.0)), ["2"])
+
+    def test_stepper(self):
+        f = hold_flow()
+        self.assertEqual([lbl for _, lbl, _ in f.stages()],
+                         ["Identify the item", "Turn to the right bin", "Let go of the item", "Create your reward code"])
+        to_letgo(f)
+        self.assertEqual([st for _, _, st in f.stages()], ["done", "done", "active", "pending"])
+
+
 class ProtocolTests(unittest.TestCase):
     def test_parse_line(self):
         self.assertEqual(parse_line("READY"), Booted())
@@ -533,7 +849,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parse_line("FILL:45,22,104"), Fill(45, 22, 100))
         self.assertEqual(parse_line("FILL:-1,40,-1"), Fill(None, 40, None), "-1 = that sensor has no reading")
         self.assertEqual(parse_line("ERR:servo stalled"), DeviceError("servo stalled"))
-        for bad in ("", "OK", "OK:4", "DONE:2", "DONE:x:1", "JAM:", "W:", "W:abc", "FILL:1,2", "FILL:1,2,300",
+        self.assertEqual(parse_line("NODROP:2"), NoDrop(2))
+        self.assertIsNone(parse_line("# chute STOPPED at Rec"), "debug lines are not protocol lines")
+        for bad in ("", "OK", "OK:4", "NODROP:", "NODROP:7", "DONE:2", "DONE:x:1", "JAM:", "W:", "W:abc", "FILL:1,2", "FILL:1,2,300",
                     "hello", "x" * 200):
             self.assertIsNone(parse_line(bad), bad)
 
@@ -759,7 +1077,9 @@ class SettingsTests(unittest.TestCase):
         s, problems = cfgmod.load_settings(Path(__file__).resolve().parents[1] / "config" / "kiosk_settings.json")
         self.assertEqual(problems, [])
         self.assertEqual((s.mode, s.serial_port, s.baud, s.min_item_g, s.steady_ms, s.identify_timeout_s),
-                         ("esp32", "COM3", 115200, 6.0, 500, 3.0))   # 6 g: above the 3-4 g drift of the empty tray
+                         ("hold", "COM3", 115200, 6.0, 500, 3.0))    # 6 g: above the 3-4 g drift of the empty tray
+        self.assertEqual((s.ok_timeout_s, s.hold_min_s, s.hold_max_s, s.drop_timeout), (15.0, 3.0, 5.0, 15.0))
+        self.assertEqual((s.pretend_weight, s.identify_s), (True, 5.0), "no load cell yet: camera + 5 s look")
 
     def test_rules_have_a_weight_limit_for_every_label(self):
         import json
@@ -767,6 +1087,10 @@ class SettingsTests(unittest.TestCase):
         rules = json.loads((root / "config" / "rules.json").read_text(encoding="utf-8"))
         labels = json.loads((root / "config" / "waste_map.json").read_text(encoding="utf-8"))["map"]
         self.assertEqual(sorted(set(labels) - set(rules["max_weight_g"])), [])
+        compact = rules["compactBonus"]
+        self.assertEqual(compact["points"], 5)
+        self.assertEqual(sorted(set(compact["maxBoxFrac"]) - set(labels)), [], "every compact label is a model label")
+        self.assertTrue(all(0 < v < 1 for v in compact["maxBoxFrac"].values()))
         self.assertEqual(rules["bin_codes"], {"Biodegradable": "1", "Recyclable": "2", "Residual": "3"})
         self.assertEqual((rules["unknown_policy"], rules["bin_warn_pct"], rules["bin_full_pct"]),
                          ("residual_no_code", 90, 100))

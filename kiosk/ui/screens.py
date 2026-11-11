@@ -1,6 +1,6 @@
 """Every kiosk screen, drawn from one View (a snapshot of the flow + system status) per frame.
 
-Layout (DESIGN_SYSTEM.md §2): top bar, optional banner, camera viewport on the left, stage panel on the
+Layout (README "Kiosk screen design"): top bar, optional banner, camera viewport on the left, stage panel on the
 right; full-screen cards for the result moments; modals for staff tools. Static parts (background, top bar
 frame, panel card) are cached per layout and copied each frame; only live parts are redrawn.
 """
@@ -20,6 +20,9 @@ PHASE_CAPTION = {
     "detected": ("check", "Item recognised"),
     "sorting": ("arrow_down", "Sorting…"),
     "dropping": ("arrow_down", "Waiting for the drop…"),
+    "holding": ("clock", "Hold still…"),
+    "turning": ("bin", "Turning the chute…"),
+    "letgo": ("arrow_down", "Let go of the item"),
     "confirming": ("scale", "Checking the drop…"),
     "issuing": ("qr", "Creating your code…"),
 }
@@ -28,7 +31,7 @@ PHASE_CAPTION = {
 @dataclass
 class View:
     phase: str = "ready"
-    mode: str = "attendant"                 # attendant | camera | esp32 | sim
+    mode: str = "attendant"                 # attendant | camera | hold | esp32 | sim
     online: bool = True
     model_ok: bool = True
     camera_ok: bool = True
@@ -74,7 +77,9 @@ class View:
     preview: object = None                  # camera frame for the diagnostics preview
     cooldown_left: float = 0.0              # camera mode: seconds until the next deposit may start
     drop_left: float = 0.0                  # camera mode: seconds left to drop the item
+    compact_points: int = 0                 # rules.json compactBonus.points (the Ready screen's tip)
     drop_timeout: float = 15.0
+    hold_min_s: float = 3.0                 # hold mode: seconds the item is held still
 
     @property
     def simulated(self):
@@ -83,11 +88,24 @@ class View:
     @property
     def automatic(self):
         """Self-service: no staff key starts the deposit."""
-        return self.mode in ("esp32", "sim", "camera")
+        return self.mode in ("esp32", "sim", "camera", "hold")
+
+    @property
+    def hold(self):
+        return self.mode == "hold"
 
     @property
     def camera_only(self):
         return self.mode == "camera"
+
+
+def compact_note(bonus):
+    """The line under the reward headline when a crushed can, bottle or cup earned the compact bonus."""
+    return f"Includes +{bonus} compact bonus. Thanks for crushing it!" if bonus else ""
+
+
+def _bonus(v):
+    return int(getattr(v.tx, "bonus", 0) or 0) if v.tx else 0
 
 
 def _ease(t):
@@ -175,8 +193,9 @@ class Renderer:
         else:
             self._viewport(img, cam, v, L, dim=0.45 if v.phase == "qr" else 0.0)
             self._panel_card(img, L)
-            {"ready": self._ready, "detected": self._detected, "qr": self._qr,
-             "dropping": self._dropping}.get(v.phase, self._working)(img, v, L, now)
+            {"ready": self._ready, "detected": self._detected, "qr": self._qr, "dropping": self._dropping,
+             "holding": self._holding, "turning": self._turning, "letgo": self._letgo,
+             "notice": self._notice}.get(v.phase, self._working)(img, v, L, now)
         if v.overlay:
             self._modal(img, v, now)
         if v.toast:
@@ -242,7 +261,7 @@ class Renderer:
                     icon="camera") - px(8)
         if v.mode == "sim":
             x = ui.chip(img, x, y, "SIMULATION", "sim", icon="alert") - px(8)
-        elif v.mode == "esp32":
+        elif v.mode in ("esp32", "hold"):
             st = {"connected": ("Sorter ready", "ok", False), "connecting": ("Sorter connecting", "busy", True),
                   "reconnecting": ("Sorter reconnecting", "busy", True), "error": ("Sorter error", "error", False)}
             label, style, pulse = st.get(v.sorter_state, ("Sorter offline", "error", False))
@@ -269,7 +288,7 @@ class Renderer:
             return
         view, (scale, ox, oy) = D.cover(cam, w, h)
         view = view.copy()
-        if v.phase in ("ready", "detected") and v.latest is not None and v.latest.box is not None:
+        if v.phase in ("ready", "detected", "holding") and v.latest is not None and v.latest.box is not None:
             self._detection_box(view, v, scale, ox, oy)
         if dim > 0:
             D.blend_rect(view, 0, 0, w, h, C.canvas, dim)
@@ -285,6 +304,9 @@ class Renderer:
         icon, label = PHASE_CAPTION.get(v.phase, ("camera", ""))
         if v.phase == "dropping" and v.tx is not None:
             label = f"Drop it into the {v.tx.waste_type} bin"
+        if v.phase in ("turning", "letgo") and v.tx is not None:
+            label = (f"Turning to the {v.tx.waste_type} bin…" if v.phase == "turning"
+                     else f"Let go: the chute is at the {v.tx.waste_type} bin")
         if v.phase == "detected" and v.detection is not None:
             label = f"Recognised: {v.detection.waste_type or 'not a known item'}"
             icon = "check" if v.detection.waste_type else "alert"
@@ -328,7 +350,7 @@ class Renderer:
         ui.card(img, cx1, cy1, cx1 + w, cy1 + h)
         pad = px(28)
         y = cy1 + pad
-        ok = "Dropped" if v.camera_only else "Sorted" if v.automatic else "Deposit confirmed"
+        ok = "Dropped" if v.camera_only or v.hold else "Sorted" if v.automatic else "Deposit confirmed"
         ui.category_pill(img, cx1 + pad, y, v.tx.waste_type if v.tx else None, ok)
         y += px(56)
         for n, text in ((1, "Open the ECOReward app"), (2, "Tap Scan"), (3, "Point your phone at the code")):
@@ -350,7 +372,9 @@ class Renderer:
         w = x2 - x1
         y = ui.overline(img, "Ready", x1, y) + px(10)
         y = ui.para(img, "Recycle your cup, earn points", x1, y, w, "title", C.ink, max_lines=2) + px(10)
-        body = ("Drop one item at a time into the slot. Cups must be empty to earn points."
+        body = (f"Hold your item still inside the bin for {v.hold_min_s:g} seconds, then let go when we say so."
+                if v.hold else
+                "Drop one item at a time into the slot. Cups must be empty to earn points."
                 if v.tray else
                 "Hold your item up to the camera, then drop it into the bin we show you."
                 if v.camera_only else
@@ -367,9 +391,12 @@ class Renderer:
             pr = ui.text(img, "pts", x2, y + tile / 2 + px(3), "caption", C.ink_2, "rm")
             ui.text(img, pts, pr[0] - px(6), y + tile / 2, "heading", cat["color"], "rm")
             y += tile + px(12)
+        if v.hold:
+            self._hold_blocked(img, v, x1, y + px(8), x2)
         draw_icon(img, "info", x1, y2 - px(40), px(18), C.ink_3)
-        ui.para(img, "Base points. Streak bonuses are added in the ECOReward app.", x1 + px(28), y2 - px(41),
-                w - px(28), "caption", C.ink_2, max_lines=2)
+        tip = (f"Base points. Crush cans, bottles and cups first: +{v.compact_points} bonus."
+               if v.tray and v.compact_points else "Base points. Streak bonuses are added in the ECOReward app.")
+        ui.para(img, tip, x1 + px(28), y2 - px(41), w - px(28), "caption", C.ink_2, max_lines=2)
 
     def _detected(self, img, v, L, now):
         ui, px = self.ui, self.m.px
@@ -442,6 +469,87 @@ class Renderer:
         ui.meter(img, x1, y + px(26), x2, v.drop_left / max(0.1, v.drop_timeout), cat["color"], height=6)
         ui.stepper(img, x1, y2 - len(v.stages) * px(40), w, v.stages, compact=True)
 
+    # ── hold mode: hold still -> keep holding while the chute turns -> let go onto the drop plate ──
+    def _hold_blocked(self, img, v, x1, y, x2):
+        """Ready screen: why holding an item up will not start a deposit right now."""
+        ui = self.ui
+        if not v.sorter_ready:
+            return ui.note(img, x1, y, x2, "The bin is reconnecting", "Please wait a moment.", "warning", icon="plug")
+        if not v.online:
+            return ui.note(img, x1, y, x2, "Reward codes are paused", "The kiosk is offline. Please ask staff.",
+                           "warning")
+        if v.cooldown_left > 0:
+            return ui.note(img, x1, y, x2, "Just a moment",
+                           f"The next deposit can start in {int(math.ceil(v.cooldown_left))} s.", "info", icon="clock")
+        if not v.armed and v.latest is not None:
+            return ui.note(img, x1, y, x2, "Take the item out of view first",
+                           "Then hold it up again to start a new deposit.", "info")
+        return y
+
+    def _hold_header(self, img, v, L, overline, title):
+        ui, px = self.ui, self.m.px
+        x1, y, x2, y2 = self._inner(L)
+        y = ui.overline(img, overline, x1, y) + px(10)
+        return x1, ui.para(img, title, x1, y, x2 - x1, "title", C.ink, max_lines=3) + px(14), x2, y2
+
+    def _holding(self, img, v, L, now):
+        ui, px = self.ui, self.m.px
+        secs = f"{v.hold_min_s:g}"
+        x1, y, x2, y2 = self._hold_header(img, v, L, "Hold still", f"Hold still for {secs} seconds")
+        d = v.detection
+        waste = d.waste_type if d else None
+        if waste:
+            ui.category_pill(img, x1, y, waste, f"+{v.points.get(waste, 0)} base points")
+        else:
+            ui.text(img, "Checking what it is…", x1, y + px(8), "body_lg", C.ink_2)
+        y += px(64)
+        left = max(0.0, v.hold_min_s * (1 - v.lock_progress))
+        ui.text(img, f"{int(math.ceil(left))} s" if left > 0 else "Almost there…", x1, y, "body_strong", C.ink)
+        y = ui.meter(img, x1, y + px(30), x2, v.lock_progress, C.navy, height=10) + px(16)
+        ui.para(img, "Keep it in the middle of the opening. If it moves a lot, the count starts again.", x1, y,
+                x2 - x1, "body", C.ink_2, max_lines=2)
+        ui.stepper(img, x1, y2 - len(v.stages) * px(40), x2 - x1, v.stages, compact=True)
+
+    def _turning(self, img, v, L, now):
+        ui, px = self.ui, self.m.px
+        waste = v.tx.waste_type if v.tx else ""
+        cat = category(waste)
+        x1, y, x2, y2 = self._hold_header(img, v, L, "Keep holding", f"Keep holding: turning to the {waste} bin")
+        ui.category_pill(img, x1, y, waste, f"+{v.points.get(waste, 0)} base points")
+        y += px(72)
+        tile = px(96)
+        D.fill_rr(img, x1, y, x1 + tile, y + tile, px(24), cat["tint"])
+        ui.spinner(img, x1 + tile / 2, y + tile / 2, tile * 0.3, cat["color"], 6)
+        ui.para(img, "Don't let go yet. We'll tell you when the chute is ready.", x1 + tile + px(20), y + px(8),
+                x2 - x1 - tile - px(20), "body_lg", C.ink, max_lines=3)
+        ui.stepper(img, x1, y2 - len(v.stages) * px(40), x2 - x1, v.stages, compact=True)
+
+    def _letgo(self, img, v, L, now):
+        ui, px = self.ui, self.m.px
+        waste = v.tx.waste_type if v.tx else ""
+        cat = category(waste)
+        x1, y, x2, y2 = self._hold_header(img, v, L, "Let go", "Let go of the item")
+        ui.category_pill(img, x1, y, waste, f"+{v.points.get(waste, 0)} base points")
+        y += px(72)
+        tile = px(96)
+        bounce = 0 if self.m.reduce_motion else int(px(6) * math.sin(now * 2 * math.pi / 1.2))
+        D.fill_rr(img, x1, y, x1 + tile, y + tile, px(24), cat["tint"])
+        draw_icon_centered(img, "arrow_down", x1 + tile / 2, y + tile / 2 + bounce, px(54), cat["color"])
+        ty = ui.para(img, f"The chute is at the {waste} bin. Drop it straight down.", x1 + tile + px(20), y + px(4),
+                     x2 - x1 - tile - px(20), "body_lg", C.ink, max_lines=3)
+        ui.para(img, "Your code appears as soon as the item lands.", x1 + tile + px(20), ty + px(6),
+                x2 - x1 - tile - px(20), "body", C.ink_2, max_lines=2)
+        y += tile + px(24)
+        ui.text(img, f"{int(math.ceil(v.drop_left))} s left", x1, y, "caption", C.ink_2)
+        ui.meter(img, x1, y + px(26), x2, v.drop_left / max(0.1, v.drop_timeout), cat["color"], height=6)
+        ui.stepper(img, x1, y2 - len(v.stages) * px(40), x2 - x1, v.stages, compact=True)
+
+    def _notice(self, img, v, L, now):
+        """Hold mode offline: the item went in, the reward is kept on this kiosk (claim code for staff)."""
+        title, message = v.notice or ("Thank you!", "")
+        x1, y, x2, y2 = self._hold_header(img, v, L, "Saved on this kiosk", title)
+        self.ui.para(img, message, x1, y, x2 - x1, "body_lg", C.ink_2, max_lines=4)
+
     def _working(self, img, v, L, now):
         ui, px = self.ui, self.m.px
         x1, y, x2, y2 = self._inner(L)
@@ -461,9 +569,12 @@ class Renderer:
         ui, px = self.ui, self.m.px
         x1, y, x2, y2 = self._inner(L)
         w = x2 - x1
-        pts = v.points.get(v.tx.waste_type, 0) if v.tx else 0
+        bonus = _bonus(v)
+        pts = (v.points.get(v.tx.waste_type, 0) if v.tx else 0) + bonus
         y = ui.overline(img, "Your reward code", x1, y) + px(8)
         y = ui.para(img, f"Scan to collect +{pts} points", x1, y, w, "title_sm", C.ink, max_lines=2) + px(14)
+        if bonus:
+            y = ui.para(img, compact_note(bonus), x1, y - px(8), w, "caption", C.ink_2, max_lines=2) + px(10)
         buttons_h = self.btn_h
         timer_h = px(52)
         fr = px(6)
@@ -660,7 +771,8 @@ class Renderer:
         pts_n = v.points.get(waste, 0)
         dur_c = self.m.duration("count")
         shown = int(round(pts_n * (_ease(v.phase_age / dur_c) if dur_c else 1.0)))
-        ui.text(img, f"+{shown} base points  ·  {waste}", cx, y, "body_lg", category(waste)["color"], "mt")
+        extra = f" + {_bonus(v)} compact bonus" if _bonus(v) else ""
+        ui.text(img, f"+{shown} base points{extra}  ·  {waste}", cx, y, "body_lg", category(waste)["color"], "mt")
         y += px(36)
         ui.text(img, "Check your balance in the ECOReward app.", cx, y, "body", C.ink_2, "mt")
         self._auto_return(img, v, cx1, cy1, cw, ch, pad, "Thank you for recycling.")
@@ -731,7 +843,10 @@ class Renderer:
         x, xr = x1 + pad, x1 + w - pad
         y = y1 + pad + px(76)
         rows = [("Date", v.issued_date), ("Issued", v.issued_local), ("Item", v.tx.waste_type),
-                ("Base points", f"+{v.points.get(v.tx.waste_type, 0)}"), ("Status", "Not yet claimed")]
+                ("Base points", f"+{v.points.get(v.tx.waste_type, 0)}")]
+        if _bonus(v):
+            rows.append(("Compact bonus", f"+{_bonus(v)}"))
+        rows.append(("Status", "Not yet claimed"))
         for k, val in rows:
             ui.text(img, k, x, y, "body", C.ink_2)
             ui.text(img, val, xr, y, "body_strong", C.ink, "rt")

@@ -5,7 +5,7 @@
 // Every "denied" case is an attack or a mistake the rules must stop; every "allowed" case is something the
 // current apps need in order to keep working.
 //
-//   cd firebase/tests && npm install && npm test        (needs Java 21+; see ../README.md)
+//   cd firebase/tests && npm install && npm test        (needs Java 21+; see the README, "Firestore rules")
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
@@ -439,6 +439,15 @@ describe('kiosk identity (Phase 7, audit C-02): least privilege', () => {
     await denied(setDoc(doc(db, 'qr_tokens', 'k7'), token({ wasteType: 'Gold' })));
     await denied(setDoc(doc(db, 'qr_tokens', 'k8'), token({ claimCode: 'ABCD' })));
     await denied(setDoc(doc(db, 'qr_tokens', 'k9'), token({ points: 5000 })));
+  });
+  it('a crushed can, bottle or cup may carry a compact bonus of at most 5 whole points', async () => {
+    const db = kiosk();
+    await ok(setDoc(doc(db, 'qr_tokens', 'c1'), token({ bonusPoints: 5 })));
+    await ok(setDoc(doc(db, 'qr_tokens', 'c2'), token({ bonusPoints: 0 })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'c3'), token({ bonusPoints: 6 })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'c4'), token({ bonusPoints: -1 })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'c5'), token({ bonusPoints: 2.5 })));
+    await denied(setDoc(doc(db, 'qr_tokens', 'c6'), token({ bonusPoints: '3' })));
   });
   it('cannot change, claim, list or delete tokens', async () => {
     const db = kiosk();

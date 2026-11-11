@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """ECOReward Bin kiosk: tray load cell -> YOLOv8 -> ESP32 sorts -> DONE -> Firestore token -> QR -> phone claim.
 
-    py -3.11 app.py                        the bin (mode esp32 in config/kiosk_settings.json, COM3, full screen)
+    py -3.11 app.py                        the bin (mode hold in config/kiosk_settings.json, COM3, full screen)
+    py -3.11 app.py --mode esp32           the older tray bin (load cell starts the deposit, tray servo tips it)
     py -3.11 app.py --no-hardware          the same flow with a simulated ESP32 (SIMULATION; staff key I = item)
     py -3.11 app.py --mode camera          testing without hardware: the camera sees the item leave
     py -3.11 app.py --mode attendant       testing without hardware: staff confirm with SPACE
@@ -44,7 +45,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from kiosk_firestore import KioskFirestore, SERVER_TIMESTAMP as KIOSK_SERVER_TIMESTAMP  # noqa: E402
 from kiosk.config import load_settings  # noqa: E402
 from kiosk.flow import (Detection, FlowConfig, IssueToken, Phase, SaveOfflineReward, SendSort, Sound,  # noqa: E402
-                        StopWatching, Tare, TransactionFlow, TrayConfig, TrayFlow, WatchToken)
+                        HoldFlow, StopWatching, Tare, TransactionFlow, TrayConfig, TrayFlow, WatchToken)
 from kiosk.hardware import DEFAULT_BIN_CODES, Fill, LinkLost, make_sorter  # noqa: E402
 from kiosk.ui.screens import Renderer, View  # noqa: E402
 
@@ -223,6 +224,11 @@ MAX_WEIGHT_G = {str(k).lower(): float(v) for k, v in _RULES.get("max_weight_g", 
 UNKNOWN_POLICY = _RULES.get("unknown_policy", "residual_no_code")
 if UNKNOWN_POLICY != "residual_no_code":
     print(f"[CONFIG] unknown_policy '{UNKNOWN_POLICY}' is not supported; using residual_no_code")
+# Compact bonus (rules.json compactBonus): a crushed can, bottle or cup looks much smaller on the tray than a normal
+# one; maxBoxFrac is the largest share of the tray its box may take to count as crushed (calibrate with staff key D).
+_COMPACT = _RULES.get("compactBonus", {})
+COMPACT_POINTS = int(_COMPACT.get("points", 0))
+COMPACT_MAX_FRAC = {str(k).lower(): float(v) for k, v in _COMPACT.get("maxBoxFrac", {}).items()}
 BIN_WARN_PCT = int(_RULES.get("bin_warn_pct", 90))
 BIN_FULL_PCT = int(_RULES.get("bin_full_pct", 100))
 
@@ -350,13 +356,14 @@ def stop_watching():
 
 
 # ── Token issuance (runs on a worker thread) ──────────────────────────────────
-def issue_token(waste_type, label, confidence):
+def issue_token(waste_type, label, confidence, bonus=0):
     """Write qr_tokens/{uuid4} and the detection log; return what the QR screen needs. Raises on failure.
 
     Contract (Flutter validateAndUseQRToken, web manualClaimPoints, rules isNewKioskToken): payload
     ECOBIN:<Type>:<uuid4>; expiresAt a UTC datetime (stored as a Timestamp, so the rules can enforce expiry
     with server time); createdAt the server time; usedBy []; isUsed false; claimCode four digits.
-    The QR is shown only after this write succeeded (audit C-03 / H-14)."""
+    The QR is shown only after this write succeeded (audit C-03 / H-14). A crushed item adds bonusPoints (rules
+    isNewKioskToken: 0-5); without a bonus the document keeps its exact earlier shape."""
     if db is None:
         raise RuntimeError("Firebase is offline")
     token = str(uuid.uuid4())
@@ -364,14 +371,17 @@ def issue_token(waste_type, label, confidence):
     claim_code = str(1000 + secrets.randbelow(9000))   # unpredictable manual-claim code
     payload = f"ECOBIN:{waste_type}:{token}"
     log(f"\n[QR GENERATED] {waste_type} +{POINTS_MAP[waste_type]}pts token={token[:8]}...")
-    db.collection("qr_tokens").document(token).set({
+    doc = {
         "wasteType": waste_type,
         "expiresAt": expires_at,            # H-07: Admin SDK stores UTC datetime as Timestamp
         "usedBy":    [],
         "isUsed":    False,
         "createdAt": SERVER_TS,             # H-07
         "claimCode": claim_code,
-    })
+    }
+    if bonus > 0:
+        doc["bonusPoints"] = int(bonus)
+    db.collection("qr_tokens").document(token).set(doc)
     log("[FIREBASE] Token saved — waiting for scan...\n")
     try:   # 3.4 / M-21: traceable detection log; never blocks the QR
         db.collection("detections").add({
@@ -464,9 +474,9 @@ class PendingRewards:
         self.path = Path(path)
         self._lock = threading.Lock()
 
-    def add(self, waste_type):
+    def add(self, waste_type, bonus=0):
         """Save one reward; returns its claim code. Raises OSError if the disk write fails."""
-        entry = {"token": str(uuid.uuid4()), "wasteType": waste_type,
+        entry = {"token": str(uuid.uuid4()), "wasteType": waste_type, "bonus": int(bonus),
                  "claimCode": str(1000 + secrets.randbelow(9000)), "savedAt": _now().isoformat()}
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,14 +508,17 @@ class PendingRewards:
             left, sent = [], 0
             for e in self._read():
                 try:
-                    db.collection("qr_tokens").document(e["token"]).set({
+                    doc = {
                         "wasteType": e["wasteType"],
                         "expiresAt": _now() + timedelta(minutes=PENDING_VALID_MINUTES),
                         "usedBy":    [],
                         "isUsed":    False,
                         "createdAt": SERVER_TS,
                         "claimCode": e["claimCode"],
-                    })
+                    }
+                    if e.get("bonus", 0) > 0:
+                        doc["bonusPoints"] = int(e["bonus"])
+                    db.collection("qr_tokens").document(e["token"]).set(doc)
                     sent += 1
                     log(f"[OFFLINE] uploaded claim code {e['claimCode']} ({e['wasteType']}); "
                         f"staff can claim it for {PENDING_VALID_MINUTES} min")
@@ -576,6 +589,7 @@ def detect(frame, roi=None):
     if roi is not None:
         ox, oy, x1, y1 = roi_box(frame, roi)
         frame = frame[oy:y1, ox:x1]
+    tray_area = float(frame.shape[0] * frame.shape[1]) if roi is not None else 0.0
     results = model(frame, conf=0.15, verbose=False)
     boxes = [b for r in results for b in r.boxes if float(b.conf[0]) >= MIN_BOX_CONF]
     if not boxes:
@@ -585,7 +599,8 @@ def detect(frame, roi=None):
     objects = 1 + sum(1 for b in boxes if b is not box and _iou(xyxy, tuple(float(v) for v in b.xyxy[0])) < 0.3)
     label = str(model.names[int(box.cls[0])]).lower()
     full = (xyxy[0] + ox, xyxy[1] + oy, xyxy[2] + ox, xyxy[3] + oy)
-    return Detection(label, WASTE_MAP.get(label), float(box.conf[0]), full, objects)
+    area_frac = (xyxy[2] - xyxy[0]) * (xyxy[3] - xyxy[1]) / tray_area if tray_area else None
+    return Detection(label, WASTE_MAP.get(label), float(box.conf[0]), full, objects, area_frac)
 
 
 # ── Camera (reconnects instead of exiting — audit K-08) ───────────────────────
@@ -719,6 +734,17 @@ def _screen_size():
         return WIN_W, WIN_H
 
 
+def compact_size_text(tx):
+    """Staff diagnostics: the last item's size on the tray next to its compact-bonus limit, for calibrating
+    rules.json compactBonus.maxBoxFrac (drop a normal and a crushed can; set the limit between the two)."""
+    frac = getattr(tx, "area_frac", None) if tx else None
+    if frac is None:
+        return "—"
+    limit = COMPACT_MAX_FRAC.get(tx.label or "")
+    rule = f"bonus at ≤ {limit:.1%}" if limit is not None else "no compact bonus for this item"
+    return f"{tx.label} · {frac:.1%} of tray ({rule})"
+
+
 def _diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, started, log_path, bad_labels, renderer):
     up = int(time.monotonic() - started)
     shape = camera.last.shape if camera.last is not None else None
@@ -743,6 +769,7 @@ def _diagnostics(settings, flow, sorter, camera, bins, infer_ms, render_ms, star
     ]
     if settings.tray:
         w = sorter.weight
+        rows.insert(0, ("Last item", [("Size", compact_size_text(flow.tx))]))
         rows.insert(0, ("Scale", [("Weight", f"{w:.1f} g" if w is not None else "—"),
                                   ("Steady", "yes" if sorter.steady else "no"),
                                   ("Item threshold", f"{settings.min_item_g:g} g"),
@@ -776,9 +803,11 @@ def _view(flow, settings, sorter, camera, overlay, modules_cache, bad_labels, no
                                    else settings.failure_seconds) - age),
         diagnostics=diagnostics,
         cooldown_left=flow.cooldown_left(now),
-        drop_left=max(0.0, settings.drop_timeout - age) if flow.phase == Phase.DROPPING else 0.0,
+        drop_left=max(0.0, settings.drop_timeout - age) if flow.phase in (Phase.DROPPING, Phase.LETGO) else 0.0,
         drop_timeout=settings.drop_timeout,
+        hold_min_s=settings.hold_min_s,
         tray=settings.tray,
+        compact_points=COMPACT_POINTS if settings.tray else 0,
         weight=sorter.weight if settings.tray else None,
         steady=sorter.steady if settings.tray else False,
         fill=getattr(flow, "fill", None),
@@ -805,13 +834,22 @@ def main(argv=None):
     if settings.tray:
         flow = TrayFlow(TrayConfig(
             points=POINTS_MAP, bin_codes=BIN_CODES, max_weight_g=MAX_WEIGHT_G, min_item_g=settings.min_item_g,
+            compact_points=COMPACT_POINTS, compact_max_frac=COMPACT_MAX_FRAC,
             steady_ms=settings.steady_ms, steady_tolerance_g=settings.steady_tolerance_g,
-            identify_timeout_s=settings.identify_timeout_s, ok_timeout_s=settings.ok_timeout_s,
+            identify_timeout_s=settings.identify_timeout_s, identify_s=settings.identify_s,
+            pretend_weight=settings.pretend_weight, ok_timeout_s=settings.ok_timeout_s,
             drop_timeout_s=settings.drop_timeout_s, multi_item_frames=settings.multi_item_frames,
             jam_clear_s=settings.jam_clear_s, auto_tare_idle_s=settings.auto_tare_idle_s,
             bin_warn_pct=BIN_WARN_PCT, bin_full_pct=BIN_FULL_PCT, issue_timeout=settings.issue_timeout,
             qr_display_seconds=settings.qr_display_seconds, success_seconds=settings.success_seconds,
             failure_seconds=settings.failure_seconds))
+    elif settings.mode == "hold":
+        flow = HoldFlow(FlowConfig(
+            mode="hold", points=POINTS_MAP, bin_codes=BIN_CODES, issue_timeout=settings.issue_timeout,
+            qr_display_seconds=settings.qr_display_seconds, success_seconds=settings.success_seconds,
+            failure_seconds=settings.failure_seconds, rearm_clear_frames=settings.rearm_clear_frames,
+            drop_timeout=settings.drop_timeout, cooldown_seconds=settings.cooldown_seconds,
+            hold_min_s=settings.hold_min_s, hold_max_s=settings.hold_max_s, ok_timeout_s=settings.ok_timeout_s))
     else:
         flow = TransactionFlow(FlowConfig(
             mode=settings.mode, points=POINTS_MAP, issue_timeout=settings.issue_timeout,
@@ -828,7 +866,7 @@ def main(argv=None):
     log("\n------------------------------------------")
     log(f"  ECOReward Bin  |  {width}x{height}  |  mode: {settings.mode}"
         f"{' (SIMULATED)' if sorter.simulated else ''}"
-        f"{f'  |  {settings.serial_port} @ {settings.baud}' if settings.mode == 'esp32' else ''}")
+        f"{f'  |  {settings.serial_port} @ {settings.baud}' if settings.mode in ('esp32', 'hold') else ''}")
     log("  D diagnostics   H history   R receipt   C clear jam   S save training photo   I sim item   "
         "SPACE attendant   Q quit")
     log("------------------------------------------\n")
@@ -891,14 +929,14 @@ def main(argv=None):
 
                 def work(a=a):
                     try:
-                        results.put((a.tx_id, True, issue_token(a.waste_type, a.label, a.confidence)))
+                        results.put((a.tx_id, True, issue_token(a.waste_type, a.label, a.confidence, a.bonus)))
                     except Exception as err:
                         log(f"[FIREBASE ERROR] Could not store token — QR not shown: {err}\n")
                         results.put((a.tx_id, False, str(err)))
                 run_in_background(work)
             elif isinstance(a, SaveOfflineReward):
                 try:
-                    run(flow.on_offline_saved(a.tx_id, pending.add(a.waste_type), now), now)
+                    run(flow.on_offline_saved(a.tx_id, pending.add(a.waste_type, a.bonus), now), now)
                 except OSError as err:
                     log(f"[OFFLINE] could not save the reward on this machine: {err}")
                     run(flow.on_offline_failed(a.tx_id, str(err), now), now)

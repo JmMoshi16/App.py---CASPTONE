@@ -2,7 +2,7 @@
 
   AttendantSorter   no hardware; a staff member confirms with SPACE (attendant mode)
   CameraOnlySorter  no hardware; the camera sees the item leave (camera mode)
-  SerialSorter      the ESP32 on USB serial (esp32 mode), or the SimulatedESP32 below (sim mode)
+  SerialSorter      the ESP32 on USB serial (esp32 and hold modes), or the SimulatedESP32 below (sim mode)
 
 ESP32 line protocol (ASCII, one message per line, "\\n"). ASSUMED — confirm against the firmware:
   app -> ESP32   "1" / "2" / "3"     sort into Biodegradable / Recyclable / Residual (rules.json bin_codes)
@@ -11,10 +11,13 @@ ESP32 line protocol (ASCII, one message per line, "\\n"). ASSUMED — confirm ag
   ESP32 -> app   READY               booted, chute at home
                  W:<grams>           weight, about every 200 ms
                  OK:<n>              chute points at bin n
-                 DONE:<n>:<grams>    the item left the tray into bin n (grams = weight before tipping)
-                 JAM:<n>             the tray tipped but the weight did not drop
+                 DONE:<n>:<grams>    the item left the tray into bin n (grams = weight before tipping);
+                                     hold mode: the item landed on the drop plate (grams = the peak)
+                 NODROP:<n>          hold mode: nothing landed on the plate in time after OK:<n>
+                 JAM:<n>             the tray tipped but the weight did not drop (hold: the item stayed on the plate)
                  FILL:<b>,<r>,<s>    fill percent of bins 1, 2, 3
                  PONG / ERR:<text>
+                 # <text>            debug messages for the Serial Monitor; the kiosk ignores them
 
 Safety rules: the link is "ready" only after the ESP32 answered PONG; nothing but a ping is sent on
 (re)connect; commands queued while disconnected are dropped (a servo must never move minutes later); one
@@ -63,6 +66,11 @@ class Ok:
 class Done:
     bin: int
     grams: float
+
+
+@dataclass(frozen=True)
+class NoDrop:
+    bin: int
 
 
 @dataclass(frozen=True)
@@ -126,6 +134,8 @@ def parse_line(text):
             return Done(_bin(n), float(g))
         if up.startswith("JAM:"):
             return Jam(_bin(t[4:]))
+        if up.startswith("NODROP:"):
+            return NoDrop(_bin(t[7:]))
         if up.startswith("FILL:"):
             parts = [float(p) for p in t[5:].split(",")]
             # -1 = that sensor has no reading (unwired, out of range): unknown, not 0 % full.
@@ -372,7 +382,8 @@ class SerialSorter(Sorter):
                 self.tracker.add(event.grams, now)
             self._lines.notify_all()
         if event is None:
-            self.unparsed += 1
+            if not text.startswith("#"):                 # "#" lines are the firmware's debug messages
+                self.unparsed += 1
             return
         if isinstance(event, Pong) and not self._alive:
             self._alive = True
@@ -531,8 +542,10 @@ class SimulatedESP32:
 
 
 def make_sorter(mode, port="COM3", baud=115200, log=print, steady_ms=500, tolerance_g=1.0):
-    if mode == "esp32":
-        return SerialSorter(port, baud, log=log, steady_ms=steady_ms, tolerance_g=tolerance_g)
+    if mode in ("esp32", "hold"):
+        s = SerialSorter(port, baud, log=log, steady_ms=steady_ms, tolerance_g=tolerance_g)
+        s.mode = mode
+        return s
     if mode == "sim":
         device = SimulatedESP32()
         s = SerialSorter("SIM", baud, opener=lambda p, b: device, list_ports=lambda: [], log=log,
